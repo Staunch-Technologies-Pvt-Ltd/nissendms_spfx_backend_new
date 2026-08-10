@@ -257,6 +257,22 @@ class ArchivedItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class FolderAnomaly(Base):
+    __tablename__ = "folder_anomalies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drive_item_id: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    parent_drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    name: Mapped[str] = mapped_column(String(400))
+    item_type: Mapped[str] = mapped_column(String(20), default="folder")  # "folder" or "file"
+    anomaly_type: Mapped[str] = mapped_column(String(50), index=True)  # main_folder_unmatched / vessel_level_unmatched / subfolder_unmatched
+    department: Mapped[str] = mapped_column(String(100))
+    vessel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    spo_path: Mapped[str] = mapped_column(String(1024))
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class ApprovalRequest(Base):
     """Pending approval requests AND completed admin-activity notifications.
 

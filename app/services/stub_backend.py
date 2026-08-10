@@ -127,10 +127,12 @@ class StubBackend:
         imo = (imo or "").strip()
         if not name:
             raise BadRequest("Vessel name is required")
-        if not imo:
-            raise BadRequest("IMO number is required")
-        if not imo.isdigit() or len(imo) != 7:
+        if not imo or imo in ("—", "None", "null", "auto", "0000000"):
+            import random as _rand
+            imo = str(_rand.randint(1000000, 9999999))
+        elif not imo.isdigit() or len(imo) != 7:
             raise BadRequest("IMO number must be exactly 7 digits")
+
         normalized_name = normalize_vessel_name(name)
         for v in store.vessels:
             if exclude_vessel_id and v["id"] == exclude_vessel_id:

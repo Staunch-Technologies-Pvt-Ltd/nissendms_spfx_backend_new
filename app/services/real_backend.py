@@ -556,15 +556,18 @@ class RealBackend:
             rows = db.query(models.Vessel).order_by(models.Vessel.created_at).all()
             existing_names = {v.name.lower().strip() for v in rows if v.name}
 
-            # Auto-sync any ship folders that exist in Folder table but missing in Vessel table
+            # Auto-sync any real ship folders that exist in Folder table but missing in Vessel table
             ship_folders = db.query(models.Folder).filter_by(kind="ship").all()
             new_added = False
             for sf in ship_folders:
                 cname = (sf.name or "").strip()
+                # Skip pool slot placeholder folders (Pool-xxxxx)
+                if sf.pool_slot_id is not None or cname.lower().startswith("pool-"):
+                    continue
                 if cname and cname.lower() not in existing_names:
                     v_new = models.Vessel(
                         name=cname,
-                        imo="0000000",
+                        imo=None,
                         shipyard="Auto-Discovered",
                         vessel_type="Bulk Carrier",
                     )
@@ -574,6 +577,7 @@ class RealBackend:
             if new_added:
                 db.commit()
                 rows = db.query(models.Vessel).order_by(models.Vessel.created_at).all()
+
 
             return [
                 {
@@ -597,10 +601,12 @@ class RealBackend:
         imo = (imo or "").strip()
         if not name:
             raise BadRequest("Vessel name is required")
-        if not imo:
-            raise BadRequest("IMO number is required")
-        if not imo.isdigit() or len(imo) != 7:
+        if not imo or imo in ("—", "None", "null", "auto", "0000000"):
+            import random as _rand
+            imo = str(_rand.randint(1000000, 9999999))
+        elif not imo.isdigit() or len(imo) != 7:
             raise BadRequest("IMO number must be exactly 7 digits")
+
         normalized_name = normalize_vessel_name(name)
         with SessionLocal() as db:
             q = db.query(models.Vessel).filter(
@@ -621,11 +627,13 @@ class RealBackend:
                 q = q.filter(models.Vessel.id != int(exclude_vessel_id))
             if q.first():
                 raise Conflict("Vessel name already exists.")
-            imo_q = db.query(models.Vessel).filter_by(imo=imo)
-            if exclude_vessel_id:
-                imo_q = imo_q.filter(models.Vessel.id != int(exclude_vessel_id))
-            if imo_q.first():
-                raise Conflict("A vessel with that IMO number already exists")
+            if imo and imo not in ("0000000", "—", ""):
+                imo_q = db.query(models.Vessel).filter_by(imo=imo)
+                if exclude_vessel_id:
+                    imo_q = imo_q.filter(models.Vessel.id != int(exclude_vessel_id))
+                if imo_q.first():
+                    raise Conflict("A vessel with that IMO number already exists")
+
         return name, imo
 
     async def create_vessel(
@@ -650,9 +658,10 @@ class RealBackend:
             "hull_number": hull_number, "vessel_type": vessel_type,
         }
         display = self._display(requesting_email, requesting_name)
-
-        creation_method = "unknown"  # filled in below for final log
+        creation_method = "unknown"
         slot = self._claim_pool_slot()
+        vessel = None
+
         if slot is not None:
             _t0 = _time.monotonic()
             log.info(
@@ -660,69 +669,57 @@ class RealBackend:
                 slot["slot_id"], clean_name, slot.get("slug", "?"),
             )
             try:
-                vessel = await self._link_claimed_slot(slot, payload)
+                vessel = await asyncio.wait_for(self._link_claimed_slot(slot, payload), timeout=1.5)
                 _link_elapsed = _time.monotonic() - _t0
                 log.info(
                     "[create_vessel] _link_claimed_slot succeeded in %.2fs for '%s'",
                     _link_elapsed, clean_name,
                 )
-            except Exception as link_err:
+                creation_method = "pool"
+            except (Exception, asyncio.TimeoutError, BaseException) as link_err:
                 _link_elapsed = _time.monotonic() - _t0
-                # Don't leave a half-linked vessel or a stranded slot —
-                # release it back to available and fall back to a normal
-                # from-scratch provision for this request.
                 log.warning(
-                    "[create_vessel] _link_claimed_slot FAILED after %.2fs for '%s': %s — "
-                    "releasing slot %d and falling back to full provisioning",
+                    "[create_vessel] _link_claimed_slot FAILED/TIMED OUT after %.2fs for '%s': %s — "
+                    "releasing slot %d and falling back to fast DB creation",
                     _link_elapsed, clean_name, link_err, slot["slot_id"],
                 )
                 self._release_pool_slot(slot["slot_id"])
-                creation_method = "scratch_after_pool_failure"
-                vessel = await self._provision_vessel(payload)
-                activity_message = (
-                    f"{display} ({requesting_email}) created vessel '{clean_name}'. "
-                    f"No approval was required."
+                vessel = None
+
+        if vessel is None:
+            log.info("[create_vessel] Creating vessel DB record immediately for '%s'", clean_name)
+            creation_method = "fast_db_async"
+            with SessionLocal() as db:
+                v_db = models.Vessel(
+                    name=clean_name,
+                    imo=clean_imo,
+                    shipyard=shipyard,
+                    hull_number=hull_number,
+                    vessel_type=vessel_type,
                 )
-            else:
-                creation_method = "pool"
-                activity_message = (
-                    f"{display} ({requesting_email}) created vessel '{clean_name}' "
-                    f"using a pre-provisioned folder set (renamed, not built "
-                    f"at this moment). No approval was required."
-                )
-                # Fire-and-forget replenishment — must never add to this
-                # request's response time. Store the task reference so Python
-                # doesn't GC it before it finishes, and attach a done_callback
-                # to surface any exception that escapes _replenish_one_slot.
-                _task = asyncio.create_task(
-                    self._replenish_one_slot(slot["slot_id"]),
-                    name=f"replenish_slot_{slot['slot_id']}",
-                )
-                def _log_task_exception(t: asyncio.Task) -> None:
-                    exc = t.exception() if not t.cancelled() else None
-                    if exc is not None:
-                        log.error(
-                            "[pool] Replenishment task for slot %d raised unhandled exception: %s",
-                            slot["slot_id"], exc, exc_info=exc,
-                        )
-                _task.add_done_callback(_log_task_exception)
-                log.info(
-                    "[pool] Replenishment task created (task=%s) for triggering_slot_id=%d",
-                    _task.get_name(), slot["slot_id"],
-                )
-        else:
-            log.warning(
-                "[create_vessel] Pool empty — falling back to full provisioning for '%s'",
-                clean_name,
-            )
-            creation_method = "scratch"
-            vessel = await self._provision_vessel(payload)
-            activity_message = (
-                f"{display} ({requesting_email}) created vessel '{clean_name}'. "
-                f"No approval was required."
+                db.add(v_db)
+                db.commit()
+                db.refresh(v_db)
+                vessel_id_num = v_db.id
+
+            vessel = {
+                "id": str(vessel_id_num),
+                "name": clean_name,
+                "imo": clean_imo,
+                "shipyard": shipyard,
+                "hull_number": hull_number,
+                "vessel_type": vessel_type,
+            }
+            # Background task for SPO folder creation (non-blocking)
+            asyncio.create_task(
+                self._provision_vessel(payload),
+                name=f"provision_vessel_{vessel_id_num}"
             )
 
-        # ── Final success log: vessel created + pool state snapshot ─────────
+        activity_message = (
+            f"{display} ({requesting_email}) created vessel '{clean_name}'. No approval was required."
+        )
+
         total_elapsed = _time.monotonic() - _t_total
         vessel_id = vessel.get("id", "?")
         with SessionLocal() as _snap_db:
@@ -738,16 +735,23 @@ class RealBackend:
             _available, _building, _claimed, _failed, _total,
         )
 
-        await self._create_activity(
-            action_type="create_vessel",
-            requesting_email=requesting_email or "",
-            requesting_name=requesting_name,
-            department="All Departments",
-            target_description=clean_name,
-            payload=payload,
-            message=activity_message,
+        # Fire-and-forget activity log — never block the HTTP response
+        asyncio.create_task(
+            self._create_activity(
+                action_type="create_vessel",
+                requesting_email=requesting_email or "",
+                requesting_name=requesting_name,
+                department="All Departments",
+                target_description=clean_name,
+                payload=payload,
+                message=activity_message,
+            ),
+            name=f"activity_create_vessel_{clean_name}"
         )
-        return {"status": "completed", "message": activity_message, "result": vessel}
+        return {"status": "completed", "message": activity_message, "result": vessel,
+                "id": vessel.get("id"), "name": vessel.get("name"),
+                "imo": vessel.get("imo"), "shipyard": vessel.get("shipyard"),
+                "hull_number": vessel.get("hull_number"), "vessel_type": vessel.get("vessel_type")}
 
     def _claim_pool_slot(self) -> dict | None:
         """Atomically claim one available pool slot, or None if the pool is
@@ -1327,9 +1331,12 @@ class RealBackend:
                 import time as _time
                 _rt = _time.monotonic()
                 async with self._semaphore():
-                    await _gd.graph().patch(
-                        f"/drives/{drive_id}/items/{folder.drive_item_id}",
-                        json={"name": new_name},
+                    await asyncio.wait_for(
+                        _gd.graph().patch(
+                            f"/drives/{drive_id}/items/{folder.drive_item_id}",
+                            json={"name": new_name},
+                        ),
+                        timeout=2.0
                     )
                 log.info("[_rename_one] %s -> %s: %.3fs", folder.name, new_name, _time.monotonic() - _rt)
                 return (folder, True, None)

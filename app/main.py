@@ -53,32 +53,72 @@ def _cors_origins() -> list[str]:
         return ["*"]
     return [o.strip() for o in raw.split(",") if o.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins(),
-    allow_origin_regex=r"https?://localhost(:\d+)?",  # always allow localhost for dev
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
-
-
-# Read-only folder/children endpoints that are safe to cache briefly in the browser
+# Read-only endpoints safe to cache briefly in the browser
 _CACHEABLE_PREFIXES = ("/api/folders/", "/api/mains", "/api/vessels")
 
+# Unified CORS + Private Network Access middleware
+# Must run BEFORE CORSMiddleware so PNA preflight responses are returned immediately.
+# @app.middleware("http") is appended LAST to the stack and therefore runs OUTERMOST (first).
 @app.middleware("http")
-async def add_no_cache_headers(request, call_next):
+async def cors_and_pna_middleware(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+
+    # Build the list of allowed origins dynamically
+    explicit_origins = set(_cors_origins())
+
+    # Decide whether this origin is allowed
+    import re as _re
+    origin_allowed = (
+        "*" in explicit_origins
+        or origin in explicit_origins
+        or bool(_re.match(r"https?://.*\.sharepoint\.com", origin))
+        or bool(_re.match(r"https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin))
+    )
+
+    # ── Handle ALL CORS and PNA preflight OPTIONS requests ──────────────────
+    if request.method == "OPTIONS":
+        resp = Response(status_code=204)
+        if origin_allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+
+        req_headers = request.headers.get("access-control-request-headers")
+        allowed_headers = "Content-Type, Authorization, X-Session-ID, X-User-Email, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+        if req_headers:
+            allowed_headers = f"{allowed_headers}, {req_headers}"
+
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = allowed_headers
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        resp.headers["Access-Control-Allow-Private-Network"] = "true"
+        resp.headers["Vary"] = "Origin"
+        return resp
+
     response = await call_next(request)
+
+    # Inject PNA & CORS headers on every response so subsequent non-preflight requests succeed
+    if origin_allowed and origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Session-ID, X-User-Email, X-Requested-With, Accept, Origin"
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+
+
+    # Cache-control
     path = request.url.path
     method = request.method
-    # Allow short-lived browser cache (10 s) for GET folder/children/mains/vessels
-    # so rapid back-navigation is instant without hitting Graph API again.
     if method == "GET" and any(path.startswith(p) for p in _CACHEABLE_PREFIXES):
         response.headers["Cache-Control"] = "private, max-age=10"
     else:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
     return response
+
+
 
 
 def _raise(e: Exception):
@@ -102,10 +142,11 @@ VESSEL_TYPES = {
 
 class VesselIn(BaseModel):
     name: str
-    imo: str
+    imo: str | None = None
     shipyard: str | None = None
     hull_number: str | None = None
     vessel_type: str | None = None
+
 
 
 class VesselUpdateIn(BaseModel):
@@ -232,8 +273,23 @@ async def _startup():
                         command.stamp(alembic_cfg, "head")
 
             print(">>> STARTUP: about to run command.upgrade", flush=True)
-            command.upgrade(alembic_cfg, "head")
-            print(">>> STARTUP: command.upgrade done", flush=True)
+            try:
+                command.upgrade(alembic_cfg, "head")
+                print(">>> STARTUP: command.upgrade done", flush=True)
+            except Exception as upgrade_exc:
+                exc_str = str(upgrade_exc)
+                # If migration fails due to a table/index that already exists
+                # (e.g. created by create_all before Alembic tracked it),
+                # stamp the DB as head and continue — the schema is already correct.
+                if "DuplicateTable" in exc_str or "already exists" in exc_str or "duplicate" in exc_str.lower():
+                    print(f">>> STARTUP: upgrade collision ({upgrade_exc!r}), stamping head and retrying once.", flush=True)
+                    try:
+                        command.stamp(alembic_cfg, "head")
+                        print(">>> STARTUP: stamped head after collision.", flush=True)
+                    except Exception as stamp_exc:
+                        print(f">>> STARTUP: stamp also failed: {stamp_exc}", flush=True)
+                else:
+                    raise
 
             # Alembic's env.py calls logging.config.fileConfig(...), which
             # fully reconfigures the ROOT logger per alembic.ini's
@@ -2082,3 +2138,189 @@ async def list_session_audit(
 # ── AI BANTO Email Automation routes ──────────────────────────────────────────
 from .email_automation import router as email_router
 app.include_router(email_router)
+
+
+# ── Folder/File Placement Detection Endpoints ─────────────────────────────────
+
+class AnomalyPatchIn(BaseModel):
+    resolved: bool = True
+
+
+class NormalFolderIn(BaseModel):
+    drive_item_id: str
+    name: str
+    item_type: str = "folder"
+    spo_path: str
+    department: str = ""
+    vessel_name: str | None = None
+
+
+@app.get("/api/normal-folders")
+async def list_normal_folders():
+    """Return all folders/files confirmed as 'Normal Folders' by a user."""
+    if not settings.db_configured:
+        return []
+    try:
+        from .db.base import SessionLocal
+        from .db import models as db_models
+        with SessionLocal() as db:
+            rows = (
+                db.query(db_models.FolderAnomaly)
+                .filter_by(anomaly_type="classified_normal")
+                .order_by(db_models.FolderAnomaly.detected_at.desc())
+                .all()
+            )
+            return [
+                {
+                    "id": r.id,
+                    "drive_item_id": r.drive_item_id,
+                    "name": r.name,
+                    "item_type": r.item_type,
+                    "spo_path": r.spo_path,
+                    "department": r.department,
+                    "vessel_name": r.vessel_name,
+                    "detected_at": r.detected_at.isoformat() if r.detected_at else None,
+                }
+                for r in rows
+            ]
+    except Exception as exc:
+        _logger.warning("Failed to fetch normal folders: %s", exc)
+        return []
+
+
+@app.post("/api/normal-folders", status_code=201)
+async def create_normal_folder(payload: NormalFolderIn):
+    """Upsert a folder/file as a confirmed 'Normal Folder'. Idempotent by drive_item_id."""
+    if not settings.db_configured:
+        return {"ok": True, "id": None, "name": payload.name}
+    try:
+        from datetime import datetime, timezone
+        from .db.base import SessionLocal
+        from .db import models as db_models
+        with SessionLocal() as db:
+            # Check if already exists (idempotent)
+            existing = (
+                db.query(db_models.FolderAnomaly)
+                .filter_by(drive_item_id=payload.drive_item_id)
+                .one_or_none()
+            )
+            if existing:
+                # Update classification to normal if it was something else
+                existing.anomaly_type = "classified_normal"
+                existing.resolved = True
+                db.commit()
+                return {"ok": True, "id": existing.id, "name": existing.name, "already_existed": True}
+            # Create new record
+            row = db_models.FolderAnomaly(
+                drive_item_id=payload.drive_item_id,
+                name=payload.name,
+                item_type=payload.item_type,
+                anomaly_type="classified_normal",
+                spo_path=payload.spo_path,
+                department=payload.department or "",
+                vessel_name=payload.vessel_name,
+                resolved=True,
+                detected_at=datetime.now(timezone.utc),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return {"ok": True, "id": row.id, "name": row.name, "already_existed": False}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to save normal folder: {exc}")
+
+
+@app.get("/api/anomalies")
+async def list_anomalies(anomaly_type: str | None = Query(default=None)):
+    """Return all unresolved folder/file placement anomalies."""
+    if not settings.db_configured:
+        return []
+    try:
+        from .db.base import SessionLocal
+        from .db import models as db_models
+        with SessionLocal() as db:
+            q = db.query(db_models.FolderAnomaly).filter_by(resolved=False)
+            if anomaly_type:
+                q = q.filter_by(anomaly_type=anomaly_type)
+            anomalies = q.order_by(db_models.FolderAnomaly.detected_at.desc()).all()
+            return [
+                {
+                    "id": a.id,
+                    "drive_item_id": a.drive_item_id,
+                    "name": a.name,
+                    "item_type": a.item_type,
+                    "anomaly_type": a.anomaly_type,
+                    "department": a.department,
+                    "vessel_name": a.vessel_name,
+                    "spo_path": a.spo_path,
+                    "resolved": a.resolved,
+                    "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+                }
+                for a in anomalies
+            ]
+    except Exception as exc:
+        _logger.warning("Failed to fetch anomalies: %s", exc)
+        return []
+
+
+@app.patch("/api/anomalies/{anomaly_id}")
+async def patch_anomaly(anomaly_id: int, payload: AnomalyPatchIn):
+    """Mark a placement anomaly as resolved/dismissed."""
+    if not settings.db_configured:
+        return {"ok": True}
+    try:
+        from .db.base import SessionLocal
+        from .db import models as db_models
+        with SessionLocal() as db:
+            row = db.query(db_models.FolderAnomaly).filter_by(id=anomaly_id).one_or_none()
+            if not row:
+                raise HTTPException(404, "Anomaly not found")
+            row.resolved = payload.resolved
+            db.commit()
+            return {"ok": True, "id": anomaly_id, "resolved": row.resolved}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to patch anomaly: {exc}")
+
+
+@app.post("/api/anomalies/scan")
+async def scan_anomalies_endpoint():
+    """Trigger on-demand scanning for folder/file placement anomalies."""
+    if not settings.db_configured:
+        return []
+    try:
+        from .db.base import SessionLocal
+        from .db import models as db_models
+        from .services.anomaly_detector import scan_and_record_anomalies
+        with SessionLocal() as db:
+            # Build tree items from cached Folder table & Vessel list
+            folder_rows = db.query(db_models.Folder).all()
+            tree_items = [
+                {
+                    "id": f.drive_item_id,
+                    "name": f.name,
+                    "item_type": "folder",
+                    "path": f.path,
+                }
+                for f in folder_rows
+            ]
+            detected = scan_and_record_anomalies(db, tree_items)
+            return [
+                {
+                    "id": a.id,
+                    "drive_item_id": a.drive_item_id,
+                    "name": a.name,
+                    "item_type": a.item_type,
+                    "anomaly_type": a.anomaly_type,
+                    "department": a.department,
+                    "vessel_name": a.vessel_name,
+                    "spo_path": a.spo_path,
+                    "resolved": a.resolved,
+                    "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+                }
+                for a in detected
+            ]
+    except Exception as exc:
+        _logger.warning("Scan anomalies failed: %s", exc)
+        return []

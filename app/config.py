@@ -23,14 +23,22 @@ class _RawEnv(BaseSettings):
 
 
 def _prefixed(prefix: str, key: str, raw: _RawEnv, default: str = "") -> str:
-    """Return PREFIX_KEY from the raw env, falling back to default."""
-    return getattr(raw, f"{prefix}_{key}".lower(), None) or default
+    """Return PREFIX_KEY from raw env, falling back to un-prefixed KEY, then default."""
+    val = getattr(raw, f"{prefix}_{key}".lower(), None)
+    if val is not None and str(val).strip():
+        return str(val)
+    val = getattr(raw, key.lower(), None)
+    if val is not None and str(val).strip():
+        return str(val)
+    return default
 
 
 def _prefixed_int(prefix: str, key: str, raw: _RawEnv, default: int = 0) -> int:
     val = getattr(raw, f"{prefix}_{key}".lower(), None)
+    if val is None or not str(val).strip():
+        val = getattr(raw, key.lower(), None)
     try:
-        return int(val) if val is not None else default
+        return int(val) if val is not None and str(val).strip() else default
     except (TypeError, ValueError):
         return default
 

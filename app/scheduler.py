@@ -221,7 +221,7 @@ async def reconcile_pool() -> dict:
             log.warning("[reconcile_pool] Failed to build a pool slot: %s", exc)
         else:
             if deficit > 1:
-                await asyncio.sleep(5)  # gap between successful builds too
+                await asyncio.sleep(10)  # 10s gap to let Graph API rate-limit quota reset
 
     if stuck_jobs or stuck_slots or built:
         log.info(
@@ -386,12 +386,13 @@ def start_scheduler() -> AsyncIOScheduler | None:
         replace_existing=True,
     )
 
-    # Vessel folder pool: retry stuck replenishments + top up deficit (every 5 minutes)
+    # Vessel folder pool: retry stuck replenishments + top up deficit (every 5 minutes, also runs immediately on startup)
     sched.add_job(
         reconcile_pool,
         "interval",
         minutes=5,
         id="reconcile_pool",
+        next_run_time=datetime.now(),
         replace_existing=True,
     )
 

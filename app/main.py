@@ -1499,6 +1499,7 @@ async def upload_by_path(
         if dest:
             log_detail += f"|{dest}"
         _log_activity(email, "file_upload", log_detail)
+        invalidate_folder_caches(folder_id)
         return result
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
@@ -1554,6 +1555,7 @@ async def upload(
         if dest:
             log_detail += f"|{dest}"
         _log_activity(email, "file_upload", log_detail)
+        invalidate_folder_caches(folder_id)
         return result
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
@@ -1585,6 +1587,7 @@ async def delete_folder(folder_id: str, user_email: str | None = Query(None), fo
         })
     detail = f"Deleted folder: {folder_name}" if folder_name else f"Deleted folder: {folder_id}"
     _log_activity(email, "delete_folder", detail)
+    invalidate_folder_caches(folder_id)
     return {"status": "completed", "message": result.get("message")}
 
 
@@ -1606,6 +1609,7 @@ async def create_subfolder(folder_id: str, payload: CreateSubfolderIn, x_user_em
                 "message": result.get("message"),
             })
         _log_activity(email, "create_folder", f"Created folder: {payload.name.strip()}")
+        invalidate_folder_caches(folder_id)
         folder = result.get("result") or {}
         return {**folder, "status": "completed", "message": result.get("message")}
     except (NotFound, BadRequest, Conflict) as e:
@@ -1636,6 +1640,7 @@ async def month_upload(
         if dest:
             log_detail += f"|{dest}"
         _log_activity(email, "file_upload", log_detail)
+        invalidate_folder_caches(folder_id)
         return result
     except (NotFound, BadRequest, Conflict, InternalServerError) as e:
         _raise(e)
@@ -1679,6 +1684,7 @@ async def delete_file(
             "message": result.get("message"),
         })
     _log_activity(email, "delete_file", f"Deleted file: {file_id}")
+    invalidate_folder_caches()
     return {"status": "completed", "message": result.get("message")}
 
 
@@ -1920,7 +1926,9 @@ async def approval_preview(
 @app.post("/api/approvals/{request_id}/approve")
 async def approve_approval(request_id: str, admin: str = Depends(_require_admin), _session: object = Depends(require_session)):
     try:
-        return await get_backend().approve_request(request_id, admin)
+        res = await get_backend().approve_request(request_id, admin)
+        invalidate_folder_caches()
+        return res
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
 
@@ -1933,7 +1941,9 @@ async def reject_approval(
     if not reason:
         raise HTTPException(400, "A rejection reason is required")
     try:
-        return await get_backend().reject_request(request_id, admin, reason)
+        res = await get_backend().reject_request(request_id, admin, reason)
+        invalidate_folder_caches()
+        return res
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
 

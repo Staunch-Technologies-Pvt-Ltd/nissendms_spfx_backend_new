@@ -554,6 +554,27 @@ class RealBackend:
     async def list_vessels(self):
         with SessionLocal() as db:
             rows = db.query(models.Vessel).order_by(models.Vessel.created_at).all()
+            existing_names = {v.name.lower().strip() for v in rows if v.name}
+
+            # Auto-sync any ship folders that exist in Folder table but missing in Vessel table
+            ship_folders = db.query(models.Folder).filter_by(kind="ship").all()
+            new_added = False
+            for sf in ship_folders:
+                cname = (sf.name or "").strip()
+                if cname and cname.lower() not in existing_names:
+                    v_new = models.Vessel(
+                        name=cname,
+                        imo="0000000",
+                        shipyard="Auto-Discovered",
+                        vessel_type="Bulk Carrier",
+                    )
+                    db.add(v_new)
+                    existing_names.add(cname.lower())
+                    new_added = True
+            if new_added:
+                db.commit()
+                rows = db.query(models.Vessel).order_by(models.Vessel.created_at).all()
+
             return [
                 {
                     "id": str(v.id),

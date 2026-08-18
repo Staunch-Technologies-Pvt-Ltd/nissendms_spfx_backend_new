@@ -2,6 +2,7 @@
 
 Presents the same interface as RealBackend so the API layer is backend-agnostic.
 """
+from datetime import datetime, timezone
 from ..config import settings
 from ..store import store
 from .normalize import normalize_vessel_name
@@ -118,8 +119,9 @@ class StubBackend:
                 "shipyard": v.get("shipyard"),
                 "hull_number": v.get("hull_number"),
                 "vessel_type": v.get("vessel_type"),
+                "is_provisioned": True,
             }
-            for v in store.vessels
+            for v in reversed(store.vessels)
         ]
 
     def _validate_create_vessel(self, name, imo, exclude_vessel_id=None):
@@ -154,6 +156,7 @@ class StubBackend:
         payload = {
             "name": clean_name, "imo": clean_imo, "shipyard": shipyard,
             "hull_number": hull_number, "vessel_type": vessel_type,
+            "requesting_email": requesting_email, "requesting_name": requesting_name,
         }
         display = self._display(requesting_email, requesting_name)
         vessel = await self._execute_create_vessel(payload)
@@ -177,11 +180,24 @@ class StubBackend:
         # the name/IMO may have been taken by someone else since the request
         # was filed.
         self._validate_create_vessel(payload["name"], payload["imo"])
-        return store.add_vessel(
+        vessel = store.add_vessel(
             payload["name"], payload["imo"],
             shipyard=payload.get("shipyard"), hull_number=payload.get("hull_number"),
             vessel_type=payload.get("vessel_type"),
         )
+        # Emit a vessel-provisioned alert for the top-header alert bell.
+        store.add_folder_alert(
+            drive_item_id=None,
+            folder_name=f"Vessel: {vessel['name']}",
+            folder_path=f"Vessels / Specific Vessels / {vessel['name']}",
+            parent_folder_id=None,
+            vessel_name=vessel["name"],
+            department="All Departments",
+            created_by_email=payload.get("requesting_email") or "",
+            created_by_name=payload.get("requesting_name") or "",
+            alert_type="vessel_provisioned",
+        )
+        return vessel
 
     def _validate_update_vessel(self, vessel_id, name, imo, shipyard, hull_number, vessel_type):
         vessel = next((v for v in store.vessels if v["id"] == vessel_id), None)
@@ -355,8 +371,28 @@ class StubBackend:
         if not vessel:
             return {"deleted": False, "message": "Vessel not found"}
         vname = vessel["name"]
+        deleted_vessels = getattr(store, "deleted_vessel_records", {})
+        deleted_vessels[f"vessel_{vessel_id}"] = {
+            "id": f"vessel_{vessel_id}",
+            "name": vname,
+            "kind": "vessel",
+            "item_type": "vessel",
+            "original_path": f"Vessels/{vname}",
+            "main_folder": "Vessels",
+            "vessel_name": vname,
+            "category": "",
+            "sub_category": "",
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "imo": vessel.get("imo"),
+            "shipyard": vessel.get("shipyard"),
+            "hull_number": vessel.get("hull_number"),
+            "vessel_type": vessel.get("vessel_type"),
+            "vessel": dict(vessel),
+            "ship_folder_ids": list(vessel.get("ship_folders", {}).values()),
+        }
+        store.deleted_vessel_records = deleted_vessels
         store.vessels = [v for v in store.vessels if v["id"] != vessel_id]
-        store.deleted_ids.add(vessel_id)
+        store.deleted_ids.update(vessel.get("ship_folders", {}).values())
         if hasattr(settings, "db_configured") and settings.db_configured:
             with SessionLocal() as db:
                 v_db = db.query(models.Vessel).filter_by(id=int(vessel_id)).first()
@@ -371,6 +407,12 @@ class StubBackend:
         if vessel is None:
             raise NotFound(f"Vessel {vessel_id!r} not found")
         return {"ok": True, "vessel_id": vessel_id, "name": vessel["name"]}
+
+    async def start_vessel_provisioning(self, vessel_id: str) -> dict:
+        vessel = next((v for v in store.vessels if v["id"] == vessel_id), None)
+        if vessel is None:
+            raise NotFound(f"Vessel {vessel_id!r} not found")
+        return {"status": "completed", "is_provisioned": True}
 
     async def repair_vessel_links(self) -> dict:
         """Stub: no-op — in-memory store is always consistent."""
@@ -401,10 +443,8 @@ class StubBackend:
         node = store.get_node(folder_id)
         if node is None:
             raise NotFound("Folder not found")
-        # Allow uploads into leaf, month_driven, and month folders
-        if not node["upload"]:
-            raise BadRequest("This folder does not accept direct uploads")
-        if node["month_driven"]:
+        # Allow uploads into any folder
+        if node.get("month_driven"):
             target, _ = store.resolve_month_target(folder_id, filename, None)
         elif node["kind"] == "drawing_classifier":
             target, _ = store.resolve_drawing_target(folder_id, filename)
@@ -538,7 +578,12 @@ class StubBackend:
         vessel_name = self._resolve_vessel_name_for_node(folder_id)
         display = self._display(requesting_email, requesting_name)
         vessel_clause = f" for vessel {vessel_name}" if vessel_name else ""
-        payload = {"parent_folder_id": folder_id, "name": cleaned_name}
+        payload = {
+            "parent_folder_id": folder_id,
+            "name": cleaned_name,
+            "requesting_email": requesting_email,
+            "requesting_name": requesting_name,
+        }
         return await self._admin_or_pending(
             action_type="create_folder",
             requesting_email=requesting_email,
@@ -560,7 +605,21 @@ class StubBackend:
         )
 
     async def _execute_create_subfolder(self, payload):
-        return store.create_subfolder(payload["parent_folder_id"], payload["name"])
+        node = store.create_subfolder(payload["parent_folder_id"], payload["name"])
+        parent_path = store.path_of(payload["parent_folder_id"])
+        folder_path = f"{parent_path} / {node['name']}" if parent_path else node["name"]
+        store.add_folder_alert(
+            drive_item_id=node["id"],
+            folder_name=node["name"],
+            folder_path=folder_path,
+            parent_folder_id=payload["parent_folder_id"],
+            vessel_name=self._resolve_vessel_name_for_node(payload["parent_folder_id"]),
+            department=self._resolve_department(payload["parent_folder_id"]),
+            created_by_email=payload.get("requesting_email") or "",
+            created_by_name=payload.get("requesting_name") or "",
+            alert_type="folder_created",
+        )
+        return node
 
     async def delete_folder(
         self, folder_id: str, requesting_email=None, requesting_name=None,
@@ -764,8 +823,18 @@ class StubBackend:
 
     async def get_deleted_nodes(self):
         ids = store.get_deleted_ids()
-        out = []
+        out = [
+            {key: value for key, value in record.items() if key != "vessel"}
+            for record in getattr(store, "deleted_vessel_records", {}).values()
+        ]
+        deleted_ship_folder_ids = {
+            folder_id
+            for record in getattr(store, "deleted_vessel_records", {}).values()
+            for folder_id in record.get("ship_folder_ids", [])
+        }
         for i in ids:
+            if i in deleted_ship_folder_ids:
+                continue
             node = store.get_node(i)
             if node:
                 s = store.serialize(node, depth=0)
@@ -773,6 +842,11 @@ class StubBackend:
                 main_folder = original_path.split("/", 1)[0] if "/" in original_path else original_path
                 s["main_folder"] = main_folder
                 s["original_path"] = original_path
+                parts = original_path.split("/")
+                vessel_name = node.get("vessel") or self._resolve_vessel_name_for_node(i) or ""
+                s["vessel_name"] = vessel_name
+                s["category"] = parts[-2] if len(parts) > 2 else main_folder
+                s["sub_category"] = ""
                 s["deleted_at"] = node.get("deleted_at") or "2026-07-20T08:30:00Z"
                 ext = node.get("ext", "").upper()
                 s["item_type"] = "File folder" if node["kind"] != "file" else (f"{ext} File" if ext else "File")
@@ -807,6 +881,16 @@ class StubBackend:
         )
 
     async def _execute_restore_deleted(self, item_id):
+        deleted_vessels = getattr(store, "deleted_vessel_records", {})
+        record = deleted_vessels.pop(item_id, None)
+        if record:
+            vessel = record.get("vessel")
+            if vessel and not any(v["id"] == vessel["id"] for v in store.vessels):
+                store.vessels.append(vessel)
+            for folder_id in record.get("ship_folder_ids", []):
+                store.deleted_ids.discard(folder_id)
+            store.deleted_vessel_records = deleted_vessels
+            return {"restored": True}
         return {"restored": store.restore_deleted_item(item_id)}
 
     async def permanent_delete_item(
@@ -837,11 +921,27 @@ class StubBackend:
         )
 
     async def _execute_permanent_delete(self, item_id, item_type):
+        deleted_vessels = getattr(store, "deleted_vessel_records", {})
+        if item_id in deleted_vessels:
+            record = deleted_vessels.pop(item_id, None)
+            for folder_id in (record or {}).get("ship_folder_ids", []):
+                store.permanent_delete_item(folder_id, "folder")
+            store.deleted_vessel_records = deleted_vessels
+            return {"deleted": True}
         return {"deleted": store.permanent_delete_item(item_id, item_type)}
 
     # -------------------------------------------------------------- approvals
     async def list_approvals(self, status=None, q=None):
         return store.list_approvals(status, q)
+
+    async def list_folder_alerts(self, unread_only=False):
+        return store.list_folder_alerts(unread_only=unread_only)
+
+    async def mark_folder_alert_read(self, alert_id: str, read: bool = True):
+        return store.mark_alert_read(alert_id, read=read)
+
+    async def mark_all_folder_alerts_read(self):
+        return {"marked": store.mark_all_alerts_read()}
 
     async def get_approval(self, request_id):
         approval = store.get_approval(request_id)

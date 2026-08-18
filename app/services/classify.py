@@ -1,8 +1,28 @@
-"""Classify a folder (by its path relative to the container root) into the
-semantic node type used by the UI, based on the declarative template.
+"""Classify a folder (by its full logical path from the Documents root) into
+the semantic node type used by the UI, based on the declarative template.
 
-`parts` is the list of folder names from a main folder downward, e.g.
-["Technical & Crewing", "MV Horizon", "Month End Reports", "July 2026", "Main Engine"].
+`parts` is the list of folder names from the Documents root downward, e.g.
+["Vessels", "Specific Vessels", "MV Horizon", "Technical & Crewing",
+ "Month End Reports", "July 2026", "Main Engine"]
+or
+["Vessels", "Common for all ships", "Insurance", "Agreements"]
+or
+["Kaizen - Knowledge Bank", "Templates"]
+
+Expected folder layout:
+
+Documents (root)
+├── Vessels
+│   ├── Specific Vessels
+│   │   └── {Ship Name}
+│   │       ├── Technical & Crewing
+│   │       ├── Commercial & Chartering
+│   │       └── Insurance
+│   └── Common for all ships
+│       ├── Technical & Crewing
+│       ├── Commercial & Chartering
+│       └── Insurance
+└── Kaizen - Knowledge Bank
 """
 from .. import template
 
@@ -36,6 +56,8 @@ def _flags(node):
 
 
 def _descend(nodes, rest):
+    """Walk further down a SHIP_TEMPLATE / COMMON_TEMPLATE / FLAT_TEMPLATE
+    node list using the remaining path segments."""
     node = _find(nodes, rest[0])
     if node is None:
         return {"kind": "folder", "upload": False, "month_driven": False}
@@ -54,20 +76,53 @@ def _descend(nodes, rest):
 def classify(parts: list[str]) -> dict:
     if not parts:
         return {"kind": "root", "upload": False, "month_driven": False}
-    main = parts[0]
-    if main not in template.MAIN_FOLDERS:
+
+    kaizen_name = template.FLAT_MAIN_FOLDERS[0]
+
+    # --------------------------------------------------------------
+    # Kaizen - Knowledge Bank sits directly at the Documents root.
+    # --------------------------------------------------------------
+    if parts[0] == kaizen_name:
+        if len(parts) == 1:
+            return {"kind": "main", "upload": False, "month_driven": False}
+        return _descend(template.FLAT_TEMPLATE[kaizen_name], parts[1:])
+
+    # --------------------------------------------------------------
+    # Everything else lives under "Vessels".
+    # --------------------------------------------------------------
+    if parts[0] != template.VESSELS_ROOT:
         return {"kind": "folder", "upload": False, "month_driven": False}
+
     if len(parts) == 1:
-        return {"kind": "main", "upload": False, "month_driven": False}
-    if main in template.FLAT_MAIN_FOLDERS:
-        # Flat, shared main folder — no ship/common split, descend directly.
-        return _descend(template.FLAT_TEMPLATE[main], parts[1:])
-    common_root = template.COMMON_TEMPLATE[main]["name"]
-    if parts[1].lower() == common_root.lower():
+        return {"kind": "root", "upload": False, "month_driven": False}  # Vessels itself
+
+    root = parts[1]
+
+    if root == template.SPECIFIC_VESSELS_ROOT:
         if len(parts) == 2:
+            return {"kind": "root", "upload": False, "month_driven": False}  # Specific Vessels itself
+
+        # parts[2] = ship name
+        if len(parts) == 3:
+            return {"kind": "ship", "upload": False, "month_driven": False}
+
+        main = parts[3]
+        if main not in template.MAIN_FOLDERS:
             return {"kind": "folder", "upload": False, "month_driven": False}
-        return _descend(template.COMMON_TEMPLATE[main].get("children", []), parts[2:])
-    # otherwise it's a ship folder
-    if len(parts) == 2:
-        return {"kind": "ship", "upload": False, "month_driven": False}
-    return _descend(template.SHIP_TEMPLATE[main], parts[2:])
+        if len(parts) == 4:
+            return {"kind": "main", "upload": False, "month_driven": False}
+        return _descend(template.SHIP_TEMPLATE[main], parts[4:])
+
+    if root == template.COMMON_SHIPS_ROOT:
+        if len(parts) == 2:
+            return {"kind": "root", "upload": False, "month_driven": False}  # Common for all ships itself
+
+        main = parts[2]
+        if main not in template.MAIN_FOLDERS:
+            return {"kind": "folder", "upload": False, "month_driven": False}
+        if len(parts) == 3:
+            return {"kind": "main", "upload": False, "month_driven": False}
+        return _descend(template.COMMON_TEMPLATE[main], parts[3:])
+
+    # Unrecognized folder directly under Vessels
+    return {"kind": "folder", "upload": False, "month_driven": False}

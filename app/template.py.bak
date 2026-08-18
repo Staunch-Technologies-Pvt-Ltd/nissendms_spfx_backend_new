@@ -33,46 +33,31 @@ def drawing_classifier(name, categories):
     return {"name": name, "kind": "drawing_classifier", "children": [leaf(c) for c in categories]}
 
 
-# =============================================================================
-# REPLACEMENT BLOCK for backend/app/template.py
-#
-# This replaces everything in the file FROM the line starting with
-# "MAIN_FOLDERS = [" DOWN TO THE END OF THE FILE.
-#
-# Do NOT touch anything above that point — leaf(), folder(), month_driven(),
-# drawing_classifier(), and FALLBACK_LEAF_NAMES stay exactly as they are
-# today in your file. This block only redefines the folder structure itself.
-# =============================================================================
-
-# Fallback leaf names used when routing rejected/unclassified uploads.
+# Recognised "not yet classified" fallback leaf names used across the tree.
+# Most folders fall back to "To be Classified"; the Drawing and Manual
+# subfolders (under "Drawings and Manuals") use "Other Drawings" / "Other
+# Manuals" instead. Reject-upload routing reuses whichever one already
+# exists in a given folder rather than always defaulting to the generic name.
 FALLBACK_LEAF_NAMES = {"to be classified", "other drawings", "other manuals"}
 
-# The top-level main folders (now nested one level deeper — see
-# SPECIFIC_VESSELS_ROOT / COMMON_SHIPS_ROOT below).
+
+# The top-level main folders.
 MAIN_FOLDERS = [
     "Technical & Crewing",
     "Commercial & Chartering",
     "Insurance",
+    "Kaizen - Knowledge Bank",
 ]
 
-# Kaizen has no per-ship split — it lives directly at the document root
-# (sibling of the Vessels folder), NOT inside Specific Vessels or Common for all ships.
+# Main folders that are flat and shared: same content for every user, no
+# per-vessel ship folder and no "Common for all ships" split (unlike the
+# other main folders, which are cloned per vessel via SHIP_TEMPLATE below).
 FLAT_MAIN_FOLDERS = [
     "Kaizen - Knowledge Bank",
 ]
-ALL_MAIN_FOLDERS = MAIN_FOLDERS + FLAT_MAIN_FOLDERS
-
-# Top-level container at the drive root; everything vessel-related nests
-# inside it.
-VESSELS_ROOT = "Vessels"
-
-# Two containers nested inside VESSELS_ROOT.
-SPECIFIC_VESSELS_ROOT = "Specific Vessels"
-COMMON_SHIPS_ROOT = "Common for all ships"
 
 # ---------------------------------------------------------------------------
-# Per-ship sub-tree for each main folder — unchanged content, same names as
-# the PDF, now created under Specific Vessels/{Ship Name}/{Main Folder}/...
+# Per-ship sub-tree for each main folder.
 # ---------------------------------------------------------------------------
 SHIP_TEMPLATE = {
     "Technical & Crewing": [
@@ -116,11 +101,10 @@ SHIP_TEMPLATE = {
                 leaf("To be Classified"),
             ],
         ),
-          folder(
+        folder(
             "PO & Invoice",
             [
-                leaf("Purchase Order"),
-                leaf("Vendor Invoice"),
+                leaf("Purchase Order and Vendor Invoice"),
             ],
         ),
         leaf("Incidents"),
@@ -157,55 +141,66 @@ SHIP_TEMPLATE = {
 }
 
 # ---------------------------------------------------------------------------
-# Common tree for each main folder, now created directly under
-# COMMON_SHIPS_ROOT/{Main Folder}/... — the old per-main wrapper folder
-# ("Common for all ships", "Common Agreements (Not Ship Specific)", "Common
-# (Not Ship Specific)") is dropped because COMMON_SHIPS_ROOT is now that
-# same container, one level up, shared by all three main folders.
+# "Common for all ships" sub-tree for each main folder.
 # ---------------------------------------------------------------------------
 COMMON_TEMPLATE = {
-    "Technical & Crewing": [
-        folder(
-            "Vendor & Service Agreements",
-            [leaf("Vendor & Service Provider Agreement"), leaf("To be Classified")],
-        ),
-        leaf("Vendor Management"),
-        leaf("To be Classified"),
-    ],
-    "Commercial & Chartering": [
-        folder(
-            "Agreements",
-            [
-                leaf("Charter party"),
-                leaf("Pool Agreement"),
-                leaf("Commission Agreement"),
-                leaf("To be Classified"),
-            ],
-        ),
-        leaf("To be Classified"),
-    ],
-    "Insurance": [
-        leaf("Agreements"),
-        leaf("Miscellaneous"),
-    ],
+    "Technical & Crewing": folder(
+        "Common for all ships",
+        [
+            folder(
+                "Vendor & Service Agreements",
+                [leaf("Vendor & Service Provider Agreement"), leaf("To be Classified")],
+            ),
+            leaf("Vendor Management"),
+            leaf("To be Classified"),
+        ],
+    ),
+    "Commercial & Chartering": folder(
+        "Common Agreements (Not Ship Specific)",
+        [
+            folder(
+                "Agreements",
+                [
+                    leaf("Charter party"),
+                    leaf("Pool Agreement"),
+                    leaf("Commission Agreement"),
+                    leaf("To be Classified"),
+                ],
+            ),
+            leaf("To be Classified"),
+        ],
+    ),
+    "Insurance": folder(
+        "Common (Not Ship Specific)",
+        [leaf("Agreements"), leaf("Miscellaneous")],
+    ),
 }
 
 # ---------------------------------------------------------------------------
-# Kaizen - Knowledge Bank — flat, shared, unchanged. Lives directly under
-# COMMON_SHIPS_ROOT/Kaizen - Knowledge Bank/...
+# Flat, shared sub-tree for each entry in FLAT_MAIN_FOLDERS — placed directly
+# under the main folder itself (no ship/common split).
 # ---------------------------------------------------------------------------
 FLAT_TEMPLATE = {
     "Kaizen - Knowledge Bank": [
         leaf("Templates"),
-        leaf("Procedures and Work Instructions"),
+        folder(
+            "Procedures and Work Instructions",
+            [
+                leaf("Equipment Maker"),
+                leaf("Class"),
+                leaf("Flag ⁄ Port State"),
+                leaf("SIRE⁄OCIMF⁄RightShip"),
+                leaf("Shipyard"),
+            ],
+        ),
         leaf("Lessons Learned"),
         folder(
             "Circulars and Guidance",
             [
                 leaf("Equipment Maker"),
                 leaf("Class"),
-                leaf("Flag / Port State"),
-                leaf("SIRE/OCIMF/RightShip"),
+                leaf("Flag ⁄ Port State"),
+                leaf("SIRE⁄OCIMF⁄RightShip"),
                 leaf("Shipyard"),
             ],
         ),

@@ -25,6 +25,10 @@ class Vessel(Base):
     shipyard: Mapped[str | None] = mapped_column(String(200), nullable=True)
     hull_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     vessel_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # A vessel is registered before its SharePoint tree is built.  This flag
+    # is the source of truth for the UI's Provision / Already Provisioned
+    # state; it is only set after the complete tree has been created.
+    is_provisioned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     folders: Mapped[list["Folder"]] = relationship(
@@ -158,6 +162,23 @@ class DeletedItem(Base):
     item_id: Mapped[str] = mapped_column(String(256), unique=True, index=True)
     item_type: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DeletedVessel(Base):
+    """Tracks vessels deleted from the app so the Recycle Bin page always
+    shows all deleted vessels, even when the SharePoint recycle bin API
+    has a propagation delay or returns a partial list."""
+
+    __tablename__ = "deleted_vessels"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vessel_name: Mapped[str] = mapped_column(String(200), index=True)
+    vessel_imo: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    vessel_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    original_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    deleted_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
 
 class UserProfile(Base):
@@ -445,5 +466,30 @@ class EmailAttachment(Base):
     content: Mapped[bytes] = mapped_column(LargeBinary)
 
     email_log: Mapped["EmailLog"] = relationship(back_populates="attachments")
+
+
+class FolderAlert(Base):
+    """Alert emitted when a new folder is created in SharePoint Online.
+
+    Surfaced to users via the top-header alert bell in the SPFx web part,
+    replacing the old per-module (Documents / Vessels) notifications. Covers
+    both manual sub-folder creation (create_subfolder) and vessel provisioning
+    (the ship folder + main/category sub-tree created for a new vessel).
+    """
+
+    __tablename__ = "folder_alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    folder_name: Mapped[str] = mapped_column(String(400))
+    folder_path: Mapped[str] = mapped_column(String(1024))
+    parent_folder_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    vessel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    department: Mapped[str] = mapped_column(String(100), default="All Departments")
+    created_by_email: Mapped[str] = mapped_column(String(320), default="")
+    created_by_name: Mapped[str] = mapped_column(String(200), default="")
+    alert_type: Mapped[str] = mapped_column(String(40), default="folder_created")  # folder_created / vessel_provisioned
+    read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

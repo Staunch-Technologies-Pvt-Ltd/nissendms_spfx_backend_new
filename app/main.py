@@ -2,12 +2,16 @@ import time
 
 _FLAT_TREE_CACHE = {"data": None, "timestamp": 0}
 _FOLDER_CHILDREN_CACHE = {}  # folder_id -> (data, timestamp)
-CACHE_TTL_FLAT_TREE = 60  # 60 seconds
-CACHE_TTL_CHILDREN = 30   # 30 seconds
+CACHE_TTL_FLAT_TREE = 5   # 5 seconds — short enough to reflect SPO uploads quickly
+CACHE_TTL_CHILDREN = 3    # 3 seconds — near-real-time for folder contents
+
+_LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
+CACHE_TTL_LIVE_SPO_FILES = 60   # 60 seconds
 
 def invalidate_folder_caches(folder_id: str = None):
-    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE
+    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE
     _FLAT_TREE_CACHE = {"data": None, "timestamp": 0}
+    _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
     if folder_id:
         _FOLDER_CHILDREN_CACHE.pop(folder_id, None)
     else:
@@ -54,7 +58,7 @@ def _cors_origins() -> list[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 # Read-only endpoints safe to cache briefly in the browser
-_CACHEABLE_PREFIXES = ("/api/folders/", "/api/mains", "/api/vessels")
+_CACHEABLE_PREFIXES = ("/api/folders/", "/api/mains")
 
 # Unified CORS + Private Network Access middleware
 # Must run BEFORE CORSMiddleware so PNA preflight responses are returned immediately.
@@ -97,7 +101,20 @@ async def cors_and_pna_middleware(request: Request, call_next):
         resp.headers["Vary"] = "Origin"
         return resp
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Starlette's default 500 response is created outside the route stack,
+        # which can otherwise omit CORS headers. Return a JSON error here so an
+        # SPFx page can receive the real HTTP failure instead of a misleading
+        # browser-level CORS error.
+        logging.getLogger(__name__).exception(
+            "Unhandled backend error for %s %s", request.method, request.url.path
+        )
+        response = JSONResponse(
+            status_code=500,
+            content={"message": "The server could not complete this request. Check the backend log for details."},
+        )
 
     # Inject PNA & CORS headers on every response so subsequent non-preflight requests succeed
     if origin_allowed and origin:
@@ -106,6 +123,8 @@ async def cors_and_pna_middleware(request: Request, call_next):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Session-ID, X-User-Email, X-Requested-With, Accept, Origin"
         response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Private-Network"] = "true"
+    response.headers["Access-Control-Allow-Origin"] = response.headers.get("Access-Control-Allow-Origin") or (origin if origin else "*")
+    response.headers["Access-Control-Allow-Credentials"] = "true"
 
 
     # Cache-control
@@ -1141,11 +1160,67 @@ async def list_vessels(_session: object = Depends(require_session)):
     return await get_backend().list_vessels()
 
 
+_LIVE_SPO_FILES_FETCHING = False
+
+
+async def _bg_refresh_live_spo_files(folder_ids_to_fetch: list[str]):
+    """Background task to fetch live SPO files without blocking list_vessels_flat_tree responses."""
+    global _LIVE_SPO_FILES_FETCHING, _LIVE_SPO_FILES_CACHE, _FLAT_TREE_CACHE
+    if _LIVE_SPO_FILES_FETCHING:
+        return
+    _LIVE_SPO_FILES_FETCHING = True
+    try:
+        if not settings.graph_configured:
+            return
+        from .graph.client import graph as _graph
+        from .config import settings as _settings
+        drive_id_val = _settings.drive_id
+        if not drive_id_val:
+            return
+
+        async def _fetch_folder_files(folder_id: str) -> tuple[str, list[dict]]:
+            try:
+                url = f"/drives/{drive_id_val}/items/{folder_id}/children?$select=id,name,size,lastModifiedDateTime,file&$top=200"
+                data = await _graph().get(url)
+                files = [i for i in (data.get("value") or []) if "file" in i]
+                return folder_id, [{"name": f["name"], "id": f["id"]} for f in files]
+            except Exception:
+                return folder_id, []
+
+        live_spo_files: dict[str, list[dict]] = {}
+        BATCH = 40
+        for i in range(0, len(folder_ids_to_fetch), BATCH):
+            batch = folder_ids_to_fetch[i:i + BATCH]
+            batch_results = await asyncio.gather(*[_fetch_folder_files(fid) for fid in batch])
+            for fid, files in batch_results:
+                if files:
+                    live_spo_files[fid] = files
+            await asyncio.sleep(0.05)
+
+        _LIVE_SPO_FILES_CACHE["data"] = live_spo_files
+        _LIVE_SPO_FILES_CACHE["timestamp"] = time.time()
+        _FLAT_TREE_CACHE["data"] = None
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Background SPO files fetch warning: %s", exc)
+    finally:
+        _LIVE_SPO_FILES_FETCHING = False
+
+
 @app.get("/api/vessels/flat-tree")
-async def list_vessels_flat_tree(_session: object = Depends(require_session)):
+async def list_vessels_flat_tree(
+    force_refresh: bool = Query(default=False),
+    vessel_name: str | None = Query(default=None),
+    recent_vessels: int | None = Query(default=None, ge=1, le=20),
+    vessel_limit: int | None = Query(default=None, ge=1, le=20),
+    vessel_offset: int = Query(default=0, ge=0),
+    _session: object = Depends(require_session),
+):
+    vessel_window = vessel_limit or recent_vessels
     now = time.time()
-    if _FLAT_TREE_CACHE["data"] is not None and (now - _FLAT_TREE_CACHE["timestamp"]) < CACHE_TTL_FLAT_TREE:
-        return _FLAT_TREE_CACHE["data"]
+    # When filtering by vessel, skip cache and do a fast targeted DB query
+    if not vessel_name and not vessel_window:
+        if not force_refresh and _FLAT_TREE_CACHE["data"] is not None and (now - _FLAT_TREE_CACHE["timestamp"]) < CACHE_TTL_FLAT_TREE:
+            return _FLAT_TREE_CACHE["data"]
 
     def clean(s: str) -> str:
         return s.strip("_").strip() if s else s
@@ -1153,6 +1228,8 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
     if not settings.db_configured:
         be = get_backend()
         vessels = await be.list_vessels()
+        if vessel_window and not vessel_name:
+            vessels = vessels[vessel_offset:vessel_offset + vessel_window]
         mains = await be.mains()
         out = []
         sr = 0
@@ -1166,8 +1243,9 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
                     cat_nodes = await be.children(ship_node["id"])
                 else:
                     cat_nodes = [c for c in children if c.get("kind") not in ("file", "ship")]
-
-                async def _recurse_categories(nodes, current_path):
+                async def _recurse_categories(nodes, current_path, path_parts=None):
+                    if path_parts is None:
+                        path_parts = []
                     nonlocal sr
                     for c in nodes:
                         if c.get("kind") == "file":
@@ -1175,6 +1253,7 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
                         
                         cname = clean(c["name"])
                         new_path = f"{current_path} > {cname}"
+                        new_parts = path_parts + [cname]
                         
                         try:
                             children = await be.children(c["id"])
@@ -1185,35 +1264,41 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
                         sub_folders = [f for f in children if f.get("kind") not in ("file", "file_wrapper")]
                         
                         if sub_folders:
-                            await _recurse_categories(sub_folders, new_path)
+                            await _recurse_categories(sub_folders, new_path, new_parts)
                         elif file_children:
                             for fn in file_children:
                                 sr += 1
+                                category_name = path_parts[0] if path_parts else cname
+                                sub_cat_name = cname
                                 out.append({
                                     "srNo": str(sr),
                                     "vesselName": vname,
                                     "group": mname,
-                                    "category": cname,
+                                    "category": category_name,
+                                    "subCategory": sub_cat_name,
                                     "subFolderPath": new_path,
                                     "fileName": fn.get("name"),
                                     "fileId": fn.get("id"),
                                     "canUpload": bool(c.get("upload", True)),
-                                    "groupKey": f"{v['id']}||{mname}||{cname}||{new_path}",
+                                    "groupKey": f"{v['id']}||{mname}||{category_name}||{sub_cat_name}||{new_path}",
                                     "uploadFolderId": c["id"],
                                     "monthDriven": bool(c.get("month_driven")),
                                 })
                         else:
                             sr += 1
+                            category_name = path_parts[0] if path_parts else cname
+                            sub_cat_name = cname
                             out.append({
                                 "srNo": str(sr),
                                 "vesselName": vname,
                                 "group": mname,
-                                "category": cname,
+                                "category": category_name,
+                                "subCategory": sub_cat_name,
                                 "subFolderPath": new_path,
                                 "fileName": None,
                                 "fileId": None,
                                 "canUpload": bool(c.get("upload", True)),
-                                "groupKey": f"{v['id']}||{mname}||{cname}||{new_path}",
+                                "groupKey": f"{v['id']}||{mname}||{category_name}||{sub_cat_name}||{new_path}",
                                 "uploadFolderId": c["id"],
                                 "monthDriven": bool(c.get("month_driven")),
                             })
@@ -1224,11 +1309,29 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
         return out
 
     from .db.base import SessionLocal
-    from .db.models import Folder, Vessel
+    from .db.models import Folder, Vessel, ApprovalRequest
 
     out = []
     with SessionLocal() as db:
-        results = (
+        # Build approved file map: uploadFolderId -> list of (filename, fileId)
+        approved_files: dict[str, list[dict]] = {}
+        approved_rows = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.status == "approved",
+                ApprovalRequest.action_type == "upload",
+                ApprovalRequest.destination_folder_id.isnot(None),
+                ApprovalRequest.filename.isnot(None),
+            )
+            .all()
+        )
+        for ar in approved_rows:
+            fid = ar.destination_folder_id
+            if fid not in approved_files:
+                approved_files[fid] = []
+            approved_files[fid].append({"name": ar.filename, "id": ar.target_id or str(ar.id)})
+
+        q = (
             db.query(Folder, Vessel)
             .join(Vessel, Folder.vessel_id == Vessel.id)
             .filter(
@@ -1236,29 +1339,101 @@ async def list_vessels_flat_tree(_session: object = Depends(require_session)):
                 Folder.drive_item_id.isnot(None),
                 Folder.vessel_id.isnot(None),
             )
-            .order_by(Vessel.name.asc(), Folder.path.asc())
-            .all()
         )
-        for i, (f, v) in enumerate(results):
-            parts = f.path.split("/") if f.path else []
-            main_name = clean(parts[0]) if parts else ""
-            group = clean(parts[2]) if len(parts) > 2 else ""
-            cat = clean(parts[3]) if len(parts) > 3 else (clean(parts[-1]) if parts else clean(f.name))
-            vessel_name = clean(v.name)
-            sub_path = f"{vessel_name} > {group} > {cat}"
+        if vessel_name:
+            q = q.filter(Vessel.name.ilike(vessel_name.strip()))
+        elif vessel_window:
+            # Apply paging before loading leaf folders. This keeps the initial
+            # Documents view fast and supports loading later vessels in small
+            # batches on demand.
+            recent_ids = [
+                vessel_id for (vessel_id,) in db.query(Vessel.id)
+                .order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc())
+                .offset(vessel_offset)
+                .limit(vessel_window)
+                .all()
+            ]
+            q = q.filter(Vessel.id.in_(recent_ids))
+        results = q.order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc(), Folder.path.asc()).all()
+
+    # Keep the list endpoint DB-fast.  Fetching every leaf folder from
+    # SharePoint here can take minutes for a large library and blocks the UI.
+    # Return any already-cached SPO files, refresh that cache in the background,
+    # and let the client fetch a folder live only when the user opens it.
+    now_live = time.time()
+    live_spo_files: dict[str, list[dict]] = _LIVE_SPO_FILES_CACHE.get("data") or {}
+
+    if settings.graph_configured and (now_live - _LIVE_SPO_FILES_CACHE.get("timestamp", 0)) >= CACHE_TTL_LIVE_SPO_FILES:
+        folder_ids_to_fetch = list(dict.fromkeys(
+            f.drive_item_id for f, v in results
+            if f.drive_item_id
+        ))
+        if folder_ids_to_fetch and not _LIVE_SPO_FILES_FETCHING:
+            asyncio.create_task(_bg_refresh_live_spo_files(folder_ids_to_fetch))
+
+    for i, (f, v) in enumerate(results):
+        parts = f.path.split("/") if f.path else []
+        # New path structure: Vessels / Specific Vessels / {Ship Name} / {Main} / ...
+        # parts[0]=Vessels, parts[1]=Specific Vessels, parts[2]=Ship Name,
+        # parts[3]=Main Folder (group), parts[4+]=sub-categories
+        vessel_name  = clean(v.name)
+        if len(parts) >= 4:
+            group        = clean(parts[3])   # Technical & Crewing / Commercial & Chartering / Insurance
+            category     = clean(parts[4]) if len(parts) > 4 else group
+            sub_category = clean(parts[-1]) if len(parts) > 5 else category
+        else:
+            group        = clean(parts[0]) if parts else ""
+            category     = clean(parts[-1]) if parts else clean(f.name)
+            sub_category = category
+
+        breadcrumb_parts = [vessel_name, group, category]
+        if sub_category and sub_category != category:
+            breadcrumb_parts.append(sub_category)
+        sub_path = " > ".join(breadcrumb_parts)
+
+        # Merge approved DB files + live SPO files (deduplicate by name)
+        folder_files: list[dict] = list(approved_files.get(f.drive_item_id, []))
+        spo_names = {ff["name"] for ff in folder_files}
+        for spo_file in live_spo_files.get(f.drive_item_id, []):
+            if spo_file["name"] not in spo_names:
+                folder_files.append(spo_file)
+                spo_names.add(spo_file["name"])
+
+        if folder_files:
+            for j, file_entry in enumerate(folder_files):
+                out.append({
+                    "srNo": str(i + 1) + (f".{j+1}" if j > 0 else ""),
+                    "vesselName": vessel_name,
+                    "group": group,
+                    "category": category,
+                    "subCategory": sub_category,
+                    "subFolderPath": sub_path,
+                    "fileName": file_entry["name"],
+                    "fileId": file_entry["id"],
+                    "canUpload": True,
+                    "groupKey": f"{vessel_name}||{group}||{category}||{sub_category}||{sub_path}",
+                    "uploadFolderId": f.drive_item_id,
+                    "monthDriven": f.month_driven,
+                })
+        else:
             out.append({
                 "srNo": str(i + 1),
                 "vesselName": vessel_name,
                 "group": group,
-                "category": cat,
+                "category": category,
+                "subCategory": sub_category,
                 "subFolderPath": sub_path,
                 "fileName": None,
                 "fileId": None,
                 "canUpload": True,
-                "groupKey": f"{v.id}||{main_name}||{group}||{cat}||{sub_path}",
+                "groupKey": f"{vessel_name}||{group}||{category}||{sub_category}||{sub_path}",
                 "uploadFolderId": f.drive_item_id,
                 "monthDriven": f.month_driven,
             })
+    # Only store unfiltered results in the shared cache.
+    if not vessel_name and not vessel_window:
+        _FLAT_TREE_CACHE["data"] = out
+        _FLAT_TREE_CACHE["timestamp"] = time.time()
     return out
 
 
@@ -1415,6 +1590,40 @@ async def reprovision_vessel(vessel_id: str):
         _raise(e)
 
 
+@app.post("/api/vessels/{vessel_id}/provision")
+async def start_vessel_provisioning(
+    vessel_id: str,
+    _session: object = Depends(require_session),
+):
+    """Ensure background provisioning is running for this vessel.
+
+    This is safe to call from the Provision button while the automatic job
+    started at vessel creation is still in progress.
+    """
+    try:
+        return await get_backend().start_vessel_provisioning(vessel_id)
+    except NotFound as e:
+        _raise(e)
+
+
+@app.get("/api/vessels/{vessel_id}/provision-status")
+async def vessel_provision_status(
+    vessel_id: str,
+    _session: object = Depends(require_session),
+):
+    try:
+        vessel_id_num = int(vessel_id)
+    except ValueError:
+        raise HTTPException(404, "Vessel not found")
+    from .db.base import SessionLocal
+    from .db import models as db_models
+    with SessionLocal() as db:
+        vessel = db.query(db_models.Vessel).filter_by(id=vessel_id_num).one_or_none()
+        if vessel is None:
+            raise HTTPException(404, "Vessel not found")
+        return {"vessel_id": vessel_id, "is_provisioned": bool(vessel.is_provisioned)}
+
+
 @app.post("/api/vessels/repair-links")
 async def repair_vessel_links():
     """Scan all ship-kind folders with vessel_id=None and link them to the
@@ -1530,7 +1739,8 @@ async def stats(_session: object = Depends(require_session)):
 @app.post("/api/folders/upload-by-path")
 async def upload_by_path(
     path: str,
-    file: UploadFile,
+    file: UploadFile = None,
+    resolve_only: bool = Query(default=False),
     uploader_email: str | None = Form(None),
     uploader_name: str | None = Form(None),
     user_email: str | None = Form(None),
@@ -1538,10 +1748,17 @@ async def upload_by_path(
     _session: object = Depends(require_session),
 ):
     """Same as POST /api/folders/{folder_id}/upload, but the target folder is
-    given as a logical path (e.g. 'Folder-3 Insurance/Bow Fighter') instead
-    of a resolved folder id. Used by the webpart's REST fallback for folders
-    it only knows by path (containing '/'), where it can't derive a folder
-    id without an extra lookup round-trip."""
+    given as a logical path. When resolve_only=true, just returns the resolved
+    folder_id without uploading (used by the frontend to resolve path-based IDs)."""
+    path = (path or "").lstrip("/").strip()
+    if resolve_only:
+        try:
+            folder_id = await get_backend().resolve_path(path)
+            return {"folder_id": folder_id}
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+    if file is None:
+        raise HTTPException(400, "file is required")
     data = await file.read()
     email = uploader_email or user_email or x_user_email or "unknown@example.com"
     name = uploader_name or email.split("@")[0]
@@ -2005,6 +2222,47 @@ async def reject_approval(
 
 
 # ---------------------------------------------------------------------------
+# Folder-creation alerts (top-header alert bell)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/alerts")
+async def list_folder_alerts(
+    unread: bool = False,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Return folder-creation alerts (newly created SharePoint Online folders)
+    for the top-header alert bell. Pass unread=true to filter to unread only."""
+    if not x_user_email:
+        raise HTTPException(400, "X-User-Email header required")
+    return await get_backend().list_folder_alerts(unread_only=unread)
+
+
+@app.post("/api/alerts/{alert_id}/read")
+async def mark_alert_read(
+    alert_id: str,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    if not x_user_email:
+        raise HTTPException(400, "X-User-Email header required")
+    res = await get_backend().mark_folder_alert_read(alert_id, read=True)
+    if res is None:
+        raise HTTPException(404, "Alert not found")
+    return res
+
+
+@app.post("/api/alerts/read-all")
+async def mark_all_alerts_read(
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    if not x_user_email:
+        raise HTTPException(400, "X-User-Email header required")
+    return await get_backend().mark_all_folder_alerts_read()
+
+
+# ---------------------------------------------------------------------------
 # Session management endpoints
 # ---------------------------------------------------------------------------
 
@@ -2323,4 +2581,4 @@ async def scan_anomalies_endpoint():
             ]
     except Exception as exc:
         _logger.warning("Scan anomalies failed: %s", exc)
-        return []
+        return []

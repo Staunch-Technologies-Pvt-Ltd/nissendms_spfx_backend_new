@@ -59,7 +59,7 @@ async def main(apply: bool) -> None:
     stale = []
 
     # Check items concurrently in small batches to avoid hammering Graph.
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(3)
 
     async def check(folder):
         nonlocal valid
@@ -68,7 +68,12 @@ async def main(apply: bool) -> None:
                 await gd.get_item(drive_id, folder.drive_item_id)
                 valid += 1
             except Exception as exc:
-                stale.append((folder, str(exc)))
+                err_str = str(exc)
+                # 429 = throttled — item may still exist; skip, don't mark stale
+                if "429" in err_str or "activityLimitReached" in err_str or "throttl" in err_str.lower():
+                    valid += 1  # assume valid, retry later
+                    return
+                stale.append((folder, err_str))
 
     await asyncio.gather(*(check(f) for f in folders))
 

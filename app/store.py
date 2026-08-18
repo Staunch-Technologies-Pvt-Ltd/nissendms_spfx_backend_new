@@ -34,6 +34,9 @@ class Store:
         # id -> pending/approved/rejected approval request dict.
         self.approvals = {}
         self._approval_ids = itertools.count(1)
+        # Top-header alert bell: folder-creation alerts (in-memory for stub mode).
+        self.folder_alerts = []
+        self._alert_ids = itertools.count(1)
         self._build_roots()
 
     # ------------------------------------------------------------------ build
@@ -70,18 +73,33 @@ class Store:
     def _build_roots(self):
         self.roots = []
         self.main_folders = {}  # name -> node
+
+        # Documents root: Vessels
+        vessels_root = self._make_node(template.VESSELS_ROOT, "root", None)
+        self.roots.append(vessels_root["id"])
+
+        # Vessels/Specific Vessels
+        specific = self._make_node(template.SPECIFIC_VESSELS_ROOT, "root", vessels_root["id"])
+
+        # Vessels/Common for all ships  +  its per-main sub-folders
+        common = self._make_node(template.COMMON_SHIPS_ROOT, "root", vessels_root["id"])
         for name in template.MAIN_FOLDERS:
-            main = self._make_node(name, "main", None)
-            self.roots.append(main["id"])
+            main = self._make_node(name, "main", common["id"])
             self.main_folders[name] = main
-            if name in template.FLAT_MAIN_FOLDERS:
-                # Flat, shared main folder — same content for everyone, no
-                # per-vessel ship folder and no "Common for all ships" split.
-                for spec in template.FLAT_TEMPLATE[name]:
-                    self._build_subtree(spec, main["id"])
-            else:
-                # The "Common for all ships" branch lives once per main folder.
-                self._build_subtree(template.COMMON_TEMPLATE[name], main["id"])
+            for spec in template.COMMON_TEMPLATE[name]:
+                self._build_subtree(spec, main["id"])
+
+        # Kaizen - Knowledge Bank at Documents root (sibling of Vessels)
+        kaizen_name = template.FLAT_MAIN_FOLDERS[0]
+        kaizen = self._make_node(kaizen_name, "main", None)
+        self.roots.append(kaizen["id"])
+        self.main_folders[kaizen_name] = kaizen
+        for spec in template.FLAT_TEMPLATE[kaizen_name]:
+            self._build_subtree(spec, kaizen["id"])
+
+        # Keep references for add_vessel
+        self._specific_vessels_id = specific["id"]
+
         self._seed_sample_archive_and_recycle_bin()
 
     def _seed_sample_archive_and_recycle_bin(self):
@@ -135,14 +153,16 @@ class Store:
     # ----------------------------------------------------------------- vessels
     def add_vessel(self, name, imo=None, shipyard=None, hull_number=None, vessel_type=None):
         ship_folder_ids = {}
-        for main_name, main in self.main_folders.items():
+        # Create {Ship Name} under Vessels/Specific Vessels
+        ship_root = self._make_node(name, "ship", self._specific_vessels_id)
+        ship_root["vessel"] = name
+        for main_name in template.MAIN_FOLDERS:
             if main_name in template.FLAT_MAIN_FOLDERS:
                 continue
-            ship = self._make_node(name, "ship", main["id"])
-            ship["vessel"] = name
+            main_node = self._make_node(main_name, "main", ship_root["id"])
             for spec in template.SHIP_TEMPLATE[main_name]:
-                self._build_subtree(spec, ship["id"])
-            ship_folder_ids[main_name] = ship["id"]
+                self._build_subtree(spec, main_node["id"])
+            ship_folder_ids[main_name] = main_node["id"]
         vessel = {
             "id": _new_id(),
             "name": name,
@@ -170,11 +190,15 @@ class Store:
         if name is not None:
             new_name = name.strip()
             if new_name:
+                old_name = vessel["name"]
                 vessel["name"] = new_name
-                for main_name, ship_id in vessel.get("ship_folders", {}).items():
-                    if ship_id in self.nodes:
-                        self.nodes[ship_id]["name"] = new_name
-                        self.nodes[ship_id]["vessel"] = new_name
+                # Rename the ship root node under Specific Vessels
+                for cid in self.nodes.get(self._specific_vessels_id, {}).get("children", []):
+                    node = self.nodes.get(cid)
+                    if node and node.get("kind") == "ship" and node.get("vessel") == old_name:
+                        node["name"] = new_name
+                        node["vessel"] = new_name
+                        break
 
         if imo is not None:
             vessel["imo"] = imo.strip() or None
@@ -418,16 +442,15 @@ class Store:
                 msg = f"Duplicate files upload, file already exists in folder: {existing_path}"
             raise DuplicateFile(msg)
 
-        # 2. Check fitz (PyMuPDF) and paddleocr installations explicitly
+        # 2. Check fitz (PyMuPDF) and paddleocr \u2014 if missing, fall back to To be Classified
         try:
             # pyrefly: ignore [missing-import]
-            import fitz
+            import fitz  # noqa: F401
             # pyrefly: ignore [missing-import]
-            from paddleocr import PaddleOCR
-        except (ImportError, ModuleNotFoundError) as ocr_err:
-            raise InternalServerError(
-                "Extraction pdf is not working and so upload not possible kindly create the manual folder and contact technical support team for installation"
-            ) from ocr_err
+            from paddleocr import PaddleOCR  # noqa: F401
+        except (ImportError, ModuleNotFoundError):
+            # OCR libraries not installed \u2014 still allow upload, route to To be Classified
+            pass
 
         # 3. Detect month
         year, month = _detect_month(filename)
@@ -932,6 +955,49 @@ class Store:
 
     def get_archived_ids(self):
         return list(self.archived_ids)
+
+    # ----------------------------------------------------------- folder alerts
+    def add_folder_alert(
+        self, *,
+        drive_item_id=None, folder_name, folder_path, parent_folder_id=None,
+        vessel_name=None, department="All Departments",
+        created_by_email="", created_by_name="", alert_type="folder_created",
+    ):
+        now = datetime.now().isoformat()
+        alert = {
+            "id": str(next(self._alert_ids)),
+            "drive_item_id": drive_item_id,
+            "folder_name": folder_name,
+            "folder_path": folder_path,
+            "parent_folder_id": parent_folder_id,
+            "vessel_name": vessel_name,
+            "department": department,
+            "created_by_email": created_by_email or "",
+            "created_by_name": created_by_name or "",
+            "alert_type": alert_type,
+            "read": False,
+            "created_at": now,
+        }
+        self.folder_alerts.insert(0, alert)
+        return dict(alert)
+
+    def list_folder_alerts(self, unread_only=False):
+        items = self.folder_alerts
+        if unread_only:
+            items = [a for a in items if not a["read"]]
+        return [dict(a) for a in items]
+
+    def mark_alert_read(self, alert_id, read=True):
+        for a in self.folder_alerts:
+            if a["id"] == alert_id:
+                a["read"] = read
+                return dict(a)
+        return None
+
+    def mark_all_alerts_read(self):
+        for a in self.folder_alerts:
+            a["read"] = True
+        return len(self.folder_alerts)
 
 
 # --------------------------------------------------------------------- helpers

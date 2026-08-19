@@ -29,6 +29,7 @@ import logging
 import os
 import warnings
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 # ── Timezone: tell tzlocal/APScheduler the system is UTC+5:30 (IST) ──────────
 os.environ.setdefault("TZ", "Asia/Kolkata")
@@ -1356,13 +1357,58 @@ async def list_vessels_flat_tree(
             q = q.filter(Vessel.id.in_(recent_ids))
         results = q.order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc(), Folder.path.asc()).all()
 
+        # A vessel-specific refresh must return the current SharePoint contents in
+        # the same response. The shared cache is intentionally background-refreshed
+        # for broad list loads, but using it here can return rows without files for
+        # up to 60 seconds after an upload or browser refresh.
+        live_spo_files: dict[str, list[dict]] = _LIVE_SPO_FILES_CACHE.get("data") or {}
+        if vessel_name and settings.graph_configured:
+            from .graph import drive as gd
+            from .graph.client import graph as graph_client
+
+            async def fetch_folder_files(folder_id: str, folder_path: str) -> tuple[str, list[dict]]:
+                def parse_files(items: list[dict]) -> list[dict]:
+                    return [
+                        {"name": item["name"], "id": item["id"]}
+                        for item in items if "file" in item
+                    ]
+
+                try:
+                    children = await gd.list_children(settings.drive_id, folder_id)
+                    files = parse_files(children)
+                    if files:
+                        return folder_id, files
+                except Exception:
+                    pass
+
+                # Folder IDs cached in the database can predate a drive change.
+                # Resolve the current folder by its stable logical path instead.
+                try:
+                    encoded_path = "/".join(quote(part, safe="") for part in folder_path.split("/"))
+                    data = await graph_client().get(
+                        f"/drives/{settings.drive_id}/root:/{encoded_path}:/children"
+                        "?$select=id,name,size,lastModifiedDateTime,file&$top=200"
+                    )
+                    return folder_id, parse_files(data.get("value") or [])
+                except Exception:
+                    return folder_id, []
+
+            folder_ids = list(dict.fromkeys(f.drive_item_id for f, _ in results if f.drive_item_id))
+            folder_paths = {f.drive_item_id: f.path for f, _ in results if f.drive_item_id}
+            semaphore = asyncio.Semaphore(8)
+
+            async def bounded_fetch(folder_id: str) -> tuple[str, list[dict]]:
+                async with semaphore:
+                    return await fetch_folder_files(folder_id, folder_paths.get(folder_id, ""))
+
+            live_results = await asyncio.gather(*(bounded_fetch(folder_id) for folder_id in folder_ids))
+            live_spo_files.update({folder_id: files for folder_id, files in live_results})
+
     # Keep the list endpoint DB-fast.  Fetching every leaf folder from
     # SharePoint here can take minutes for a large library and blocks the UI.
     # Return any already-cached SPO files, refresh that cache in the background,
     # and let the client fetch a folder live only when the user opens it.
     now_live = time.time()
-    live_spo_files: dict[str, list[dict]] = _LIVE_SPO_FILES_CACHE.get("data") or {}
-
     if settings.graph_configured and (now_live - _LIVE_SPO_FILES_CACHE.get("timestamp", 0)) >= CACHE_TTL_LIVE_SPO_FILES:
         folder_ids_to_fetch = list(dict.fromkeys(
             f.drive_item_id for f, v in results

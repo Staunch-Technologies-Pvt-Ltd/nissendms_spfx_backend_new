@@ -193,6 +193,8 @@ COMMON_TEMPLATE = {
 # ---------------------------------------------------------------------------
 # Kaizen - Knowledge Bank — flat, shared, unchanged. Lives directly under
 # COMMON_SHIPS_ROOT/Kaizen - Knowledge Bank/...
+# Kaizen - Knowledge Bank — flat, shared, unchanged. Lives directly under
+# Documents, alongside the Vessels folder.
 # ---------------------------------------------------------------------------
 FLAT_TEMPLATE = {
     "Kaizen - Knowledge Bank": [

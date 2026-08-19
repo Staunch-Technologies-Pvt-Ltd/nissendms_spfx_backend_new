@@ -529,6 +529,37 @@ class RealBackend:
             )
         return month_item
 
+    async def _remove_legacy_kaizen_folders(self, drive_id, specific_id, common_id):
+        """Remove Kaizen folders left in vessel-specific locations.
+
+        Kaizen is a single Documents-root folder. Older provisioning placed
+        copies under Common for all ships and individual vessel folders.
+        """
+        kaizen_name = template.FLAT_MAIN_FOLDERS[0]
+        misplaced: list[tuple[str, str]] = []
+
+        common_kaizen = await gd.find_child(drive_id, common_id, kaizen_name)
+        if common_kaizen:
+            misplaced.append((f"{template.VESSELS_ROOT}/{template.COMMON_SHIPS_ROOT}/{kaizen_name}", common_kaizen["id"]))
+
+        for vessel in await gd.list_children(drive_id, specific_id):
+            if not vessel.get("folder"):
+                continue
+            vessel_kaizen = await gd.find_child(drive_id, vessel["id"], kaizen_name)
+            if vessel_kaizen:
+                misplaced.append((
+                    f"{template.VESSELS_ROOT}/{template.SPECIFIC_VESSELS_ROOT}/{vessel['name']}/{kaizen_name}",
+                    vessel_kaizen["id"],
+                ))
+
+        for path, item_id in misplaced:
+            await gd.delete_item(drive_id, item_id)
+            with SessionLocal() as db:
+                db.query(models.Folder).filter(
+                    (models.Folder.path == path) | models.Folder.path.like(f"{path}/%")
+                ).delete(synchronize_session=False)
+                db.commit()
+
     async def ensure_base_structure(self):
         if self._base_ready:
             return
@@ -554,6 +585,11 @@ class RealBackend:
         missing_kaizen = kaizen_name not in existing_mains and kaizen_name not in existing_roots
 
         if not missing_roots and not missing_common_mains and not missing_kaizen:
+            await self._remove_legacy_kaizen_folders(
+                drive_id,
+                existing_roots[specific_path].drive_item_id,
+                existing_roots[common_path].drive_item_id,
+            )
             self._base_ready = True
             return
 
@@ -585,6 +621,10 @@ class RealBackend:
             item = await gd.ensure_folder(drive_id, vessels_id, name)
             root_items[path] = item["id"]
             to_upsert_roots.append((path, name, item["id"]))
+
+        await self._remove_legacy_kaizen_folders(
+            drive_id, root_items[specific_path], root_items[common_path]
+        )
 
         # 3. "Kaizen - Knowledge Bank" directly at Documents root (sibling of Vessels)
         # Never created inside Specific Vessels or Common for all ships.

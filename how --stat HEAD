@@ -1,0 +1,38 @@
+[33mcommit 799faaa52d8ceb0f98b33e8357bc484a623e6da2[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/feature/kamalnath-backend[m[33m, [m[1;32mfeature/kamalnath-backend[m[33m)[m
+Author: Kamalnath Murugan <software@staunchtec.com>
+Date:   Tue Aug 18 12:17:17 2026 +0530
+
+    commited the changes
+
+ .env                                               |    4 [32m+[m[31m-[m
+ README.md                                          |  358 [32m+[m[31m-[m
+ _fix_folder_structure.py                           |   81 [32m+[m
+ alembic/versions/0013_vessel_is_provisioned.py     |   31 [32m+[m
+ .../0013_vessel_is_provisioned.cpython-314.pyc     |  Bin [31m0[m -> [32m2373[m bytes
+ app/__pycache__/config.cpython-314.pyc             |  Bin [31m10289[m -> [32m10289[m bytes
+ app/__pycache__/main.cpython-314.pyc               |  Bin [31m133395[m -> [32m147557[m bytes
+ app/__pycache__/store.cpython-314.pyc              |  Bin [31m48136[m -> [32m49115[m bytes
+ app/__pycache__/template.cpython-314.pyc           |  Bin [31m9473[m -> [32m4977[m bytes
+ app/db/__pycache__/models.cpython-314.pyc          |  Bin [31m36810[m -> [32m40803[m bytes
+ app/db/models.py                                   |   46 [32m+[m
+ app/main.py                                        | 4910 [32m++++++++++[m[31m----------[m
+ app/services/__pycache__/classify.cpython-314.pyc  |  Bin [31m3797[m -> [32m5058[m bytes
+ .../__pycache__/real_backend.cpython-314.pyc       |  Bin [31m180970[m -> [32m209380[m bytes
+ .../__pycache__/stub_backend.cpython-314.pyc       |  Bin [31m53296[m -> [32m57822[m bytes
+ app/services/anomaly_detector.py                   |  210 [32m+[m[31m-[m
+ app/services/classify.py                           |   89 [32m+[m[31m-[m
+ app/services/real_backend.py                       | 1136 [32m+++[m[31m--[m
+ app/services/stub_backend.py                       |  120 [32m+[m[31m-[m
+ app/store.py                                       |  118 [32m+[m[31m-[m
+ app/template.py                                    |  318 [32m+[m[31m-[m
+ app/template.py.bak                                |  208 [32m+[m
+ repair_stale_folder_links.py                       |    9 [32m+[m[31m-[m
+ scratch/__pycache__/check_spo.cpython-314.pyc      |  Bin [31m0[m -> [32m2029[m bytes
+ scratch/check_spo.py                               |   35 [32m+[m
+ scratch/find_vm.py                                 |   41 [32m+[m
+ scratch/list_all_sites.py                          |   29 [32m+[m
+ scratch/list_drives.py                             |   31 [32m+[m
+ scratch/list_root_drives.py                        |   17 [32m+[m
+ scratch/search_sp.py                               |   27 [32m+[m
+ scratch/test_graph_path.py                         |   26 [32m+[m
+ 31 files changed, 4637 insertions(+), 3207 deletions(-)

@@ -9,6 +9,7 @@
 """
 import asyncio
 import json
+import time
 import uuid
 from datetime import date, datetime
 from sqlalchemy import func, or_ as sa_or
@@ -1598,7 +1599,7 @@ class RealBackend:
                         folder.path = new_prefix + folder.path[len(old_prefix):]
                     db.commit()
 
-                v_updated = db.query(models.Vessel).filter_by(id=int(vessel_id)).one()
+            v_updated = db.query(models.Vessel).filter_by(id=int(vessel_id)).one()
             return {
                 "id": str(v_updated.id),
                 "name": v_updated.name,
@@ -1844,24 +1845,67 @@ class RealBackend:
             "knowledge bank": "Kaizen - Knowledge Bank",
         }
 
-        # Swap if vessel name comes first e.g. "MV Pacific Test / Technical & Crewing / Registration / Flag & MPA"
-        if len(parts) >= 2 and parts[1].lower() in main_map:
+        # Swap if the main folder comes first, e.g.
+        # "Technical & Crewing / MV Pacific Test / Registration / Flag & MPA".
+        if len(parts) >= 2 and parts[0].lower() in main_map and parts[1].lower() not in main_map:
             parts[0], parts[1] = parts[1], parts[0]
 
         if parts and parts[0].lower() in main_map:
             parts[0] = main_map[parts[0].lower()]
 
-        normalized = "/".join(parts)
+        # Frontend breadcrumbs omit the physical library prefix and use the
+        # vessel display name first: "MV 124/Insurance/Flag & MPA". Resolve
+        # that form against the canonical stored path before any leaf-name
+        # fallback, otherwise a pool slot with the same leaf can be selected.
+        canonical_candidates = ["/".join(parts)]
+        if len(parts) >= 2 and parts[1].lower() in main_map:
+            canonical_candidates.insert(0, "/".join([
+                template.VESSELS_ROOT,
+                template.SPECIFIC_VESSELS_ROOT,
+                parts[0],
+                main_map[parts[1].lower()],
+                *parts[2:],
+            ]))
+        normalized = canonical_candidates[0]
+
+        drive_id = await self._drive()
+
+        async def valid_cached_folder(folder_id: str, expected_path: str) -> bool:
+            try:
+                actual_path = await self._folder_path(drive_id, folder_id)
+                actual = actual_path.strip("/").lower()
+                expected = expected_path.strip("/").lower()
+                return actual == expected or actual.endswith(f"/{expected}")
+            except Exception:
+                log.warning("resolve_path: stale folder cache entry id=%s path=%s", folder_id, expected_path)
+                return False
 
         with SessionLocal() as db:
-            # 1. Exact path match (case insensitive)
-            row = (
-                db.query(models.Folder)
-                .filter(func.lower(models.Folder.path) == normalized.lower())
-                .first()
-            )
-            if row and row.drive_item_id:
-                return row.drive_item_id
+            # 1. Exact canonical path match (case insensitive).
+            for candidate in canonical_candidates:
+                row = (
+                    db.query(models.Folder)
+                    .filter(func.lower(models.Folder.path) == candidate.lower())
+                    .first()
+                )
+                if row and row.drive_item_id and await valid_cached_folder(row.drive_item_id, candidate):
+                    return row.drive_item_id
+
+            # Support legacy punctuation variants without losing vessel scope.
+            scoped_candidates = []
+            for candidate in canonical_candidates:
+                scoped_candidates.extend([
+                    candidate.replace("Flag & MPA", "Flag - MPA"),
+                    candidate.replace("Flag & MPA", "Flag / MPA"),
+                ])
+            for candidate in scoped_candidates:
+                row = (
+                    db.query(models.Folder)
+                    .filter(func.lower(models.Folder.path) == candidate.lower())
+                    .first()
+                )
+                if row and row.drive_item_id and await valid_cached_folder(row.drive_item_id, candidate):
+                    return row.drive_item_id
 
             # 2. Prefix / subfolder match
             leaf_row = (
@@ -1877,22 +1921,26 @@ class RealBackend:
                 )
                 .first()
             )
-            if leaf_row and leaf_row.drive_item_id:
+            if leaf_row and leaf_row.drive_item_id and await valid_cached_folder(leaf_row.drive_item_id, normalized):
                 return leaf_row.drive_item_id
 
-            # 3. Match by leaf folder name
+            # 3. Match by leaf folder name only inside the requested vessel.
+            # Never use a global leaf lookup: pool slots share the same leaf
+            # names and may otherwise receive the upload.
             if len(parts) >= 2:
-                leaf_name = parts[-1]
+                leaf_name = parts[-1].lower()
+                vessel_prefix = f"{template.VESSELS_ROOT.lower()}/{template.SPECIFIC_VESSELS_ROOT.lower()}/{parts[0].lower()}/"
                 fuzzy_leaf = (
                     db.query(models.Folder)
                     .filter(
-                        func.lower(models.Folder.name) == leaf_name.lower(),
+                        func.lower(models.Folder.name).in_([leaf_name, "flag - mpa", "flag / mpa"]),
+                        func.lower(models.Folder.path).like(f"{vessel_prefix}%"),
                         models.Folder.drive_item_id.isnot(None)
                     )
                     .order_by(models.Folder.id.desc())
                     .first()
                 )
-                if fuzzy_leaf and fuzzy_leaf.drive_item_id:
+                if fuzzy_leaf and fuzzy_leaf.drive_item_id and await valid_cached_folder(fuzzy_leaf.drive_item_id, fuzzy_leaf.path):
                     return fuzzy_leaf.drive_item_id
 
             # 4. On-demand auto-reprovision if vessel folder structure is missing
@@ -2092,10 +2140,21 @@ class RealBackend:
                     ]
                 if not ship_folder_ids:
                     return  # nothing provisioned for this vessel yet
-                results = await asyncio.gather(
-                    *[gd.search_items_in(drive_id, fid, filename) for fid in ship_folder_ids],
-                    return_exceptions=True,
-                )
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(
+                            *[gd.search_items_in(drive_id, fid, filename) for fid in ship_folder_ids],
+                            return_exceptions=True,
+                        ),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Duplicate scan timed out after 3s; continuing upload: filename=%s vessel_id=%s",
+                        filename,
+                        vessel_id,
+                    )
+                    return
                 for r in results:
                     if isinstance(r, Exception):
                         continue
@@ -2148,6 +2207,7 @@ class RealBackend:
         SPE Admin uploads are filed immediately and recorded as an activity
         notification instead."""
         drive_id = await self._drive()
+        started_at = time.monotonic()
         
         # Retry logic: if the folder doesn't exist yet (e.g., vessel just created),
         # wait briefly and retry up to 3 times before giving up
@@ -2168,6 +2228,7 @@ class RealBackend:
                 )
         
         flags = classify(path.split("/"))
+        log.info("Upload target resolved in %.3fs: folder_id=%s path=%s", time.monotonic() - started_at, folder_id, path)
         if flags.get("month_driven"):
             return await self.month_upload(
                 folder_id, filename, None, content, content_type,
@@ -2180,6 +2241,7 @@ class RealBackend:
             )
         department, vessel_id, vessel_name, _ = await self._resolve_department_vessel(target_id)
         await self._check_global_duplicate(drive_id, filename, target_id, dest_path, vessel_id=vessel_id)
+        log.info("Upload duplicate checks completed in %.3fs: filename=%s", time.monotonic() - started_at, filename)
 
         display = self._display(uploaded_by_email, uploaded_by_name)
 
@@ -2193,6 +2255,7 @@ class RealBackend:
 
         # Always upload directly to the destination folder in SharePoint Online
         item = await gd.upload_file(drive_id, target_id, filename, content, content_type)
+        log.info("Graph upload completed in %.3fs: filename=%s target_id=%s", time.monotonic() - started_at, filename, target_id)
         item_url = item.get("webUrl") or folder_web_url
         approval = await self._create_activity(
             action_type="upload",
@@ -2443,18 +2506,18 @@ class RealBackend:
         except (ImportError, ModuleNotFoundError):
             ocr_available = False
 
-        detected = None
+        detected = {"year": None, "month": None, "label": None, "text_empty": False}
         if ocr_available:
             try:
-                detected = await asyncio.to_thread(
+                detected = (await asyncio.to_thread(
                     detect_document_month, content, filename, content_type or ""
-                )
+                )) or detected
             except Exception:
                 # Treat OCR errors as undetectable — route to To be Classified
-                detected = None
+                pass
 
         if detected and detected.get("text_empty"):
-            detected = None  # Can't determine date — fall back to To be Classified
+            detected = {"year": None, "month": None, "label": None, "text_empty": True}
 
         # 1. Determine target folder path and dest_path beforehand
         if detected and detected.get("year") is not None:
@@ -2582,9 +2645,14 @@ class RealBackend:
                 if row and (row.drive_item_id or row.target_id):
                     resolved_id = row.drive_item_id or row.target_id
         drive_id = await self._drive()
+        log.info("File download requested: file_id=%s resolved_id=%s drive_id=%s", file_id, resolved_id, drive_id)
         try:
             return await gd.download_file(drive_id, resolved_id)
-        except GraphError:
+        except GraphError as e:
+            log.warning(
+                "File download failed: file_id=%s resolved_id=%s drive_id=%s graph_status=%s error=%s",
+                file_id, resolved_id, drive_id, e.status, e,
+            )
             return None
 
 

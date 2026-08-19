@@ -51,6 +51,7 @@ from .services.errors import BadRequest, Conflict, NotFound, InternalServerError
 _profile_cache: dict[str, dict] = {}
 
 app = FastAPI(title="Vessel DMS", version="1.0.0")
+logger = logging.getLogger("vessel_dms")
 
 def _cors_origins() -> list[str]:
     raw = settings.allowed_origins or "*"
@@ -115,6 +116,14 @@ async def cors_and_pna_middleware(request: Request, call_next):
         response = JSONResponse(
             status_code=500,
             content={"message": "The server could not complete this request. Check the backend log for details."},
+        )
+
+    if response.status_code >= 400:
+        logger.warning(
+            "HTTP failure: %s %s -> %s",
+            request.method,
+            request.url.path,
+            response.status_code,
         )
 
     # Inject PNA & CORS headers on every response so subsequent non-preflight requests succeed
@@ -1800,8 +1809,10 @@ async def upload_by_path(
     if resolve_only:
         try:
             folder_id = await get_backend().resolve_path(path)
+            logger.info("Folder navigation resolve: path=%s folder_id=%s", path, folder_id)
             return {"folder_id": folder_id}
         except (NotFound, BadRequest) as e:
+            logger.warning("Folder navigation resolve failed: path=%s error=%s", path, e)
             _raise(e)
     if file is None:
         raise HTTPException(400, "file is required")
@@ -1822,6 +1833,37 @@ async def upload_by_path(
         return result
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
+    except Exception as e:
+        logger.exception(
+            "Upload-by-path failure: path=%s filename=%s error=%s",
+            path,
+            file.filename if file else None,
+            e,
+        )
+        raise HTTPException(status_code=500, detail="Upload failed. Check the backend log for details.")
+
+
+@app.get("/api/folders/upload-by-path")
+async def resolve_upload_path(
+    path: str,
+    _session: object = Depends(require_session),
+):
+    """Resolve a logical folder path for frontend refreshes.
+
+    Keep this route explicit so FastAPI does not route the literal
+    ``upload-by-path`` segment into ``/api/folders/{folder_id}``.
+    """
+    normalized_path = (path or "").lstrip("/").strip()
+    try:
+        folder_id = await get_backend().resolve_path(normalized_path)
+        logger.info("Folder refresh resolve: path=%s folder_id=%s", normalized_path, folder_id)
+        return {"folder_id": folder_id}
+    except (NotFound, BadRequest) as e:
+        logger.warning("Folder refresh resolve failed: path=%s error=%s", normalized_path, e)
+        _raise(e)
+    except Exception as e:
+        logger.exception("Folder path resolution failure: path=%s error=%s", normalized_path, e)
+        raise HTTPException(status_code=500, detail="Folder path resolution failed. Check the backend log for details.")
 
 
 @app.get("/api/folders/{folder_id}/children")
@@ -1878,6 +1920,14 @@ async def upload(
         return result
     except (NotFound, BadRequest, Conflict) as e:
         _raise(e)
+    except Exception as e:
+        logger.exception(
+            "Folder upload failure: folder_id=%s filename=%s error=%s",
+            folder_id,
+            file.filename if file else None,
+            e,
+        )
+        raise HTTPException(status_code=500, detail="Upload failed. Check the backend log for details.")
 
 
 class CreateSubfolderIn(BaseModel):
@@ -1964,15 +2014,21 @@ async def month_upload(
     except (NotFound, BadRequest, Conflict, InternalServerError) as e:
         _raise(e)
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).exception("Unexpected error in month_upload for folder %s", folder_id)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {type(e).__name__}: {e}")
+        logger.exception(
+            "Month upload failure: folder_id=%s filename=%s category=%s error=%s",
+            folder_id,
+            file.filename if file else None,
+            category,
+            e,
+        )
+        raise HTTPException(status_code=500, detail="Upload failed. Check the backend log for details.")
 
 
 @app.get("/api/files/{file_id}/content")
 async def file_content(file_id: str, _session: object = Depends(require_session)):
     result = await get_backend().get_file(file_id)
     if result is None:
+        logger.warning("File content not found: file_id=%s", file_id)
         raise HTTPException(404, "File not found")
     content, content_type, name = result
     return Response(
@@ -2016,6 +2072,30 @@ class LogActivityIn(BaseModel):
     email: str
     action: str
     detail: str | None = None
+
+
+class SharePointNavigationLogIn(BaseModel):
+    navigation_id: str
+    event: str
+    ui_path: str | None = None
+    sharepoint_path: str | None = None
+    details: dict = {}
+
+
+@app.post("/api/diagnostics/sharepoint-navigation", status_code=204)
+async def log_sharepoint_navigation(
+    payload: SharePointNavigationLogIn,
+    _session: object = Depends(require_session),
+):
+    logger.info(
+        "SharePoint folder navigation: navigation_id=%s event=%s ui_path=%s sharepoint_path=%s details=%s",
+        payload.navigation_id,
+        payload.event,
+        payload.ui_path,
+        payload.sharepoint_path,
+        payload.details,
+    )
+    return Response(status_code=204)
 
 
 @app.post("/api/activity", status_code=204)
@@ -2282,6 +2362,42 @@ async def list_folder_alerts(
     if not x_user_email:
         raise HTTPException(400, "X-User-Email header required")
     return await get_backend().list_folder_alerts(unread_only=unread)
+
+
+@app.get("/api/alerts/all")
+async def list_all_alerts(
+    unread: bool = False,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Aggregate DMS, CRUD activity, and email notifications for the top bell."""
+    if not x_user_email:
+        raise HTTPException(400, "X-User-Email header required")
+    alerts = await get_backend().list_folder_alerts(unread_only=unread)
+    if not settings.db_configured:
+        return alerts
+    from .db import models as db_models
+    from .db.base import SessionLocal
+    with SessionLocal() as db:
+        activities = db.query(db_models.ActivityLog).order_by(db_models.ActivityLog.created_at.desc()).limit(100).all()
+        emails = db.query(db_models.EmailLog).order_by(db_models.EmailLog.created_at.desc()).limit(100).all()
+        alerts.extend({
+            "id": f"crud_{row.id}", "drive_item_id": None,
+            "folder_name": row.action.replace("_", " ").title(), "folder_path": row.detail or row.action,
+            "parent_folder_id": None, "vessel_name": None, "department": "Application",
+            "created_by_email": row.user_email, "created_by_name": row.user_email,
+            "alert_type": "crud_operation", "alert_category": "crud", "read": False,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        } for row in activities)
+        alerts.extend({
+            "id": f"email_{row.id}", "drive_item_id": None,
+            "folder_name": row.subject_final or "Email notification", "folder_path": f"{row.status} → {row.recipient}",
+            "parent_folder_id": None, "vessel_name": row.vessel_name, "department": "Email",
+            "created_by_email": "", "created_by_name": "Email automation",
+            "alert_type": "email_alert", "alert_category": "email", "read": False,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        } for row in emails)
+    return sorted(alerts, key=lambda item: item.get("created_at") or "", reverse=True)
 
 
 @app.post("/api/alerts/{alert_id}/read")

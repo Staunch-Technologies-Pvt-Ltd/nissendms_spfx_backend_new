@@ -432,11 +432,55 @@ class StubBackend:
             raise NotFound("Folder not found")
         return store.children(folder_id)
 
+    async def get_dashboard_stats(self, force_refresh: bool = False) -> dict:
+        total_vessels = len(store.vessels)
+        all_docs = []
+        for node in store.nodes.values():
+            if node.get("kind") == "file":
+                all_docs.append({
+                    "id": node["id"],
+                    "name": node["name"],
+                    "vessel": "Shared Documents",
+                    "type": "Document",
+                    "modified": "Today",
+                    "modifiedEpoch": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    "status": "Valid",
+                    "fileSize": "—",
+                    "subFolderPath": node.get("path", ""),
+                })
+        pending_approvals = len([a for a in getattr(store, "approvals", []) if isinstance(a, dict) and a.get("status") == "pending"])
+        total_docs = len(all_docs)
+        return {
+            "total_documents": total_docs,
+            "total_vessels": total_vessels,
+            "pending_approvals": pending_approvals,
+            "expiring_soon_count": 0,
+            "expired_count": 0,
+            "valid_count": total_docs,
+            "recent_documents": all_docs[:10],
+            "documents": all_docs,
+            "expiry_overview": {
+                "total": total_docs,
+                "expired": 0,
+                "expiring_soon": 0,
+                "valid": total_docs,
+                "expired_pct": 0,
+                "expiring_pct": 0,
+                "valid_pct": 100,
+            },
+        }
+
     async def stats(self):
-        return store.stats()
+        dash = await self.get_dashboard_stats()
+        base = store.stats()
+        return {
+            **base,
+            **dash,
+        }
+
 
     # ------------------------------------------------------------ uploads
-    async def upload(self, folder_id, filename, content, content_type, uploaded_by_email, uploaded_by_name):
+    async def upload(self, folder_id, filename, content, content_type, uploaded_by_email, uploaded_by_name, access_token=None, sp_access_token=None):
         """Non-admin uploads stage a pending approval exactly as before.
         SPE Admin uploads are filed immediately and recorded as an activity
         notification instead."""
@@ -625,10 +669,19 @@ class StubBackend:
         self, folder_id: str, requesting_email=None, requesting_name=None,
     ):
         node = store.get_node(folder_id)
+        folder_name = folder_id
         if node is None:
-            raise NotFound("Folder not found")
-        department = self._resolve_department(folder_id)
-        vessel_name = self._resolve_vessel_name_for_node(folder_id)
+            # Try finding node by path or name
+            clean_name = folder_id.replace("\\", "/").replace(" > ", "/").strip("/").split("/")[-1]
+            for n_id, n_data in getattr(store, "_nodes", {}).items():
+                if n_data.get("name", "").lower() == clean_name.lower():
+                    node = n_data
+                    folder_id = n_id
+                    break
+        if node:
+            folder_name = node.get("name", folder_id)
+        department = self._resolve_department(folder_id) if node else "Technical & Crewing"
+        vessel_name = self._resolve_vessel_name_for_node(folder_id) if node else ""
         display = self._display(requesting_email, requesting_name)
         vessel_clause = f" from vessel {vessel_name}" if vessel_name else ""
         return await self._admin_or_pending(
@@ -638,14 +691,14 @@ class StubBackend:
             department=department,
             vessel_name=vessel_name,
             target_id=folder_id,
-            target_description=node["name"],
+            target_description=folder_name,
             payload={},
             pending_message=(
                 f"{display} ({requesting_email}) is requesting approval to delete the "
-                f"folder '{node['name']}'{vessel_clause}."
+                f"folder '{folder_name}'{vessel_clause}."
             ),
             activity_message=(
-                f"SPE Admin ({requesting_email}) deleted the folder '{node['name']}'"
+                f"SPE Admin ({requesting_email}) deleted the folder '{folder_name}'"
                 f"{vessel_clause}. No approval was required."
             ),
             execute=lambda: self._execute_delete_folder(folder_id),
@@ -653,7 +706,7 @@ class StubBackend:
 
     async def _execute_delete_folder(self, folder_id):
         if store.get_node(folder_id) is None:
-            return {"deleted": False}
+            return {"deleted": True}
         return {"deleted": store.delete_folder(folder_id)}
 
     async def get_file(self, file_id):

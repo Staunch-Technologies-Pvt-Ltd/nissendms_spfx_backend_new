@@ -23,7 +23,7 @@ async def test_user_lookup():
         return
     
     app_token = token_resp.json().get("access_token", "")
-    print("✓ Got access token")
+    print("[OK] Got access token")
     
     # Test user lookup
     email = "spe.admin@sg-nissenkaiun.com"
@@ -38,7 +38,7 @@ async def test_user_lookup():
     print(f"User lookup status: {user_resp.status_code}")
     if user_resp.status_code == 200:
         user_data = user_resp.json()
-        print(f"✓ User found:")
+        print(f"[OK] User found:")
         print(f"  Display Name: {user_data.get('displayName')}")
         print(f"  Mail: {user_data.get('mail')}")
         print(f"  UPN: {user_data.get('userPrincipalName')}")

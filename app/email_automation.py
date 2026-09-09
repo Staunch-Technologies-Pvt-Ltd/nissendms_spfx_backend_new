@@ -483,10 +483,12 @@ async def bento_dispatch_form(
     elif attachment_name and file_id:
         # Download the file directly from Graph using the drive item ID
         try:
-            from .graph.drive import download_file as _dl, get_container_drive_id as _gcd
+            from .graph.drive import download_file as _dl
             from .config import settings as _s
 
-            drive_id = _s.drive_id or await _gcd(_s.container_id)
+            drive_id = _s.drive_id
+            if not drive_id:
+                raise RuntimeError("DRIVE_ID is not configured for SharePoint Online mode")
             file_content, file_content_type, _ = await _dl(drive_id, file_id)
             attachments.append(AttachmentInput(
                 filename=attachment_name,

@@ -29,6 +29,8 @@ class Vessel(Base):
     # is the source of truth for the UI's Provision / Already Provisioned
     # state; it is only set after the complete tree has been created.
     is_provisioned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set when a vessel is restored from Recycle Bin and re-activated in DB.
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     folders: Mapped[list["Folder"]] = relationship(
@@ -291,7 +293,10 @@ class FolderAnomaly(Base):
     vessel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     spo_path: Mapped[str] = mapped_column(String(1024))
     resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     detected_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class ApprovalRequest(Base):
@@ -468,6 +473,112 @@ class EmailAttachment(Base):
     email_log: Mapped["EmailLog"] = relationship(back_populates="attachments")
 
 
+class DocumentCategory(Base):
+    """User-managed document category definitions that drive OCR classification and tagging.
+
+    Each row defines:
+    - name               : display name (e.g. "Drawing", "Manual", "Invoice")
+    - department         : which DMS main folder this belongs to
+    - dms_path_template  : path template with {key} placeholders, e.g.
+                           "{group}/{vessel}/Drawings and Manuals/{category}/{sub_category}"
+    - tag_fields_json    : JSON array of TagFieldDef objects — the dynamic set of
+                           metadata fields shown in the staging review UI.
+                           Shape: [{"key": str, "label": str, "type": str,
+                                    "required": bool, "options": list[str] | null}]
+                           Allowed types: text | textarea | select_vessel | select_dept
+                                          | select_category | select
+    - ocr_hints_json     : JSON array of keyword strings used for scoring during
+                           OCR classification (supplements the built-in taxonomy).
+    - is_active          : soft-delete flag
+    """
+    __tablename__ = "document_categories"
+
+    _DEFAULT_TAG_FIELDS = (
+        '[{"key":"vessel","label":"Vessel Name","type":"select_vessel","required":true,"options":null},'
+        '{"key":"group","label":"Department","type":"select_dept","required":true,"options":null},'
+        '{"key":"category","label":"Category","type":"text","required":true,"options":null},'
+        '{"key":"sub_category","label":"Sub-Category","type":"text","required":false,"options":null}]'
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    department: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    dms_path_template: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # JSON-encoded list of TagFieldDef objects (see docstring)
+    tag_fields_json: Mapped[str] = mapped_column(Text, default=_DEFAULT_TAG_FIELDS)
+    # JSON-encoded list of keyword hint strings for OCR scoring
+    ocr_hints_json: Mapped[str] = mapped_column(Text, default="[]")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    staging_files: Mapped[list["OcrStagingFile"]] = relationship(
+        back_populates="category", cascade="save-update, merge"
+    )
+
+
+class OcrStagingFile(Base):
+    """Unified OCR staging queue entry — one row per file queued for review.
+
+    Populated by POST /api/ocr/stage-file regardless of whether the file came
+    from a folder upload (BulkUploadModal) or a single-file upload.
+
+    Lifecycle:
+        ocr_pending   → file is queued; OCR extraction has not run yet
+        ocr_complete  → text extracted; classification in progress
+        tag_suggested → category matched + suggested_tags populated (confidence ≥ 0.40)
+                        OR low-confidence placeholder (category_id=NULL, tags empty)
+        moved         → user approved; file relocated in SharePoint
+        dismissed     → user dismissed without moving
+
+    Upsert rule: if a row with the same drive_item_id already exists and its status
+    is NOT 'moved' or 'dismissed', the existing row is returned (no duplicate insert).
+    When drive_item_id is NULL, fall back to filename+source_folder_id uniqueness
+    within a 60-second window.
+    """
+    __tablename__ = "ocr_staging_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filename: Mapped[str] = mapped_column(String(400))
+    # SharePoint drive item ID of the uploaded file (nullable before Graph confirms it)
+    drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    source_folder_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source_subfolder_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    vessel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # "folder" = BulkUploadModal; "direct" = single-file upload
+    upload_source: Mapped[str] = mapped_column(String(20), default="direct", index=True)
+    # ocr_pending | ocr_complete | tag_suggested | moved | dismissed
+    status: Mapped[str] = mapped_column(String(30), default="ocr_pending", index=True)
+
+    # FK to the matched DocumentCategory (NULL when confidence < 0.40 or no match)
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("document_categories.id", ondelete="SET NULL"), nullable=True
+    )
+    category: Mapped["DocumentCategory | None"] = relationship(back_populates="staging_files")
+
+    # JSON dict of suggested tag values, e.g. {"vessel": "MV Aurora", "group": "Technical & Crewing"}
+    # Keys match the category's tag_fields_json[*].key values
+    suggested_tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # First 1000 chars of extracted OCR text for UI preview
+    ocr_text_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 0.0–1.0; NULL when OCR has not run yet
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    # JSON array of matched keyword strings (up to 10)
+    matched_keywords_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Resolved SharePoint path after placeholder substitution — set just before the move call
+    final_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    uploaded_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    # Non-fatal OCR error message (file still queued for manual review)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class FolderAlert(Base):
     """Alert emitted when a new folder is created in SharePoint Online.
 
@@ -490,6 +601,61 @@ class FolderAlert(Base):
     created_by_name: Mapped[str] = mapped_column(String(200), default="")
     alert_type: Mapped[str] = mapped_column(String(40), default="folder_created")  # folder_created / vessel_provisioned
     read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SiteConfigurationChange(Base):
+    """Audit log for site configuration changes made by admins.
+    
+    Tracks when an admin switches the active SharePoint site/database via the UI.
+    Used for compliance, debugging, and rollback purposes.
+    """
+    __tablename__ = "site_configuration_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    # Admin email who performed the change
+    changed_by_email: Mapped[str] = mapped_column(String(320), index=True)
+    changed_by_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    
+    # Site keys (e.g., "local", "dev", "prod")
+    previous_site: Mapped[str] = mapped_column(String(100), index=True)
+    new_site: Mapped[str] = mapped_column(String(100), index=True)
+    
+    # Previous configuration details (for rollback reference)
+    previous_db_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    previous_drive_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    previous_site_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    
+    # New configuration details
+    new_db_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    new_drive_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    new_site_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    
+    # Status of the change
+    status: Mapped[str] = mapped_column(String(50), default="success")  # success / failed / rolled_back
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    
+    # Reason for the change
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SiteConfiguration(Base):
+    """Persisted SharePoint site and document-library selections."""
+    __tablename__ = "site_configurations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    site_key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(256))
+    site_name: Mapped[str] = mapped_column(String(256))
+    site_id: Mapped[str] = mapped_column(String(512))
+    drive_id: Mapped[str] = mapped_column(String(512))
+    created_by_email: Mapped[str] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 

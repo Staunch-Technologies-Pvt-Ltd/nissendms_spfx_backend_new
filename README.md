@@ -13,7 +13,7 @@ service that:
   vessel-folder pool replenishment.
 
 One code path sits over two backends (`app/services/__init__.py`): the **real**
-backend (SharePoint Embedded / Graph + PostgreSQL) when configured, or an
+backend (SharePoint Online / Graph + PostgreSQL) when configured, or an
 **in-memory stub** for dependency-free local development.
 
 ## Tech stack
@@ -40,7 +40,7 @@ app/
     drive.py            # SharePoint drive helpers (create folder, upload, move, download)
     http.py             # TLS verification helper
   services/
-    real_backend.py     # Graph + Postgres implementation
+    real_backend.py     # SharePoint Online Graph + Postgres implementation
     stub_backend.py     # In-memory implementation
     session_service.py  # Server-side sessions (create/validate/logout/revoke/audit)
     classify.py         # Vessel vs normal-folder classification
@@ -51,7 +51,6 @@ app/
   scheduler.py          # APScheduler jobs (precreate_next_month, pool replenishment)
   store.py              # In-memory store helpers
 alembic/                # Versioned migrations
-scripts/create_container.py   # One-off: create the SharePoint Embedded container
 requirements.txt
 ```
 
@@ -81,7 +80,7 @@ Key groups:
 | Area | Keys |
 |---|---|
 | Entra / Graph | `AZURE_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` |
-| SharePoint Embedded | `CONTAINER_TYPE_ID`, `CONTAINER_ID`, `CONTAINER_DISPLAY_NAME`, `DRIVE_ID` |
+| SharePoint Online | `DRIVE_ID` |
 | PostgreSQL | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` |
 | CORS | `ALLOWED_ORIGINS` (comma-separated) |
 | Email (AI BANTO) | `GRAPH_SENDER_MAILBOX`, `AI_BANTO_RECIPIENT` |
@@ -89,7 +88,7 @@ Key groups:
 | Sessions | `SESSION_IDLE_TIMEOUT_MINUTES`, `SESSION_MAX_LIFETIME_HOURS`, `SESSION_REVALIDATION_INTERVAL_MINUTES` |
 | Other | `MONTH_FOLDER_FORMAT` (default `%B %Y`), `TRUSTED_PROXY_HOPS`, `GRAPH_VERIFY_SSL` |
 
-When `GRAPH_*` + container keys **and** DB keys are all set, the app boots in
+When `GRAPH_*` + `DRIVE_ID` **and** DB keys are all set, the app boots in
 `real` mode; otherwise it falls back to the `stub` backend so local development
 works with no Azure/Postgres. Check the active mode with `/api/health` (`"mode"`).
 

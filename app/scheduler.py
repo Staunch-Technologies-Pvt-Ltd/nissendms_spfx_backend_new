@@ -9,7 +9,7 @@ Jobs:
 
 All jobs are only active when Graph + DB are configured (real mode).
 """
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import asyncio
 import logging
 
@@ -21,6 +21,7 @@ from .db import models
 from .db.base import SessionLocal
 from .services.classify import classify
 from .ocr.dates import month_label
+from .graph.client import GraphError, graph
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,161 @@ def _next_month(year, month):
     return (year + 1, 1) if month == 12 else (year, month + 1)
 
 
+async def _log_sp_permission_diagnostics(drive_id: str) -> None:
+    """Run narrow SPO probes so 403s identify which operation is denied."""
+    from .graph import drive as gd
+
+    diag: dict[str, dict] = {}
+
+    async def _record(op: str, coro):
+        try:
+            result = await coro
+            diag[op] = {"ok": True, "result": result}
+            return result
+        except GraphError as e:
+            diag[op] = {"ok": False, "status": e.status, "error": str(e)}
+            return None
+        except Exception as e:
+            diag[op] = {"ok": False, "error": str(e)}
+            return None
+
+    root = await _record(
+        "drive_root_read",
+        graph().get(f"/drives/{drive_id}/root?$select=id,name,webUrl"),
+    )
+    root_id = str((root or {}).get("id") or "")
+
+    children = []
+    if root_id:
+        listed = await _record("drive_children_list", gd.list_children(drive_id, root_id))
+        children = listed or []
+    else:
+        diag.setdefault(
+            "drive_children_list",
+            {"ok": False, "error": "Skipped because drive_root_read did not return root id."},
+        )
+
+    if root_id:
+        probe_name = f"__perm_probe_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        created = await _record("folder_create_probe", gd.ensure_folder(drive_id, root_id, probe_name))
+        created_id = str((created or {}).get("id") or "")
+        if created_id:
+            await _record("folder_delete_probe", gd.delete_item(drive_id, created_id))
+        else:
+            diag.setdefault(
+                "folder_delete_probe",
+                {"ok": False, "error": "Skipped because folder_create_probe failed."},
+            )
+    else:
+        diag.setdefault(
+            "folder_create_probe",
+            {"ok": False, "error": "Skipped because drive_root_read did not return root id."},
+        )
+        diag.setdefault(
+            "folder_delete_probe",
+            {"ok": False, "error": "Skipped because folder_create_probe was not attempted."},
+        )
+
+    first_item_id = ""
+    first_item = next((it for it in children if it.get("id")), None)
+    if first_item:
+        first_item_id = str(first_item.get("id") or "")
+    if first_item_id:
+        await _record(
+            "listitem_fields_read_probe",
+            graph().get(f"/drives/{drive_id}/items/{first_item_id}/listItem/fields"),
+        )
+    else:
+        diag.setdefault(
+            "listitem_fields_read_probe",
+            {"ok": False, "error": "Skipped because no probe item was found under drive root."},
+        )
+
+    log.warning(
+        "[precreate_next_month] SPO permission diagnostics for drive %s: %s",
+        drive_id,
+        diag,
+    )
+
+
+async def _normalize_month_driven_rows_for_drive(
+    drive_id: str,
+) -> list[tuple[str, str, int | None]]:
+    """Return month-driven parent rows bound to the active drive.
+
+    Repairs stale cached drive_item_id values by resolving folder path on the
+    active drive and writing the corrected id back to DB.
+    """
+    from .graph import drive as gd
+
+    with SessionLocal() as db:
+        db_rows = [
+            (r.id, str(r.drive_item_id or "").strip(), str(r.path or "").strip(), r.vessel_id)
+            for r in db.query(models.Folder).filter_by(month_driven=True).all()
+        ]
+
+    resolved_rows: list[tuple[str, str, int | None]] = []
+    updates: dict[int, str] = {}
+    repaired = 0
+    skipped = 0
+
+    for row_id, cached_item_id, path, vessel_id in db_rows:
+        if not path:
+            skipped += 1
+            continue
+
+        resolved_item_id = cached_item_id
+        cached_valid = False
+
+        if cached_item_id:
+            try:
+                await gd.get_item(drive_id, cached_item_id, select="id")
+                cached_valid = True
+            except GraphError as e:
+                if e.status == 403:
+                    raise
+                cached_valid = False
+            except Exception:
+                cached_valid = False
+
+        if not cached_valid:
+            try:
+                by_path = await gd.get_item_by_path(drive_id, path, select="id")
+                resolved_item_id = str(by_path.get("id") or "").strip()
+            except GraphError as e:
+                if e.status == 403:
+                    raise
+                resolved_item_id = ""
+            except Exception:
+                resolved_item_id = ""
+
+        if not resolved_item_id:
+            skipped += 1
+            continue
+
+        resolved_rows.append((resolved_item_id, path, vessel_id))
+        if resolved_item_id != cached_item_id:
+            updates[row_id] = resolved_item_id
+            repaired += 1
+
+    if updates:
+        with SessionLocal() as db:
+            records = db.query(models.Folder).filter(models.Folder.id.in_(list(updates.keys()))).all()
+            for rec in records:
+                rec.drive_item_id = updates[rec.id]
+            db.commit()
+
+    if repaired or skipped:
+        log.info(
+            "[precreate_next_month] normalized month-driven parents for active drive: repaired=%d skipped=%d total=%d",
+            repaired,
+            skipped,
+            len(db_rows),
+        )
+
+    return resolved_rows
+
+
 async def precreate_next_month(force: bool = False) -> int:
     """Ensure next month's folders exist. Returns how many were processed."""
     from .services import get_backend
@@ -73,18 +229,27 @@ async def precreate_next_month(force: bool = False) -> int:
     ny, nm = _next_month(today.year, today.month)
     label = month_label(ny, nm) 
     drive_id = await backend._drive()
-    with SessionLocal() as db:
-        rows = [
-            (r.drive_item_id, r.path, r.vessel_id)
-            for r in db.query(models.Folder).filter_by(month_driven=True).all()
-        ]
+    rows = await _normalize_month_driven_rows_for_drive(drive_id)
     if not rows:
         return 0
 
     # Pass 1: batch-create the month folder itself for every vessel/main in one go.
-    month_items = await gd.batch_create_folders(
-        drive_id, [(item_id, label) for item_id, _, _ in rows]
-    )
+    try:
+        month_items = await gd.batch_create_folders(
+            drive_id, [(item_id, label) for item_id, _, _ in rows]
+        )
+    except GraphError as e:
+        msg = str(e).lower()
+        if e.status == 403 and "access denied" in msg:
+            await _log_sp_permission_diagnostics(drive_id)
+            log.warning(
+                "[precreate_next_month] Skipping precreate: Graph access denied for drive %s. "
+                "Check app permissions and site/library grants; run /api/debug/sharepoint-access-health. Error: %s",
+                drive_id,
+                e,
+            )
+            return 0
+        raise
 
     with SessionLocal() as db:
         month_paths = {}  # (item_id) -> (mpath, month_item_id)
@@ -109,9 +274,23 @@ async def precreate_next_month(force: bool = False) -> int:
             cat_targets.append((month_item_id, cat, mpath, vid))
 
     if cat_targets:
-        cat_items = await gd.batch_create_folders(
-            drive_id, [(mid, cat) for mid, cat, _, _ in cat_targets]
-        )
+        try:
+            cat_items = await gd.batch_create_folders(
+                drive_id, [(mid, cat) for mid, cat, _, _ in cat_targets]
+            )
+        except GraphError as e:
+            msg = str(e).lower()
+            if e.status == 403 and "access denied" in msg:
+                await _log_sp_permission_diagnostics(drive_id)
+                log.warning(
+                    "[precreate_next_month] Category precreate skipped: Graph access denied for drive %s. "
+                    "Month folder rows were processed, but category leaf precreate could not continue. "
+                    "Check app permissions and site/library grants; run /api/debug/sharepoint-access-health. Error: %s",
+                    drive_id,
+                    e,
+                )
+                return len(rows)
+            raise
         with SessionLocal() as db:
             for month_item_id, cat, mpath, vid in cat_targets:
                 item = cat_items.get((month_item_id, cat))

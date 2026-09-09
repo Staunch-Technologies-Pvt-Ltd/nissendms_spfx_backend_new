@@ -11,7 +11,7 @@ class Base(DeclarativeBase):
     pass
 
 
-# Engine is created only when a DATABASE_URL is configured. In stub mode this
+# Engine is created when a DATABASE_URL is configured. In stub mode this
 # stays None and the app uses the in-memory store instead.
 engine = (
     create_engine(settings.database_url_resolved, pool_pre_ping=True, future=True)
@@ -27,8 +27,12 @@ _session_factory = (
 
 
 def SessionLocal() -> Session:
-    if _session_factory is None:
+    global engine, _session_factory
+    if not settings.db_configured:
         raise RuntimeError("Database not configured (DATABASE_URL is empty).")
+    if engine is None or _session_factory is None:
+        engine = create_engine(settings.database_url_resolved, pool_pre_ping=True, future=True)
+        _session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     return _session_factory()
 
 

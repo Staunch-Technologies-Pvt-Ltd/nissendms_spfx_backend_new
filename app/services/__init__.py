@@ -4,13 +4,15 @@ Exposes a single `get_backend()` returning either the real SharePoint Embedded +
 PostgreSQL backend (when configured) or the in-memory stub. Both implement the
 same async interface so the API layer has one code path.
 """
+from typing import Any
+
 from ..config import settings
 
 _real_backend = None
 _stub_backend = None
 
 
-def get_backend():
+def get_backend() -> Any:
     global _real_backend, _stub_backend
     if settings.graph_configured and settings.db_configured:
         if _real_backend is None:

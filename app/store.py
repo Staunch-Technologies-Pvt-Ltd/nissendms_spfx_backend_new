@@ -74,31 +74,28 @@ class Store:
         self.roots = []
         self.main_folders = {}  # name -> node
 
-        # Documents root: Vessels
-        vessels_root = self._make_node(template.VESSELS_ROOT, "root", None)
-        self.roots.append(vessels_root["id"])
-
-        # Vessels/Specific Vessels
-        specific = self._make_node(template.SPECIFIC_VESSELS_ROOT, "root", vessels_root["id"])
-
-        # Vessels/Common for all ships  +  its per-main sub-folders
-        common = self._make_node(template.COMMON_SHIPS_ROOT, "root", vessels_root["id"])
+        # Top-level main folders at Documents root
         for name in template.MAIN_FOLDERS:
-            main = self._make_node(name, "main", common["id"])
+            main = self._make_node(name, "main", None)
+            self.roots.append(main["id"])
             self.main_folders[name] = main
+            # Insurance uses a different folder name for its common area
+            common_name = (
+                template.INSURANCE_COMMON_FOLDER_NAME
+                if name == "Insurance"
+                else template.COMMON_SHIPS_ROOT
+            )
+            common = self._make_node(common_name, "common", main["id"])
             for spec in template.COMMON_TEMPLATE[name]:
-                self._build_subtree(spec, main["id"])
+                self._build_subtree(spec, common["id"])
 
-        # Kaizen - Knowledge Bank at Documents root (sibling of Vessels)
+        # Kaizen - Knowledge Bank at Documents root
         kaizen_name = template.FLAT_MAIN_FOLDERS[0]
         kaizen = self._make_node(kaizen_name, "main", None)
         self.roots.append(kaizen["id"])
         self.main_folders[kaizen_name] = kaizen
         for spec in template.FLAT_TEMPLATE[kaizen_name]:
             self._build_subtree(spec, kaizen["id"])
-
-        # Keep references for add_vessel
-        self._specific_vessels_id = specific["id"]
 
         self._seed_sample_archive_and_recycle_bin()
 
@@ -153,16 +150,16 @@ class Store:
     # ----------------------------------------------------------------- vessels
     def add_vessel(self, name, imo=None, shipyard=None, hull_number=None, vessel_type=None):
         ship_folder_ids = {}
-        # Create {Ship Name} under Vessels/Specific Vessels
-        ship_root = self._make_node(name, "ship", self._specific_vessels_id)
-        ship_root["vessel"] = name
         for main_name in template.MAIN_FOLDERS:
             if main_name in template.FLAT_MAIN_FOLDERS:
                 continue
-            main_node = self._make_node(main_name, "main", ship_root["id"])
-            for spec in template.SHIP_TEMPLATE[main_name]:
-                self._build_subtree(spec, main_node["id"])
-            ship_folder_ids[main_name] = main_node["id"]
+            parent_main = self.main_folders.get(main_name)
+            if parent_main:
+                ship_node = self._make_node(name, "ship", parent_main["id"])
+                ship_node["vessel"] = name
+                for spec in template.SHIP_TEMPLATE[main_name]:
+                    self._build_subtree(spec, ship_node["id"])
+                ship_folder_ids[main_name] = ship_node["id"]
         vessel = {
             "id": _new_id(),
             "name": name,

@@ -114,59 +114,81 @@ def scan_and_record_anomalies(db: Session, tree_items: list[dict]):
                 anomaly_type = "subfolder_unmatched"
 
         # ---------------------------------------------------------------
-        # Branch 2: anything outside "Vessels" and outside Kaizen is unknown
+        # Branch 2: Main Department Folders at Documents root
+        # {MainFolder}/{VesselName}/... or {MainFolder}/Common for all ships/...
         # ---------------------------------------------------------------
-        elif parts[0] != VESSELS_ROOT:
-            continue  # outside all known roots
+        elif parts[0] in MAIN_FOLDERS:
+            dept_name = parts[0]
+            rest = parts[1:]
+            if len(rest) == 0:
+                continue  # the main folder root itself
+
+            first = rest[0]
+            first_lower = first.lower()
+
+            if first_lower in ("common for all ships", "common for all vessels", "common"):
+                if len(rest) == 1:
+                    continue  # common root itself
+                sub_path_name = rest[1]
+                expected_cats = set(KNOWN_MAIN_CATEGORIES.get(dept_name, set()))
+                if dept_name in COMMON_TEMPLATE:
+                    for node in COMMON_TEMPLATE[dept_name]:
+                        expected_cats.add(node["name"])
+                if (
+                    sub_path_name not in expected_cats
+                    and not sub_path_name.startswith("Month ")
+                    and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
+                ):
+                    anomaly_type = "subfolder_unmatched"
+            else:
+                # Direct child is vessel
+                if first_lower in pool_slugs or first_lower.startswith("pool-"):
+                    continue
+                if first_lower not in known_vessels:
+                    if item_type == "folder" and len(rest) == 1:
+                        anomaly_type = "vessel_level_unmatched"
+                else:
+                    vessel_name = known_vessels[first_lower]
+                    if len(rest) == 1:
+                        continue  # the vessel folder itself
+                    sub_path_name = rest[1]
+                    expected_cats = set(KNOWN_MAIN_CATEGORIES.get(dept_name, set()))
+                    if dept_name in SHIP_TEMPLATE:
+                        for node in SHIP_TEMPLATE[dept_name]:
+                            expected_cats.add(node["name"])
+                    if (
+                        sub_path_name not in expected_cats
+                        and not sub_path_name.startswith("Month ")
+                        and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
+                    ):
+                        anomaly_type = "subfolder_unmatched"
 
         # ---------------------------------------------------------------
-        # Branch 3: everything under Vessels/...
+        # Branch 3: Legacy Vessels/... layout fallback
         # ---------------------------------------------------------------
-        else:
+        elif parts[0] == "Vessels":
             inner = parts[1:]
             if not inner:
                 continue  # the Vessels root itself
             root = inner[0]
 
-            if root == SPECIFIC_VESSELS_ROOT:
-                # Vessels/Specific Vessels/{Ship}/{Main}/...
+            if root == "Specific Vessels":
                 rest = inner[1:]
                 if len(rest) == 0:
-                    continue  # the root itself
-
+                    continue
                 first = rest[0]
                 first_lower = first.lower()
-
-                if len(rest) == 1:
-                    # Direct child of Specific Vessels — should be a ship folder
-                    if first_lower in pool_slugs or first_lower.startswith("pool-"):
-                        continue
-                    if first_lower in known_vessels:
-                        continue
-                    anomaly_type = "vessel_level_unmatched" if item_type == "folder" else "main_folder_unmatched"
-                    dept_name = "Technical & Crewing"
-
-                else:
-                    if first_lower in pool_slugs or first_lower.startswith("pool-"):
-                        continue
-
-                    if first_lower not in known_vessels:
-                        if item_type == "folder" and len(rest) == 1:
-                            anomaly_type = "vessel_level_unmatched"
-                            dept_name = "Technical & Crewing"
-                        # else: nested under an unknown vessel — skip, will
-                        # surface once the vessel-level anomaly is resolved
-                    else:
-                        vessel_name = known_vessels[first_lower]
-                        if len(rest) == 2:
-                            continue  # the main-folder root itself
+                if first_lower in pool_slugs or first_lower.startswith("pool-"):
+                    continue
+                if first_lower in known_vessels:
+                    vessel_name = known_vessels[first_lower]
+                    if len(rest) >= 3:
                         dept_name = rest[1]
                         sub_path_name = rest[2]
                         expected_cats = set(KNOWN_MAIN_CATEGORIES.get(dept_name, set()))
                         if dept_name in SHIP_TEMPLATE:
                             for node in SHIP_TEMPLATE[dept_name]:
                                 expected_cats.add(node["name"])
-
                         if dept_name not in MAIN_FOLDERS:
                             anomaly_type = "main_folder_unmatched"
                         elif (
@@ -175,29 +197,23 @@ def scan_and_record_anomalies(db: Session, tree_items: list[dict]):
                             and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
                         ):
                             anomaly_type = "subfolder_unmatched"
-
-            elif root == COMMON_SHIPS_ROOT:
-                # Vessels/Common for all ships/{Main}/...
+            elif root in ("Common for all ships", "Common"):
                 rest = inner[1:]
-                if len(rest) == 0:
-                    continue  # the root itself
-
-                dept_name = rest[0]
-                if len(rest) == 1:
-                    continue  # the main-folder root itself
-
-                if dept_name not in MAIN_FOLDERS:
-                    anomaly_type = "main_folder_unmatched"
-                else:
+                if len(rest) >= 2:
+                    dept_name = rest[0]
                     sub_path_name = rest[1]
                     expected_cats = set(KNOWN_MAIN_CATEGORIES.get(dept_name, set()))
                     if dept_name in COMMON_TEMPLATE:
                         for node in COMMON_TEMPLATE[dept_name]:
                             expected_cats.add(node["name"])
-
                     if (
                         sub_path_name not in expected_cats
                         and not sub_path_name.startswith("Month ")
+                        and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
+                    ):
+                        anomaly_type = "subfolder_unmatched"
+        else:
+            continue
                         and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
                     ):
                         anomaly_type = "subfolder_unmatched"

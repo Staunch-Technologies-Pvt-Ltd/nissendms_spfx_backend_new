@@ -47,32 +47,28 @@ def drawing_classifier(name, categories):
 # Fallback leaf names used when routing rejected/unclassified uploads.
 FALLBACK_LEAF_NAMES = {"to be classified", "other drawings", "other manuals"}
 
-# The top-level main folders (now nested one level deeper — see
-# SPECIFIC_VESSELS_ROOT / COMMON_SHIPS_ROOT below).
+# Top-level main folders located directly at the Documents root
 MAIN_FOLDERS = [
     "Technical & Crewing",
     "Commercial & Chartering",
     "Insurance",
 ]
 
-# Kaizen has no per-ship split — it lives directly at the document root
-# (sibling of the Vessels folder), NOT inside Specific Vessels or Common for all ships.
+# Kaizen lives directly at the Documents root alongside main folders
 FLAT_MAIN_FOLDERS = [
     "Kaizen - Knowledge Bank",
 ]
 ALL_MAIN_FOLDERS = MAIN_FOLDERS + FLAT_MAIN_FOLDERS
 
-# Top-level container at the drive root; everything vessel-related nests
-# inside it.
-VESSELS_ROOT = "Vessels"
-
-# Two containers nested inside VESSELS_ROOT.
-SPECIFIC_VESSELS_ROOT = "Specific Vessels"
+# Legacy root constants kept for backwards-compatibility
+VESSELS_ROOT = ""
+SPECIFIC_VESSELS_ROOT = ""
 COMMON_SHIPS_ROOT = "Common for all ships"
+# Insurance uses a different name for its common folder
+INSURANCE_COMMON_FOLDER_NAME = "Common (Not Ship Specific)"
 
 # ---------------------------------------------------------------------------
-# Per-ship sub-tree for each main folder — unchanged content, same names as
-# the PDF, now created under Specific Vessels/{Ship Name}/{Main Folder}/...
+# Per-ship sub-tree for each main folder — created under {Main Folder}/{Ship Name}/...
 # ---------------------------------------------------------------------------
 SHIP_TEMPLATE = {
     "Technical & Crewing": [
@@ -236,8 +232,8 @@ FLAT_TEMPLATE = {
             [
                 leaf("Equipment Maker"),
                 leaf("Class"),
-                leaf("Flag / Port State"),
-                leaf("SIRE/OCIMF/RightShip"),
+                leaf("Flag - Port State"),
+                leaf("SIRE-OCIMF-RightShip"),
                 leaf("Shipyard"),
             ],
         ),

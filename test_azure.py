@@ -22,9 +22,9 @@ async def test_token():
         print(f"Token Status: {token_resp.status_code}")
         if token_resp.status_code == 200:
             token_data = token_resp.json()
-            print(f"✓ Token acquired successfully")
+            print(f"[OK] Token acquired successfully")
             print(f"  Token expires in: {token_data.get('expires_in')} seconds")
         else:
-            print(f"✗ Token request failed: {token_resp.text}")
+            print(f"[FAIL] Token request failed: {token_resp.text}")
 
 asyncio.run(test_token())

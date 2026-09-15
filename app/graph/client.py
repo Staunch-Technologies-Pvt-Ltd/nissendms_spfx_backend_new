@@ -19,11 +19,12 @@ class GraphError(RuntimeError):
 
 
 class GraphClient:
-    def __init__(self):
+    def __init__(self, site_config=None):
+        self._cfg = site_config or settings
         self._app = msal.ConfidentialClientApplication(
-            client_id=settings.graph_client_id,
-            authority=settings.authority_url,
-            client_credential=settings.graph_client_secret,
+            client_id=self._cfg.graph_client_id,
+            authority=self._cfg.authority_url,
+            client_credential=self._cfg.graph_client_secret,
         )
         self._http: httpx.AsyncClient | None = None
 
@@ -45,9 +46,10 @@ class GraphClient:
             await self._http.aclose()
 
     def _token(self) -> str:
-        result = self._app.acquire_token_silent([settings.graph_scope], account=None)
+        scope = getattr(self._cfg, "graph_scope", "https://graph.microsoft.com/.default")
+        result = self._app.acquire_token_silent([scope], account=None)
         if not result:
-            result = self._app.acquire_token_for_client(scopes=[settings.graph_scope])
+            result = self._app.acquire_token_for_client(scopes=[scope])
         if "access_token" not in result:
             raise GraphError(
                 401,
@@ -62,7 +64,7 @@ class GraphClient:
         even when all permissions are granted and consented.  A separate token
         with scope ``https://<tenant>.sharepoint.com/.default`` is required.
         """
-        sp_scope = settings.sharepoint_scope
+        sp_scope = getattr(self._cfg, "sharepoint_scope", None)
         if not sp_scope:
             raise GraphError(400, "sharepoint_scope not configured — add {ENV}_SHAREPOINT_SITE_URL to .env")
         result = self._app.acquire_token_silent([sp_scope], account=None)
@@ -76,7 +78,8 @@ class GraphClient:
         return result["access_token"]
 
     def _headers(self, extra: dict | None = None, access_token: str | None = None) -> dict:
-        h = {"Authorization": f"Bearer {access_token or self._token()}"}
+        token = access_token if (isinstance(access_token, str) and "." in access_token) else self._token()
+        h = {"Authorization": f"Bearer {token}"}
         if extra:
             h.update(extra)
         return h
@@ -223,19 +226,27 @@ _client: GraphClient | None = None
 _site_clients: dict[str, GraphClient] = {}  # Cache clients per site
 
 
-def graph(site_name: str | None = None) -> GraphClient:
+def graph(site_name: str | None = None, site_config: object | None = None) -> GraphClient:
     """Lazily-constructed singleton (only valid when Graph is configured).
     
     Args:
         site_name: If provided, return a client for that site. Otherwise use default.
+        site_config: If provided, return a client configured with this settings object.
     """
     global _client, _site_clients
+    if site_config is not None:
+        return GraphClient(site_config=site_config)
     
     # If site_name is specified, use per-site caching
     if site_name:
         if site_name not in _site_clients:
-            # Create a client for this site
-            _site_clients[site_name] = GraphClient()
+            from ..config import Settings
+            cfg = None
+            try:
+                cfg = Settings.load_site_config(site_name)
+            except Exception:
+                pass
+            _site_clients[site_name] = GraphClient(site_config=cfg)
         return _site_clients[site_name]
     
     # Default: use global client

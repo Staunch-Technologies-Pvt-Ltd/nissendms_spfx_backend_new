@@ -901,6 +901,7 @@ class RealBackend:
                     "hull_number": v.hull_number,
                     "vessel_type": v.vessel_type,
                     "is_provisioned": v.is_provisioned,
+                    "provisioned_site_ids": v.provisioned_site_ids or [],
                     "restored_at": v.restored_at.isoformat() if v.restored_at else None,
                     "status": "Active",
                 }
@@ -954,15 +955,17 @@ class RealBackend:
     async def create_vessel(
         self, name, imo, shipyard=None, hull_number=None, vessel_type=None,
         requesting_email=None, requesting_name=None,
+        provisioned_site_ids: list[str] | None = None,
     ):
         """Creating a vessel never requires approval — for anyone, admin or
         not. It always executes immediately and is always recorded as a
         completed activity entry for audit purposes.
 
-        Tries the pre-provisioned pool first (claim + rename a folder tree
-        that already exists — sub-second); falls back to full from-scratch
-        provisioning (the original ~2.4 minute path) only when the pool is
-        empty or the claimed slot fails to link cleanly.
+        Uses Strategy A Truth Table:
+        1. No selection -> pool claim on default/active drive (Fast Path)
+        2. 1 site == default/active site -> pool claim on default drive (Fast Path)
+        3. 1 site != default/active site -> bypass pool (fast_db_async + background provisioning)
+        4. 2+ sites -> bypass pool (fast_db_async + background provisioning across drives)
         """
         import time as _time
         _t_total = _time.monotonic()
@@ -974,7 +977,17 @@ class RealBackend:
         }
         display = self._display(requesting_email, requesting_name)
         creation_method = "unknown"
-        slot = self._claim_pool_slot()
+
+        active_site = (settings.active_site or "dev").lower()
+        target_sites = [s.strip().lower() for s in (provisioned_site_ids or []) if s.strip()]
+
+        # Strategy A Decision:
+        should_claim_pool = (
+            len(target_sites) == 0 or
+            (len(target_sites) == 1 and target_sites[0] == active_site)
+        )
+
+        slot = self._claim_pool_slot() if should_claim_pool else None
         vessel = None
 
         if slot is not None:
@@ -1002,8 +1015,9 @@ class RealBackend:
                 vessel = None
 
         if vessel is None:
-            log.info("[create_vessel] Creating vessel DB record immediately for '%s'", clean_name)
+            log.info("[create_vessel] Creating vessel DB record immediately for '%s' (Strategy A)", clean_name)
             creation_method = "fast_db_async"
+            final_target_sites = target_sites if target_sites else [active_site]
             with SessionLocal() as db:
                 v_db = models.Vessel(
                     name=clean_name,
@@ -1011,6 +1025,8 @@ class RealBackend:
                     shipyard=shipyard,
                     hull_number=hull_number,
                     vessel_type=vessel_type,
+                    is_provisioned=False,
+                    provisioned_site_ids=[],
                 )
                 db.add(v_db)
                 db.commit()
@@ -1024,9 +1040,15 @@ class RealBackend:
                 "shipyard": shipyard,
                 "hull_number": hull_number,
                 "vessel_type": vessel_type,
+                "is_provisioned": False,
+                "provisioned_site_ids": [],
             }
-            # Background task for SPO folder creation (non-blocking)
-            await self.start_vessel_provisioning(str(vessel_id_num))
+            # Background task for multi-site folder creation (non-blocking)
+            from .site_provisioning import provision_vessel_multi_site
+            asyncio.create_task(
+                provision_vessel_multi_site(vessel_id_num, clean_name, final_target_sites),
+                name=f"provision_vessel_multi_{vessel_id_num}"
+            )
 
         activity_message = (
             f"{display} ({requesting_email}) created vessel '{clean_name}'. No approval was required."
@@ -1180,11 +1202,13 @@ class RealBackend:
             )
 
         _t3 = _time.monotonic()
+        active_site = (settings.active_site or "dev").lower()
         with SessionLocal() as db:
             vessel = models.Vessel(
                 name=name, imo=imo, shipyard=payload.get("shipyard"),
                 hull_number=payload.get("hull_number"), vessel_type=payload.get("vessel_type"),
                 is_provisioned=True,
+                provisioned_site_ids=[active_site],
             )
             db.add(vessel)
             db.flush()
@@ -1213,6 +1237,8 @@ class RealBackend:
         return {
             "id": str(vessel_id), "name": vname, "imo": vimo,
             "shipyard": vshipyard, "hull_number": vhull, "vessel_type": vtype,
+            "is_provisioned": True,
+            "provisioned_site_ids": [active_site],
         }
 
 
@@ -1651,6 +1677,7 @@ class RealBackend:
         self, vessel_id: str, name: str | None = None, imo: str | None = None,
         shipyard: str | None = None, hull_number: str | None = None, vessel_type: str | None = None,
         requesting_email=None, requesting_name=None,
+        provisioned_site_ids: list[str] | None = None,
     ):
         old_values, new_name, new_imo = self._validate_vessel_update(
             vessel_id, name, imo, shipyard, hull_number, vessel_type
@@ -1670,6 +1697,7 @@ class RealBackend:
         payload = {
             "vessel_id": vessel_id, "name": new_name, "imo": new_imo,
             "shipyard": shipyard, "hull_number": hull_number, "vessel_type": vessel_type,
+            "provisioned_site_ids": provisioned_site_ids,
         }
         display = self._display(requesting_email, requesting_name)
         change_summary = (
@@ -1860,6 +1888,16 @@ class RealBackend:
                     db.commit()
 
             v_updated = db.query(models.Vessel).filter_by(id=int(vessel_id)).one()
+            
+            # Handle multi-site provisioning updates if provisioned_site_ids was passed
+            requested_sites = payload.get("provisioned_site_ids")
+            if requested_sites is not None:
+                from .site_provisioning import provision_vessel_multi_site
+                asyncio.create_task(
+                    provision_vessel_multi_site(int(vessel_id), v_updated.name, requested_sites),
+                    name=f"provision_vessel_update_{vessel_id}"
+                )
+
             return {
                 "id": str(v_updated.id),
                 "name": v_updated.name,
@@ -1867,6 +1905,8 @@ class RealBackend:
                 "shipyard": v_updated.shipyard,
                 "hull_number": v_updated.hull_number,
                 "vessel_type": v_updated.vessel_type,
+                "is_provisioned": v_updated.is_provisioned,
+                "provisioned_site_ids": v_updated.provisioned_site_ids or [],
                 "sp_success": sp_success,
                 "sp_errors": sp_errors,
             }
@@ -2505,6 +2545,13 @@ class RealBackend:
                 vessel = db.query(models.Vessel).filter(func.lower(models.Vessel.name) == part.lower()).first()
                 if vessel:
                     try:
+                        active_site = (settings.active_site or "dev").lower()
+                        from .site_provisioning import get_available_provisioning_sites
+                        avail = get_available_provisioning_sites(db)
+                        if active_site not in avail:
+                            log.warning("resolve_path: Active site '%s' is disabled for provisioning; skipping auto-reprovision for vessel %s", active_site, vessel.name)
+                            break
+
                         log.info("resolve_path: Folder missing for path %r — auto-reprovisioning vessel %s (%s)", path, vessel.id, vessel.name)
                         await self.reprovision_vessel(str(vessel.id))
                         with SessionLocal() as db2:

@@ -196,21 +196,82 @@ def _png_to_bgr_array(png_bytes: bytes):
         return None
 
 
+def _ocr_with_winocr(image_bytes: bytes) -> tuple[str, float]:
+    """Run native Windows OCR (hardware-accelerated, high speed)."""
+    try:
+        import winocr
+        import fitz
+        img_doc = fitz.open(stream=image_bytes)
+        if len(img_doc) == 0:
+            return "", 0.0
+        page = img_doc[0]
+        w, h = page.rect.width, page.rect.height
+        if w <= 0 or h <= 0:
+            return "", 0.0
+        # Bound maximum dimension to 1800 px so it stays well within memory & winocr limit (<= 2600 px)
+        scale = min(1800.0 / max(w, h), 2.0)
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=True)
+        if pix.width < 40 or pix.height < 40:
+            return "", 0.0
+        op = winocr.recognize_bytes(bytes(pix.samples), pix.width, pix.height, "en-US")
+        res = op.get() if hasattr(op, "get") else None
+        if res and res.text:
+            cleaned = clean_and_validate_ocr_text(res.text)
+            return cleaned, 0.90
+        return "", 0.0
+    except Exception as exc:
+        logger.debug("winocr image extraction unavailable or failed: %s", exc)
+        return "", 0.0
+
+
+def _ocr_fitz_page_with_winocr(page) -> tuple[str, float]:
+    """Run native Windows OCR directly on a PyMuPDF Page object without PNG encoding overhead."""
+    try:
+        import winocr
+        import fitz
+        w, h = page.rect.width, page.rect.height
+        if w <= 0 or h <= 0:
+            return "", 0.0
+        # Bound maximum dimension to 1800 px:
+        # A0/A1 drawings (e.g. 7000-14000 px) are scaled down to 1800 px,
+        # preventing huge 100+ megapixel bitmaps, memory spikes, and CPU zlib compression lockups.
+        scale = min(1800.0 / max(w, h), 2.0)
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=True)
+        if pix.width < 40 or pix.height < 40:
+            return "", 0.0
+        op = winocr.recognize_bytes(bytes(pix.samples), pix.width, pix.height, "en-US")
+        res = op.get() if hasattr(op, "get") else None
+        if res and res.text:
+            cleaned = clean_and_validate_ocr_text(res.text)
+            return cleaned, 0.90
+        return "", 0.0
+    except Exception as exc:
+        logger.debug("winocr page extraction unavailable or failed: %s", exc)
+        return "", 0.0
+
+
 def ocr_image_bytes(image_bytes: bytes) -> tuple[str, str, float]:
     """Multi-engine image OCR. Returns (extracted_text, engine_name, confidence)."""
-    # 1. Try PaddleOCR (Top accuracy on scanned drawings, technical diagrams, tables)
+    # 1. Try Windows native OCR (fastest on Windows, < 0.1s, no GPU requirement)
+    text, conf = _ocr_with_winocr(image_bytes)
+    if text and len(text) > 5:
+        return text, "winocr", conf
+
+    # 2. Try PaddleOCR (Top accuracy on scanned drawings, technical diagrams, tables)
     arr = _png_to_bgr_array(image_bytes)
     if arr is not None:
         text, conf = _ocr_with_paddle(arr)
         if text and len(text) > 10:
             return text, "paddleocr", conf
 
-    # 2. Try EasyOCR
+    # 3. Try EasyOCR
     text, conf = _ocr_with_easyocr(image_bytes)
     if text and len(text) > 10:
         return text, "easyocr", conf
 
-    # 3. Try Tesseract
+    # 4. Try Tesseract
     text, conf = _ocr_with_tesseract(image_bytes)
     if text and len(text) > 10:
         return text, "tesseract", conf
@@ -219,11 +280,20 @@ def ocr_image_bytes(image_bytes: bytes) -> tuple[str, str, float]:
 
 
 def pdf_text_with_metadata(pdf_bytes: bytes, ocr_fallback: bool = True) -> tuple[str, str, float]:
-    """Extract PDF text: checks embedded text layer first across all pages; falls back to rasterized vision OCR if garbled/unusable."""
+    """Extract PDF text: checks embedded text layer first across sampled pages; falls back to fast vision OCR if garbled/unusable."""
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        embedded_pages = [page.get_text() for page in doc]
+        if len(doc) == 0:
+            return "", "empty_doc", 0.0
+
+        # Sample up to first 5 pages and last page (where cover, stamps, certificates, and metadata live).
+        # Avoids iterating through 100s of pages in large PDF packages.
+        sample_indices = list(range(min(len(doc), 5)))
+        if len(doc) > 5 and (len(doc) - 1) not in sample_indices:
+            sample_indices.append(len(doc) - 1)
+
+        embedded_pages = [doc[idx].get_text() for idx in sample_indices]
         embedded = clean_and_validate_ocr_text("\n".join(embedded_pages))
 
         # Check if embedded text passes the usability quality gate
@@ -233,16 +303,31 @@ def pdf_text_with_metadata(pdf_bytes: bytes, ocr_fallback: bool = True) -> tuple
         if not ocr_fallback:
             return embedded or "", "pymupdf_embedded", 0.40
 
-        # Embedded text is empty, noisy, or failed the quality gate -> rasterize pages and run vision OCR
-        logger.info("Embedded PDF text failed quality gate; falling back to multi-engine vision OCR...")
+        # Embedded text is empty, noisy, or failed the quality gate -> run fast vision OCR on key pages
+        logger.info("Embedded PDF text failed quality gate; running fast vision OCR on %d pages...", min(len(doc), 3))
         ocr_chunks: list[str] = []
         conf_scores: list[float] = []
         engine_used = "none"
 
-        max_pages = min(len(doc), 10)
+        # Auto-tagging only needs the title block, cover, and key metadata pages (max 3 pages).
+        # Scanning 10 huge drawings causes massive latency and memory bloat.
+        max_pages = min(len(doc), 3)
         for page_idx in range(max_pages):
             page = doc[page_idx]
-            pix = page.get_pixmap(dpi=200)
+
+            # 1. Direct native Windows OCR (fast, direct memory buffer, bounded resolution)
+            page_text, conf = _ocr_fitz_page_with_winocr(page)
+            if page_text:
+                ocr_chunks.append(page_text)
+                conf_scores.append(conf)
+                engine_used = "winocr"
+                continue
+
+            # 2. Fallback: render scaled pixmap (bounded at 1800 px) and try secondary engines
+            w, h = page.rect.width, page.rect.height
+            scale = min(1800.0 / max(w, h, 1.0), 2.0)
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
             png_bytes = pix.tobytes("png")
 
             page_text, engine, conf = ocr_image_bytes(png_bytes)

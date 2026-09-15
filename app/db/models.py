@@ -9,7 +9,7 @@
 from datetime import date, datetime
 
 # pyrefly: ignore [missing-import]
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, Integer, func, LargeBinary
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, Integer, func, LargeBinary, JSON
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +29,8 @@ class Vessel(Base):
     # is the source of truth for the UI's Provision / Already Provisioned
     # state; it is only set after the complete tree has been created.
     is_provisioned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Target SharePoint site keys/IDs provisioned for this vessel (multi-site support)
+    provisioned_site_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
     # Set when a vessel is restored from Recycle Bin and re-activated in DB.
     restored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -606,6 +608,25 @@ class FolderAlert(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class TagFailure(Base):
+    """Persistent retry queue for SharePoint metadata tagging failures."""
+    __tablename__ = "tag_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    file_id: Mapped[str] = mapped_column(String(256), index=True)
+    site_id: Mapped[str] = mapped_column(String(256), index=True)
+    drive_id: Mapped[str] = mapped_column(String(256), index=True)
+    filename: Mapped[str] = mapped_column(String(500), default="")
+    parent_path: Mapped[str] = mapped_column(String(1024), default="")
+    error_reason: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="needs_retry", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1)
+    first_failed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_attempted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    dismissed_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    dismissed_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SiteConfigurationChange(Base):
     """Audit log for site configuration changes made by admins.
     
@@ -654,6 +675,8 @@ class SiteConfiguration(Base):
     site_name: Mapped[str] = mapped_column(String(256))
     site_id: Mapped[str] = mapped_column(String(512))
     drive_id: Mapped[str] = mapped_column(String(512))
+    is_available_for_provisioning: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_default_provisioning: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by_email: Mapped[str] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

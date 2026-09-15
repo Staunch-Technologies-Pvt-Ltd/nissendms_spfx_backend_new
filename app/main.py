@@ -5,6 +5,10 @@ _FOLDER_CHILDREN_CACHE = {}  # folder_id -> (data, timestamp)
 CACHE_TTL_FLAT_TREE = 5   # 5 seconds — short enough to reflect SPO uploads quickly
 CACHE_TTL_CHILDREN = 3    # 3 seconds — near-real-time for folder contents
 
+# Longer-lived cache for tag-enriched folder children (listItem/fields already fetched)
+_FOLDER_CHILDREN_TAGS_CACHE: dict = {}  # cache_key -> (timestamp, list[decorated_item])
+CACHE_TTL_CHILDREN_TAGS = 300  # 5 minutes — covers repeated navigations; invalidated on edits
+
 _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
 CACHE_TTL_LIVE_SPO_FILES = 60   # 60 seconds
 
@@ -13,11 +17,15 @@ _FOLDER_PARENT_MAP: dict[str, str] = {}  # folder_id -> parent_folder_id
 CACHE_TTL_FOLDER_RECURSIVE_COUNTS = 600  # 10 minutes (invalidated on changes)
 
 def invalidate_folder_caches(folder_id: str = None):
-    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE, _FOLDER_RECURSIVE_COUNTS_CACHE, _FOLDER_PARENT_MAP
+    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE, _FOLDER_RECURSIVE_COUNTS_CACHE, _FOLDER_PARENT_MAP, _FOLDER_CHILDREN_TAGS_CACHE
     _FLAT_TREE_CACHE = {"data": None, "timestamp": 0}
     _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
     if folder_id:
         _FOLDER_CHILDREN_CACHE.pop(folder_id, None)
+        _FOLDER_CHILDREN_TAGS_CACHE.pop(folder_id, None)
+        for k in list(_FOLDER_CHILDREN_TAGS_CACHE.keys()):
+            if k.endswith(f":{folder_id}"):
+                _FOLDER_CHILDREN_TAGS_CACHE.pop(k, None)
         # Targeted invalidation: walk up ancestor chain and evict only this folder and its parents
         curr = folder_id
         visited = set()
@@ -31,6 +39,7 @@ def invalidate_folder_caches(folder_id: str = None):
     else:
         _FOLDER_CHILDREN_CACHE.clear()
         _FOLDER_RECURSIVE_COUNTS_CACHE.clear()
+        _FOLDER_CHILDREN_TAGS_CACHE.clear()
 
 # -*- coding: utf-8 -*-
 """FastAPI entry point for the Vessel DMS.
@@ -54,9 +63,9 @@ from urllib.parse import quote
 os.environ.setdefault("TZ", "Asia/Kolkata")
 warnings.filterwarnings("ignore", message="Timezone offset does not match system offset")
 
-from typing import Any
+from typing import Any, Literal
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -75,9 +84,16 @@ _profile_cache: dict[str, dict] = {}
 app = FastAPI(title="Vessel DMS", version="1.0.0")
 logger = logging.getLogger("vessel_dms")
 
-_GRAPH_RECURSIVE_SEMAPHORE = asyncio.Semaphore(6)
+_GRAPH_RECURSIVE_SEMAPHORE = asyncio.Semaphore(15)
 
-async def get_folder_recursive_counts(drive_id: str, folder_id: str, parent_id: str | None = None) -> dict[str, int]:
+async def get_folder_recursive_counts(
+    drive_id: str,
+    folder_id: str,
+    parent_id: str | None = None,
+    access_token: str | None = None,
+    max_depth: int = 2,
+    current_depth: int = 0,
+) -> dict[str, int]:
     """
     Recursively walks a folder and its subfolders to compute:
     - direct_subfolders: count of immediate child folders
@@ -86,6 +102,7 @@ async def get_folder_recursive_counts(drive_id: str, folder_id: str, parent_id: 
     - total_files: count of all files in the subtree
     Guarantees max 6 concurrent Graph API requests globally via _GRAPH_RECURSIVE_SEMAPHORE.
     Records child -> parent relationship in _FOLDER_PARENT_MAP for targeted ancestor invalidation.
+    Bounded by max_depth to prevent Graph API rate-limiting delays.
     """
     cache_key = f"{drive_id}:{folder_id}"
     now = time.time()
@@ -99,7 +116,7 @@ async def get_folder_recursive_counts(drive_id: str, folder_id: str, parent_id: 
         _FOLDER_PARENT_MAP[folder_id] = parent_id
 
     async with _GRAPH_RECURSIVE_SEMAPHORE:
-        children = await gd.list_children(drive_id, folder_id)
+        children = await gd.list_children(drive_id, folder_id, access_token=access_token)
 
     subfolders = [c for c in children if c.get("folder") and c.get("id")]
     files = [c for c in children if not c.get("folder")]
@@ -117,8 +134,30 @@ async def get_folder_recursive_counts(drive_id: str, folder_id: str, parent_id: 
         _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
         return result
 
+    if current_depth >= max_depth:
+        total_sub_files = sum(
+            (sf.get("folder") or {}).get("childCount") or 0
+            for sf in subfolders
+            if isinstance((sf.get("folder") or {}).get("childCount"), int)
+        )
+        result = {
+            "direct_subfolders": direct_subfolders,
+            "direct_files": direct_files,
+            "total_subfolders": direct_subfolders,
+            "total_files": direct_files + total_sub_files,
+        }
+        _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
+        return result
+
     sub_results = await asyncio.gather(*(
-        get_folder_recursive_counts(drive_id, sf["id"], parent_id=folder_id)
+        get_folder_recursive_counts(
+            drive_id,
+            sf["id"],
+            parent_id=folder_id,
+            access_token=access_token,
+            max_depth=max_depth,
+            current_depth=current_depth + 1,
+        )
         for sf in subfolders
     ))
 
@@ -674,6 +713,7 @@ class VesselIn(BaseModel):
     shipyard: str | None = None
     hull_number: str | None = None
     vessel_type: str | None = None
+    provisioned_site_ids: list[str] | None = None
 
 
 
@@ -683,6 +723,7 @@ class VesselUpdateIn(BaseModel):
     shipyard: str | None = None
     hull_number: str | None = None
     vessel_type: str | None = None
+    provisioned_site_ids: list[str] | None = None
 
 
 class RejectIn(BaseModel):
@@ -895,6 +936,53 @@ async def _startup():
                             )
                             _logger.warning(
                                 "DB schema drift repaired: added missing vessels.restored_at column"
+                            )
+                        if "provisioned_site_ids" not in vessel_cols:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE vessels "
+                                    "ADD COLUMN IF NOT EXISTS provisioned_site_ids JSON "
+                                    "NULL DEFAULT '[]'::json"
+                                )
+                            )
+                            _logger.warning(
+                                "DB schema drift repaired: added missing vessels.provisioned_site_ids column"
+                            )
+                        # Backfill existing provisioned vessels with active site
+                        try:
+                            active_site_name = settings.active_site or "dev"
+                            conn.execute(
+                                text(
+                                    f"UPDATE vessels SET provisioned_site_ids = json_build_array('{active_site_name}') "
+                                    "WHERE is_provisioned = TRUE AND (provisioned_site_ids IS NULL OR json_array_length(provisioned_site_ids) = 0)"
+                                )
+                            )
+                        except Exception as bf_err:
+                            _logger.warning("Vessel provisioned_site_ids backfill notice: %s", bf_err)
+
+                    if "site_configurations" in set(inspector.get_table_names()):
+                        site_cols = {c["name"] for c in inspector.get_columns("site_configurations")}
+                        if "is_available_for_provisioning" not in site_cols:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE site_configurations "
+                                    "ADD COLUMN IF NOT EXISTS is_available_for_provisioning BOOLEAN "
+                                    "NOT NULL DEFAULT TRUE"
+                                )
+                            )
+                            _logger.warning(
+                                "DB schema drift repaired: added missing site_configurations.is_available_for_provisioning"
+                            )
+                        if "is_default_provisioning" not in site_cols:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE site_configurations "
+                                    "ADD COLUMN IF NOT EXISTS is_default_provisioning BOOLEAN "
+                                    "NOT NULL DEFAULT FALSE"
+                                )
+                            )
+                            _logger.warning(
+                                "DB schema drift repaired: added missing site_configurations.is_default_provisioning"
                             )
 
                 _logger.info("Database safety-net create_all completed.")
@@ -2158,6 +2246,8 @@ class SiteItemTagsIn(BaseModel):
 class SiteScanTagsIn(BaseModel):
     item_ids: list[str] = Field(..., min_length=1)
     recursive: bool = False
+    exclude_item_ids: list[str] = Field(default_factory=list)
+    scope: Literal["missing_only", "all"] = "missing_only"
 
 
 class SiteResolveTagsIn(BaseModel):
@@ -2177,6 +2267,14 @@ class SiteBulkTagsIn(BaseModel):
     category: str = ""
     auto_from_path: bool = False
     recursive: bool = False
+    skip_if_tagged: bool = False  # When True, skip files where vessel already matches the target
+    skip_if_any_vessel_set: bool = False  # When True, skip files that have ANY existing vessel tag
+    scope: Literal["missing_only", "all"] = "missing_only"
+
+
+class TagFailureActionIn(BaseModel):
+    file_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
 
 
 def _site_item_tags(fields: dict[str, Any]) -> dict[str, str]:
@@ -2207,16 +2305,117 @@ def _sharepoint_tags_match(fields: dict[str, Any], expected: dict[str, str]) -> 
     )
 
 
+_TAG_PLACEHOLDERS = {"", "to be classified", "to be classified ", "unknown", "n/a"}
+
+
+def _tags_need_attention(tags: dict[str, str]) -> bool:
+    """Return whether the file is missing its Vessel tag.
+
+    Missing-only OCR is intentionally vessel-focused: files with an existing
+    vessel tag must not be rescanned because another taxonomy field is blank.
+    """
+    value = (tags.get("vessel") or "").strip().lower()
+    return value in _TAG_PLACEHOLDERS
+
+
+async def _filter_site_files_by_scope(
+    drive_id: str,
+    files: list[dict[str, Any]],
+    scope: str,
+    access_token: str | None = None,
+) -> list[dict[str, Any]]:
+    if scope == "all" or not files:
+        return files
+
+    semaphore = asyncio.Semaphore(20)
+
+    async def needs_attention(item: dict[str, Any]) -> bool:
+        async with semaphore:
+            try:
+                fields = await graph().get(
+                    f"/drives/{drive_id}/items/{item['id']}/listItem/fields",
+                    access_token=access_token,
+                )
+                return _tags_need_attention(_site_item_tags(fields))
+            except Exception:
+                # Unknown metadata must remain actionable rather than being skipped.
+                return True
+
+    flags = await asyncio.gather(*(needs_attention(item) for item in files))
+    return [item for item, include in zip(files, flags) if include]
+
+
+def _record_tag_failure(
+    *, site_id: str, drive_id: str, file_id: str, filename: str,
+    parent_path: str, error_reason: str,
+) -> None:
+    if not settings.db_configured:
+        return
+    try:
+        from .db.base import SessionLocal
+        from .db.models import TagFailure
+        with SessionLocal() as db:
+            row = db.query(TagFailure).filter(
+                TagFailure.site_id == site_id,
+                TagFailure.drive_id == drive_id,
+                TagFailure.file_id == file_id,
+            ).first()
+            if row:
+                row.status = "needs_retry"
+                row.error_reason = error_reason
+                row.filename = filename or row.filename
+                row.parent_path = parent_path or row.parent_path
+                row.attempt_count = (row.attempt_count or 0) + 1
+                row.dismissed_by = None
+                row.dismissed_reason = None
+            else:
+                row = TagFailure(
+                    site_id=site_id, drive_id=drive_id, file_id=file_id,
+                    filename=filename or file_id, parent_path=parent_path or "",
+                    error_reason=error_reason, status="needs_retry", attempt_count=1,
+                )
+                db.add(row)
+            db.commit()
+    except Exception as exc:
+        _logger.warning("Could not persist tag failure for %s: %s", file_id, exc)
+
+
+def _resolve_tag_failure(*, site_id: str, drive_id: str, file_id: str) -> None:
+    if not settings.db_configured:
+        return
+    try:
+        from .db.base import SessionLocal
+        from .db.models import TagFailure
+        with SessionLocal() as db:
+            row = db.query(TagFailure).filter(
+                TagFailure.site_id == site_id,
+                TagFailure.drive_id == drive_id,
+                TagFailure.file_id == file_id,
+            ).first()
+            if row:
+                row.status = "resolved"
+                db.commit()
+    except Exception as exc:
+        _logger.warning("Could not resolve tag failure for %s: %s", file_id, exc)
+
+
 async def _get_site_item_with_tags(drive_id: str, item: dict[str, Any], detected_vessel: str = "") -> dict[str, Any]:
     item_id = item.get("id", "")
-    try:
-        fields = await graph().get(f"/drives/{drive_id}/items/{item_id}/listItem/fields")
-    except GraphError:
-        fields = {}
-    tags = _site_item_tags(fields)
+    tags: dict[str, str] = {}
     suggested_vessel = ""
-    if not item.get("folder") and not tags.get("vessel"):
-        suggested_vessel = detected_vessel or ""
+
+    # Folder entries do not need listItem/fields lookups for the UI to open.
+    # Loading tags for every child folder adds a large amount of unnecessary
+    # Graph work and slows down folder navigation. Files still get enriched.
+    if item.get("file") is not None:
+        try:
+            fields = await graph().get(f"/drives/{drive_id}/items/{item_id}/listItem/fields")
+        except GraphError:
+            fields = {}
+        tags = _site_item_tags(fields)
+        if not tags.get("vessel"):
+            suggested_vessel = detected_vessel or ""
+
     return {
         **item,
         "web_url": item.get("webUrl") or "",
@@ -2226,14 +2425,17 @@ async def _get_site_item_with_tags(drive_id: str, item: dict[str, Any], detected
 
 
 @app.get("/api/sites")
-async def discover_sites(_session: object = Depends(require_session)):
-    """List every tenant site visible to the configured Graph application."""
+async def discover_sites(
+    limit: int = Query(default=50, ge=1, le=100),
+    _session: object = Depends(require_session),
+):
+    """List a bounded first page of tenant sites without blocking on full pagination."""
     cached = _DISCOVERED_SITES_CACHE.get(settings.active_site)
     now = time.time()
     if cached and now - cached[0] < _DISCOVERED_SITES_CACHE_TTL:
         return {"sites": cached[1], "cached": True}
     sites: list[dict[str, Any]] = []
-    next_url: str | None = "/sites?search=*"
+    next_url: str | None = f"/sites?search=*&$top={limit}"
     try:
         while next_url:
             page = await graph().get(next_url)
@@ -2247,9 +2449,11 @@ async def discover_sites(_session: object = Depends(require_session)):
                         "description": site.get("description", ""),
                         "thumbnail": (site.get("thumbnail") or {}).get("large", {}).get("url", ""),
                     })
-            next_url = page.get("@odata.nextLink")
+                    if len(sites) >= limit:
+                        break
+            next_url = None if len(sites) >= limit else page.get("@odata.nextLink")
         _DISCOVERED_SITES_CACHE[settings.active_site] = (now, sites)
-        return {"sites": sites, "cached": False}
+        return {"sites": sites, "cached": False, "limited": True, "limit": limit}
     except GraphError as exc:
         raise HTTPException(status_code=502, detail=f"SharePoint site discovery failed: {exc}") from exc
 
@@ -2268,11 +2472,17 @@ async def discover_site_drives(site_id: str, _session: object = Depends(require_
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/children")
-async def site_folder_children(site_id: str, drive_id: str, folder_id: str, _session: object = Depends(require_session)):
+async def site_folder_children(
+    site_id: str,
+    drive_id: str,
+    folder_id: str,
+    x_graph_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
     del site_id
-    parent_id = await gd.get_root_item_id(drive_id) if folder_id == "root" else folder_id
+    parent_id = await gd.get_root_item_id(drive_id, access_token=x_graph_access_token) if folder_id == "root" else folder_id
     try:
-        items = await gd.list_children(drive_id, parent_id)
+        items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         from .ocr.drawing_category import _extract_vessel_from_folder_path
         parent_path = ""
         if items:
@@ -2280,7 +2490,7 @@ async def site_folder_children(site_id: str, drive_id: str, folder_id: str, _ses
             parent_path = raw_p.split("root:", 1)[-1].strip("/")
         elif parent_id != "root":
             try:
-                parent_meta = await gd.get_item(drive_id, parent_id)
+                parent_meta = await gd.get_item(drive_id, parent_id, access_token=x_graph_access_token)
                 raw_p = (parent_meta.get("parentReference") or {}).get("path") or ""
                 p_base = raw_p.split("root:", 1)[-1].strip("/")
                 p_name = parent_meta.get("name") or ""
@@ -2306,11 +2516,78 @@ async def site_folder_children(site_id: str, drive_id: str, folder_id: str, _ses
                 if idx + 1 < len(path_parts):
                     detected_cat = path_parts[idx + 1]
 
-        decorated_items = await asyncio.gather(*(
-            _get_site_item_with_tags(drive_id, item, detected_vessel=detected_vessel) for item in items
-        ))
+        # ── Fast concurrent tag enrichment via Graph $batch ──────────────────────────────
+        # Runs chunks of 20 concurrently via asyncio.gather instead of sequentially.
+        # This reduces round-trip time from N * 400ms down to a single concurrent ~400ms burst.
+        now_ts = time.time()
+        cache_key_tags = f"{drive_id}:{parent_id}"
+        cached_decorated = _FOLDER_CHILDREN_TAGS_CACHE.get(cache_key_tags)
+        if cached_decorated and (now_ts - cached_decorated[0]) < CACHE_TTL_CHILDREN_TAGS:
+            decorated_items = cached_decorated[1]
+        else:
+            file_items = [it for it in items if it.get("file") is not None]
+
+            # Batch-fetch listItem/fields concurrently in chunks of 20 with bounded semaphore
+            BATCH_SIZE = 20
+            fields_by_id: dict[str, dict] = {}
+            if file_items:
+                sem = asyncio.Semaphore(5)
+
+                async def _fetch_chunk(chunk):
+                    batch_requests = [
+                        {
+                            "id": it["id"],
+                            "method": "GET",
+                            "url": f"/drives/{drive_id}/items/{it['id']}/listItem/fields",
+                        }
+                        for it in chunk
+                    ]
+                    async with sem:
+                        try:
+                            batch_resp = await graph().post(
+                                "/$batch",
+                                json={"requests": batch_requests},
+                                access_token=x_graph_access_token,
+                            )
+                            return batch_resp.get("responses", [])
+                        except Exception:
+                            return []
+
+                chunks = [file_items[i: i + BATCH_SIZE] for i in range(0, len(file_items), BATCH_SIZE)]
+                chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
+                for resp_list in chunk_results:
+                    for resp_item in resp_list:
+                        if resp_item.get("status") == 200:
+                            fields_by_id[resp_item["id"]] = resp_item.get("body") or {}
+
+            decorated_items = []
+            for it in items:
+                iid = it.get("id", "")
+                download_url = it.get("@microsoft.graph.downloadUrl") or ""
+                if it.get("file") is not None:
+                    raw_fields = fields_by_id.get(iid, {})
+                    tags = _site_item_tags(raw_fields)
+                    suggested_vessel = detected_vessel if not tags.get("vessel") else ""
+                    decorated_items.append({
+                        **it,
+                        "web_url": it.get("webUrl") or "",
+                        "download_url": download_url,
+                        "tags": tags,
+                        "suggested_vessel": suggested_vessel,
+                    })
+                else:
+                    decorated_items.append({
+                        **it,
+                        "web_url": it.get("webUrl") or "",
+                        "download_url": "",
+                        "tags": {},
+                        "suggested_vessel": "",
+                    })
+            _FOLDER_CHILDREN_TAGS_CACHE[cache_key_tags] = (now_ts, decorated_items)
 
         now = time.time()
+        # Collect folder items that need background count computation
+        _uncached_folder_ids: list[str] = []
         for it in decorated_items:
             if it.get("folder") and it.get("id"):
                 ck = f"{drive_id}:{it['id']}"
@@ -2318,7 +2595,37 @@ async def site_folder_children(site_id: str, drive_id: str, folder_id: str, _ses
                 if cached and (now - cached[0]) < CACHE_TTL_FOLDER_RECURSIVE_COUNTS:
                     it["folder_counts"] = cached[1]
                 else:
-                    it["folder_counts"] = None
+                    # Pre-populate from Graph's immediate childCount so the UI
+                    # shows a count instantly instead of a spinner.
+                    child_count = (it.get("folder") or {}).get("childCount")
+                    it["folder_counts"] = {
+                        "direct_subfolders": 0,
+                        "direct_files": child_count if isinstance(child_count, int) else 0,
+                        "total_subfolders": 0,
+                        "total_files": child_count if isinstance(child_count, int) else 0,
+                        "is_estimated": True,
+                    } if isinstance(child_count, int) else None
+                    _uncached_folder_ids.append(it["id"])
+
+        # Fire-and-forget: compute accurate counts in background so next load is correct.
+        # This populates direct_subfolders / direct_files properly instead of relying on
+        # the childCount estimate which lumps folders and files together.
+        if _uncached_folder_ids:
+            _bg_token = x_graph_access_token
+            _bg_drive = drive_id
+            _bg_parent = parent_id
+            async def _compute_counts_bg() -> None:
+                for _fid in _uncached_folder_ids:
+                    try:
+                        await get_folder_recursive_counts(
+                            _bg_drive, _fid,
+                            parent_id=_bg_parent,
+                            access_token=_bg_token,
+                            max_depth=1,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            asyncio.ensure_future(_compute_counts_bg())
 
         direct_folders = len([i for i in items if i.get("folder")])
         direct_files = len([i for i in items if not i.get("folder")])
@@ -2356,18 +2663,27 @@ async def site_folder_children(site_id: str, drive_id: str, folder_id: str, _ses
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/subfolder-counts")
-async def site_subfolder_counts(site_id: str, drive_id: str, folder_id: str, _session: object = Depends(require_session)):
+async def site_subfolder_counts(
+    site_id: str,
+    drive_id: str,
+    folder_id: str,
+    x_graph_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
     del site_id
-    parent_id = await gd.get_root_item_id(drive_id) if folder_id == "root" else folder_id
+    parent_id = await gd.get_root_item_id(drive_id, access_token=x_graph_access_token) if folder_id == "root" else folder_id
     try:
-        items = await gd.list_children(drive_id, parent_id)
+        items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         folder_items = [i for i in items if i.get("folder") and i.get("id")]
         direct_files = len([i for i in items if not i.get("folder")])
         direct_folders = len(folder_items)
 
-        # Concurrently compute counts for all direct child folders (bounded by _GRAPH_RECURSIVE_SEMAPHORE)
+        # Concurrently compute counts for all direct child folders with max_depth=2
         results = await asyncio.gather(*(
-            get_folder_recursive_counts(drive_id, fi["id"], parent_id=parent_id)
+            get_folder_recursive_counts(
+                drive_id, fi["id"], parent_id=parent_id,
+                access_token=x_graph_access_token, max_depth=2,
+            )
             for fi in folder_items
         ))
 
@@ -2625,7 +2941,7 @@ async def _expand_to_files(
     item_ids: list[str],
     recursive: bool = False,
     max_depth: int = 6,
-    max_files: int = 200,
+    max_files: int = 500,
     access_token: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """Expands item_ids into a list of file items.
@@ -2637,7 +2953,7 @@ async def _expand_to_files(
       - File items are kept directly.
       - Folder items expand via BFS to all descendant files up to max_depth (relative to the selected folder).
 
-    Enforces max_files cap (default 200).
+    Enforces max_files cap (default 500).
     Returns (files_to_process, total_discovered_count, is_truncated).
     """
     files: list[dict[str, Any]] = []
@@ -2695,15 +3011,18 @@ async def bulk_update_site_tags(
     x_sp_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    del site_id
     target_files, total_discovered, is_truncated = await _expand_to_files(
         drive_id=drive_id,
         item_ids=request.item_ids,
         recursive=request.recursive,
         max_depth=6,
-        max_files=200,
+        max_files=10000,
         access_token=x_graph_access_token,
     )
+    if request.scope == "missing_only":
+        target_files = await _filter_site_files_by_scope(drive_id, target_files, request.scope, x_graph_access_token)
+        total_discovered = len(target_files)
+        is_truncated = False
 
     if not target_files:
         return {
@@ -2711,7 +3030,7 @@ async def bulk_update_site_tags(
             "updated_count": 0,
             "total_discovered": 0,
             "truncated": False,
-            "cap": 200,
+            "cap": 10000,
             "results": [],
         }
 
@@ -2731,139 +3050,439 @@ async def bulk_update_site_tags(
         except Exception:
             vessel_names = []
 
+    # Semaphore to limit concurrent Graph API calls and avoid throttling
+    _update_sem = asyncio.Semaphore(10)
+
     async def _update_one(file_item: dict[str, Any]) -> dict[str, Any]:
-        file_id = file_item["id"]
-        filename = file_item.get("name") or file_id
-        raw_p = (file_item.get("parentReference") or {}).get("path") or ""
-        p_path = raw_p.split("root:", 1)[-1].strip("/")
+        async with _update_sem:
+            file_id = file_item["id"]
+            filename = file_item.get("name") or file_id
+            raw_p = (file_item.get("parentReference") or {}).get("path") or ""
+            p_path = raw_p.split("root:", 1)[-1].strip("/")
 
-        try:
             try:
-                fields = await graph().get(f"/drives/{drive_id}/items/{file_id}/listItem/fields", access_token=x_graph_access_token)
-            except Exception:
-                fields = {}
-            current = _site_item_tags(fields)
-
-            v_val = request.vessel.strip()
-            d_val = request.department.strip()
-            g_val = request.group.strip()
-            c_val = request.category.strip()
-
-            # vessel-only mode: when only vessel is explicitly set (no group/category/department
-            # provided and auto_from_path is off), preserve all existing tags and only update vessel.
-            vessel_only_mode = bool(v_val) and not d_val and not g_val and not c_val and not request.auto_from_path
-
-            if request.auto_from_path or (not vessel_only_mode and not (v_val and d_val and g_val and c_val)):
-                path_tags = _derive_path_tags(p_path, filename=filename, known_vessels=vessel_names)
-                if not v_val:
-                    v_val = path_tags.get("vessel", "")
-                if not d_val:
-                    d_val = path_tags.get("department", "")
-                if not g_val:
-                    g_val = path_tags.get("group", "")
-                if not c_val:
-                    c_val = path_tags.get("category", "")
-
-            # Merge with current tags so we preserve existing values.
-            # In vessel-only mode: keep current group/category/department exactly as-is.
-            final_v = v_val or current.get("vessel", "")
-            if vessel_only_mode:
-                final_d = current.get("department", "")
-                final_g = current.get("group", "")
-                final_c = current.get("category", "")
-            else:
-                final_d = d_val or current.get("department", "")
-                final_g = g_val or current.get("group", "")
-                final_c = c_val or current.get("category", "")
-
-            # Build payload: in vessel-only mode only include the vessel field so
-            # SharePoint does not overwrite group/category with blank values.
-            if vessel_only_mode:
-                payload = {k: v for k, v in _build_sharepoint_metadata_payload(vessel=final_v).items() if v}
-            else:
-                payload = _build_sharepoint_metadata_payload(
-                    department=final_d,
-                    vessel=final_v,
-                    group=final_g,
-                    category=final_c,
-                )
-
-            # Retry loop with backoff (up to 3 retries) on 429/503
-            patch_res = None
-            max_retries = 3
-            for attempt in range(max_retries):
                 try:
-                    patch_res = await gd.update_file_columns(
-                        drive_id, file_id, payload,
-                        access_token=x_graph_access_token,
-                        sp_access_token=x_sp_access_token,
-                    )
-                    if patch_res.get("ok"):
-                        break
-                    err_str = str(patch_res.get("error") or "")
-                    if ("429" in err_str or "503" in err_str or "throttled" in err_str.lower()) and attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
-                        continue
-                    break
-                except Exception as patch_exc:
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    return {"item_id": file_id, "filename": filename, "ok": False, "error": str(patch_exc), "parent_path": p_path}
+                    fields = await graph().get(f"/drives/{drive_id}/items/{file_id}/listItem/fields", access_token=x_graph_access_token)
+                except Exception:
+                    fields = {}
+                current = _site_item_tags(fields)
 
-            expected_tags = {"department": final_d, "vessel": final_v, "group": final_g, "category": final_c}
-            if not patch_res or not patch_res.get("ok"):
+                v_val = request.vessel.strip()
+                d_val = request.department.strip()
+                g_val = request.group.strip()
+                c_val = request.category.strip()
+
+                # vessel-only mode: when only vessel is explicitly set (no group/category/department
+                # provided and auto_from_path is off), preserve all existing tags and only update vessel.
+                vessel_only_mode = bool(v_val) and not d_val and not g_val and not c_val and not request.auto_from_path
+
+                if request.auto_from_path or (not vessel_only_mode and not (v_val and d_val and g_val and c_val)):
+                    path_tags = _derive_path_tags(p_path, filename=filename, known_vessels=vessel_names)
+                    if not v_val:
+                        v_val = path_tags.get("vessel", "")
+                    if not d_val:
+                        d_val = path_tags.get("department", "")
+                    if not g_val:
+                        g_val = path_tags.get("group", "")
+                    if not c_val:
+                        c_val = path_tags.get("category", "")
+
+                # Merge with current tags so we preserve existing values.
+                # In vessel-only mode: keep current group/category/department exactly as-is.
+                final_v = v_val or current.get("vessel", "")
+                if vessel_only_mode:
+                    final_d = current.get("department", "")
+                    final_g = current.get("group", "")
+                    final_c = current.get("category", "")
+                else:
+                    final_d = d_val or current.get("department", "")
+                    final_g = g_val or current.get("group", "")
+                    final_c = c_val or current.get("category", "")
+
+                # skip_if_any_vessel_set: skip any file that already has ANY vessel tag assigned
+                if request.skip_if_any_vessel_set and current.get("vessel", "").strip():
+                    return {
+                        "item_id": file_id,
+                        "filename": filename,
+                        "ok": True,
+                        "skipped": True,
+                        "tags": {"department": current.get("department", ""), "vessel": current.get("vessel", "").strip(), "group": current.get("group", ""), "category": current.get("category", "")},
+                        "parent_path": p_path,
+                    }
+
+                # skip_if_tagged: if the file already has the correct vessel tag, skip it.
+                # This prevents re-processing already-tagged files on subsequent runs.
+                if request.skip_if_tagged and vessel_only_mode and current.get("vessel", "").strip() == final_v:
+                    return {
+                        "item_id": file_id,
+                        "filename": filename,
+                        "ok": True,
+                        "skipped": True,
+                        "tags": {"department": current.get("department", ""), "vessel": final_v, "group": current.get("group", ""), "category": current.get("category", "")},
+                        "parent_path": p_path,
+                    }
+
+                # Build payload: in vessel-only mode only include the vessel field so
+                # SharePoint does not overwrite group/category with blank values.
+                if vessel_only_mode:
+                    payload = {k: v for k, v in _build_sharepoint_metadata_payload(vessel=final_v).items() if v}
+                else:
+                    payload = _build_sharepoint_metadata_payload(
+                        department=final_d,
+                        vessel=final_v,
+                        group=final_g,
+                        category=final_c,
+                    )
+
+                # Retry loop with backoff (up to 3 retries) on 429/503
+                patch_res = None
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        patch_res = await gd.update_file_columns(
+                            drive_id, file_id, payload,
+                            access_token=x_graph_access_token,
+                            sp_access_token=x_sp_access_token,
+                        )
+                        if patch_res.get("ok"):
+                            break
+                        err_str = str(patch_res.get("error") or "")
+                        if ("429" in err_str or "503" in err_str or "throttled" in err_str.lower()) and attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+                            continue
+                        break
+                    except Exception as patch_exc:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=str(patch_exc))
+                        return {"item_id": file_id, "filename": filename, "ok": False, "error": str(patch_exc), "parent_path": p_path}
+
+                expected_tags = {"department": final_d, "vessel": final_v, "group": final_g, "category": final_c}
+                if not patch_res or not patch_res.get("ok"):
+                    error_reason = (patch_res or {}).get("error") or "SharePoint update failed"
+                    _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=error_reason)
+                    return {
+                        "item_id": file_id,
+                        "filename": filename,
+                        "ok": False,
+                        "tags": expected_tags,
+                        "patch": patch_res or {},
+                        "error": error_reason,
+                        "parent_path": p_path,
+                    }
+
+                _resolve_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id)
                 return {
                     "item_id": file_id,
                     "filename": filename,
-                    "ok": False,
+                    "ok": True,
+                    "skipped": False,
                     "tags": expected_tags,
-                    "patch": patch_res or {},
-                    "error": (patch_res or {}).get("error") or "SharePoint update failed",
+                    "patch": patch_res,
                     "parent_path": p_path,
                 }
-
-            return {
-                "item_id": file_id,
-                "filename": filename,
-                "ok": True,
-                "tags": expected_tags,
-                "patch": patch_res,
-                "parent_path": p_path,
-            }
-        except Exception as exc:
-            return {"item_id": file_id, "filename": filename, "ok": False, "error": str(exc), "parent_path": p_path}
+            except Exception as exc:
+                _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=str(exc))
+                return {"item_id": file_id, "filename": filename, "ok": False, "error": str(exc), "parent_path": p_path}
 
     results = await asyncio.gather(*(_update_one(f) for f in target_files))
     invalidate_folder_caches()
+    skipped_count = sum(1 for r in results if r.get("ok") and r.get("skipped"))
+    updated_count = sum(1 for r in results if r.get("ok") and not r.get("skipped"))
     return {
         "ok": True,
-        "updated_count": sum(1 for r in results if r.get("ok")),
+        "updated_count": updated_count,
+        "skipped_count": skipped_count,
         "total_discovered": total_discovered,
         "truncated": is_truncated,
-        "cap": 200,
+        "cap": 500,
         "results": results,
     }
 
 
+
+@app.post("/api/sites/{site_id}/drives/{drive_id}/bulk-update-tags/stream")
+async def bulk_update_site_tags_stream(
+    site_id: str,
+    drive_id: str,
+    request: SiteBulkTagsIn,
+    x_graph_access_token: str | None = Header(default=None),
+    x_sp_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """SSE streaming version of bulk-update-tags.
+
+    Streams newline-delimited JSON events as each file is processed:
+      {"type": "start", "total": N, "total_discovered": N, "truncated": bool}
+      {"type": "progress", "completed": N, "total": N, "result": {...}}
+      {"type": "done", "updated_count": N, "skipped_count": N, "failed_count": N}
+    """
+    target_files, total_discovered, is_truncated = await _expand_to_files(
+        drive_id=drive_id,
+        item_ids=request.item_ids,
+        recursive=request.recursive,
+        max_depth=6,
+        max_files=10000,
+        access_token=x_graph_access_token,
+    )
+    if request.scope == "missing_only":
+        target_files = await _filter_site_files_by_scope(drive_id, target_files, request.scope, x_graph_access_token)
+        total_discovered = len(target_files)
+        is_truncated = False
+
+    vessel_names: list[Any] = []
+    if settings.db_configured:
+        try:
+            from .db.base import SessionLocal
+            from .db import models as db_models
+            with SessionLocal() as db:
+                vessel_names = _get_vessels_for_ocr(db)
+        except Exception:
+            pass
+    if not vessel_names:
+        try:
+            v_list = await get_backend().list_vessels()
+            vessel_names = [v["name"] for v in v_list if isinstance(v, dict) and "name" in v]
+        except Exception:
+            vessel_names = []
+
+    # Use a queue so results can be streamed as they complete
+    queue: asyncio.Queue = asyncio.Queue()
+    sem = asyncio.Semaphore(10)
+
+    async def _process_one(file_item: dict[str, Any]) -> None:
+        """Process a single file and put result on the queue."""
+        async with sem:
+            file_id = file_item["id"]
+            filename = file_item.get("name") or file_id
+            raw_p = (file_item.get("parentReference") or {}).get("path") or ""
+            p_path = raw_p.split("root:", 1)[-1].strip("/")
+            try:
+                try:
+                    fields = await graph().get(f"/drives/{drive_id}/items/{file_id}/listItem/fields", access_token=x_graph_access_token)
+                except Exception:
+                    fields = {}
+                current = _site_item_tags(fields)
+
+                v_val = request.vessel.strip()
+                d_val = request.department.strip()
+                g_val = request.group.strip()
+                c_val = request.category.strip()
+
+                vessel_only_mode = bool(v_val) and not d_val and not g_val and not c_val and not request.auto_from_path
+
+                if request.auto_from_path or (not vessel_only_mode and not (v_val and d_val and g_val and c_val)):
+                    path_tags = _derive_path_tags(p_path, filename=filename, known_vessels=vessel_names)
+                    if not v_val:
+                        v_val = path_tags.get("vessel", "")
+                    if not d_val:
+                        d_val = path_tags.get("department", "")
+                    if not g_val:
+                        g_val = path_tags.get("group", "")
+                    if not c_val:
+                        c_val = path_tags.get("category", "")
+
+                final_v = v_val or current.get("vessel", "")
+                if vessel_only_mode:
+                    final_d = current.get("department", "")
+                    final_g = current.get("group", "")
+                    final_c = current.get("category", "")
+                else:
+                    final_d = d_val or current.get("department", "")
+                    final_g = g_val or current.get("group", "")
+                    final_c = c_val or current.get("category", "")
+
+                # Skip if already has ANY vessel tag and skip_if_any_vessel_set is True
+                if request.skip_if_any_vessel_set and current.get("vessel", "").strip():
+                    await queue.put({
+                        "item_id": file_id, "filename": filename, "ok": True, "skipped": True,
+                        "tags": {"department": current.get("department", ""), "vessel": current.get("vessel", "").strip(),
+                                 "group": current.get("group", ""), "category": current.get("category", "")},
+                        "parent_path": p_path,
+                    })
+                    return
+
+                # Skip files that already have the correct vessel tag
+                if request.skip_if_tagged and vessel_only_mode and current.get("vessel", "").strip() == final_v:
+                    await queue.put({
+                        "item_id": file_id, "filename": filename, "ok": True, "skipped": True,
+                        "tags": {"department": current.get("department", ""), "vessel": final_v,
+                                 "group": current.get("group", ""), "category": current.get("category", "")},
+                        "parent_path": p_path,
+                    })
+                    return
+
+                if vessel_only_mode:
+                    payload = {k: v for k, v in _build_sharepoint_metadata_payload(vessel=final_v).items() if v}
+                else:
+                    payload = _build_sharepoint_metadata_payload(
+                        department=final_d, vessel=final_v, group=final_g, category=final_c,
+                    )
+
+                patch_res = None
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        patch_res = await gd.update_file_columns(
+                            drive_id, file_id, payload,
+                            access_token=x_graph_access_token,
+                            sp_access_token=x_sp_access_token,
+                        )
+                        if patch_res.get("ok"):
+                            break
+                        err_str = str(patch_res.get("error") or "")
+                        if ("429" in err_str or "503" in err_str or "throttled" in err_str.lower()) and attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        break
+                    except Exception as patch_exc:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=str(patch_exc))
+                        await queue.put({"item_id": file_id, "filename": filename, "ok": False, "error": str(patch_exc), "parent_path": p_path, "skipped": False})
+                        return
+
+                expected_tags = {"department": final_d, "vessel": final_v, "group": final_g, "category": final_c}
+                if not patch_res or not patch_res.get("ok"):
+                    err_msg = (patch_res or {}).get("error") or "SharePoint update failed"
+                    # If the file is locked but already has the correct vessel tag, treat as success
+                    is_lock_err = "locked" in err_msg.lower() or "lock" in err_msg.lower()
+                    current_vessel = (current.get("vessel") or "").strip()
+                    target_vessel = (final_v or "").strip()
+
+                    def _vessel_match(a: str, b: str) -> bool:
+                        """Compare vessel names, stripping common suffixes and normalising case."""
+                        import re as _re
+                        def _norm(s: str) -> str:
+                            return _re.sub(r"\s+", " ", s.strip().lower())
+                        return _norm(a) == _norm(b)
+
+                    if is_lock_err and target_vessel and _vessel_match(current_vessel, target_vessel):
+                        # File is locked but already has the right vessel — count as skipped success
+                        await queue.put({
+                            "item_id": file_id, "filename": filename, "ok": True, "skipped": True,
+                            "tags": expected_tags,
+                            "parent_path": p_path,
+                        })
+                    else:
+                        _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=err_msg)
+                        await queue.put({
+                            "item_id": file_id, "filename": filename, "ok": False, "skipped": False,
+                            "tags": expected_tags, "patch": patch_res or {},
+                            "error": err_msg,
+                            "parent_path": p_path,
+                        })
+                else:
+                    _resolve_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id)
+                    await queue.put({
+                        "item_id": file_id, "filename": filename, "ok": True, "skipped": False,
+                        "tags": expected_tags, "patch": patch_res, "parent_path": p_path,
+                    })
+            except Exception as exc:
+                _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=file_id, filename=filename, parent_path=p_path, error_reason=str(exc))
+                await queue.put({"item_id": file_id, "filename": filename, "ok": False, "error": str(exc), "parent_path": p_path, "skipped": False})
+
+    async def event_generator():
+        total = len(target_files)
+        # Send start event
+        yield json.dumps({"type": "start", "total": total, "total_discovered": total_discovered, "truncated": is_truncated}) + "\n"
+
+        if total == 0:
+            yield json.dumps({"type": "done", "updated_count": 0, "skipped_count": 0, "failed_count": 0}) + "\n"
+            return
+
+        # Fire all file-processing tasks concurrently (semaphore controls parallelism)
+        tasks = [asyncio.create_task(_process_one(f)) for f in target_files]
+
+        completed = 0
+        updated_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        while completed < total:
+            result = await queue.get()
+            completed += 1
+            if result.get("ok") and result.get("skipped"):
+                skipped_count += 1
+            elif result.get("ok"):
+                updated_count += 1
+            else:
+                failed_count += 1
+
+            # Only stream non-skipped results so the feed only shows actual work
+            if not result.get("skipped"):
+                yield json.dumps({
+                    "type": "progress",
+                    "completed": updated_count + failed_count,
+                    "skipped": skipped_count,
+                    "total": total - skipped_count if skipped_count else total,
+                    "result": result,
+                }) + "\n"
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        invalidate_folder_caches()
+        yield json.dumps({
+            "type": "done",
+            "updated_count": updated_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+        }) + "\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
 async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None = None) -> dict[str, Any]:
+    filename = item_id
+    parent_path = ""
     try:
         item = await gd.get_item(drive_id, item_id, access_token=access_token)
+        filename = item.get("name") or item_id
+        parent_path = ((item.get("parentReference") or {}).get("path") or "").split("root:", 1)[-1].strip("/")
+
         try:
             fields = await graph().get(f"/drives/{drive_id}/items/{item_id}/listItem/fields", access_token=access_token)
         except Exception:
             fields = {}
         current_tags = _site_item_tags(fields)
 
-        data, content_type, filename = await gd.download_file(drive_id, item_id, access_token=access_token)
+        data = b""
+        content_type = ""
+        try:
+            dl_data, dl_ctype, dl_fname = await asyncio.wait_for(
+                gd.download_file(drive_id, item_id, access_token=access_token),
+                timeout=45.0,
+            )
+            data = dl_data
+            content_type = dl_ctype or ""
+            if dl_fname:
+                filename = dl_fname
+        except (asyncio.TimeoutError, Exception) as dl_exc:
+            logger.warning("Download timed out or failed for %s (%s): %s", item_id, filename, dl_exc)
+
         from .ocr.extract import extract_text
         from .ocr.drawing_category import (
             classify_document_content,
             classify_against_db_categories,
             classify_all_fields_tiered,
+            is_non_document_filename,
         )
 
-        text_value = await asyncio.to_thread(extract_text, data, filename, content_type or "")
+        text_value = ""
+        if data:
+            try:
+                text_value = await asyncio.wait_for(
+                    asyncio.to_thread(extract_text, data, filename, content_type or ""),
+                    timeout=20.0,
+                )
+            except (asyncio.TimeoutError, Exception) as ocr_exc:
+                logger.warning("OCR extraction timed out or failed for %s (%s): %s", item_id, filename, ocr_exc)
+                text_value = ""
 
         vessel_names: list[Any] = []
         db_categories = []
@@ -2883,7 +3502,6 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
             except Exception:
                 vessel_names = []
 
-        parent_path = ((item.get("parentReference") or {}).get("path") or "").split("root:", 1)[-1].strip("/")
         classification = classify_document_content(text_value, filename=filename, known_vessels=vessel_names)
         tiered = classify_all_fields_tiered(text_value, filename=filename, known_vessels=vessel_names, source_path=parent_path)
         best_db_cat, db_conf, db_matches = classify_against_db_categories(text_value, filename=filename, db_categories=db_categories)
@@ -2915,6 +3533,7 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
             "vessel": {
                 "value": detected_vessel,
                 "confidence": round(float((tiered.get("vessel") or {}).get("confidence") or (0.95 if detected_vessel else 0.0)), 2),
+                "vessel_in_filename_only": bool(tiered.get("vessel_in_filename_only")),
             },
             "group": {
                 "value": detected_group,
@@ -3070,6 +3689,11 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
             else:
                 path_group = "Drawing" if _fn_has_drawing else "Manual"
 
+        if is_non_document_filename(filename):
+            path_group = "Drawing"
+            path_cat = "To Be Classified"
+            path_sub = "To Be Classified"
+
 
         path_values = {
             "department": path_dept or "Technical & Crewing",
@@ -3091,22 +3715,27 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
             path_v = path_values.get(k, "")
             if current_tags.get(k):
                 proposed_tags[k] = current_tags[k]
-            elif k in ("vessel", "group") and path_v:
-                # For vessel and group, path (folder location) is the authoritative source.
-                # Only override with OCR if OCR is very highly confident (>= 0.85).
-                if ocr_v and ocr_c >= 0.85:
+            elif k == "vessel":
+                # For vessel, use the folder-derived value when available; only override
+                # with OCR when the OCR hit is very strong.
+                if path_v and (not ocr_v or ocr_c < 0.85):
+                    proposed_tags[k] = path_v
+                elif ocr_v:
                     proposed_tags[k] = ocr_v
                 else:
                     proposed_tags[k] = path_v
-            elif ocr_v and ocr_c >= 0.60:
-                proposed_tags[k] = ocr_v
             elif path_v:
+                # For department/group/category, the current folder path is the most
+                # reliable source of taxonomy because OCR can be noisy on scanned drawings.
                 proposed_tags[k] = path_v
-            else:
+            elif ocr_v:
                 proposed_tags[k] = ocr_v
+            else:
+                proposed_tags[k] = ""
 
         path_parts = [p.strip() for p in parent_path.replace("\\", "/").split("/") if p.strip()]
         subfolder_name = path_parts[-1] if path_parts else ""
+        vessel_in_filename_only = bool(tiered.get("vessel_in_filename_only"))
         return {
             "item_id": item_id,
             "filename": filename,
@@ -3119,6 +3748,9 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
             "current_values": current_tags,
             "proposed_tags": proposed_tags,
             "confidence": max((item.get("confidence", 0) for item in ocr_suggestion.values()), default=0.5),
+            # True when vessel was detected from filename alias (e.g. N-2119 → Bow Fighter)
+            # but the vessel name is absent from the file's actual text content.
+            "vessel_in_filename_only": vessel_in_filename_only,
             "error": None,
         }
     except Exception as exc:
@@ -3144,24 +3776,251 @@ async def scan_site_tags(
     x_graph_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    del site_id
     target_files, total_discovered, is_truncated = await _expand_to_files(
         drive_id=drive_id,
         item_ids=request.item_ids,
         recursive=request.recursive,
         max_depth=6,
-        max_files=200,
+        # OCR review must cover the complete selected tree in one request.
+        # Graph child enumeration already paginates; this high ceiling only
+        # protects the service from an accidentally unbounded selection.
+        max_files=10000,
         access_token=x_graph_access_token,
     )
-    results = await asyncio.gather(*(_site_scan_file(drive_id, f["id"], access_token=x_graph_access_token) for f in target_files))
+    total_in_scope = total_discovered
+    if request.scope == "missing_only":
+        target_files = await _filter_site_files_by_scope(drive_id, target_files, request.scope, x_graph_access_token)
+        is_truncated = False
+    excluded = set(request.exclude_item_ids)
+    if excluded:
+        target_files = [item for item in target_files if item.get("id") not in excluded]
+        total_discovered = len(target_files)
+        is_truncated = False
+    sem = asyncio.Semaphore(4)
+
+    async def _bounded_scan(f: dict[str, Any]) -> dict[str, Any]:
+        async with sem:
+            try:
+                return await asyncio.wait_for(
+                    _site_scan_file(drive_id, f["id"], access_token=x_graph_access_token),
+                    timeout=90,
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "item_id": f["id"],
+                    "filename": f.get("name") or f["id"],
+                    "status": "error",
+                    "confidence": 0,
+                    "error": "OCR scan timed out after 90 seconds",
+                }
+            except Exception as exc:
+                return {
+                    "item_id": f["id"],
+                    "filename": f.get("name") or f["id"],
+                    "status": "error",
+                    "confidence": 0,
+                    "error": str(exc),
+                }
+
+    results = await asyncio.gather(*(_bounded_scan(f) for f in target_files))
     invalidate_folder_caches()
     return {
         "results": results,
         "scanned": len(results),
-        "total_discovered": total_discovered,
+        "total_discovered": total_in_scope,
+        "eligible_count": len(target_files),
+        "scope": request.scope,
         "truncated": is_truncated,
-        "cap": 200,
+        "cap": 10000,
     }
+
+
+@app.post("/api/sites/{site_id}/drives/{drive_id}/scan-tags/stream")
+async def scan_site_tags_stream(
+    site_id: str,
+    drive_id: str,
+    request: SiteScanTagsIn,
+    x_graph_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Stream OCR scan progress as newline-delimited JSON events."""
+    async def event_generator():
+        # Send an event before Graph traversal/tag inspection so the UI never
+        # appears hung while a large folder tree is being discovered.
+        yield json.dumps({"type": "start", "phase": "discovering", "total": 0}) + "\n"
+        target_files, total_discovered, is_truncated = await _expand_to_files(
+            drive_id=drive_id,
+            item_ids=request.item_ids,
+            recursive=request.recursive,
+            max_depth=6,
+            max_files=10000,
+            access_token=x_graph_access_token,
+        )
+        total_in_scope = total_discovered
+        if request.scope == "missing_only":
+            target_files = await _filter_site_files_by_scope(
+                drive_id, target_files, request.scope, x_graph_access_token
+            )
+            is_truncated = False
+        excluded = set(request.exclude_item_ids)
+        if excluded:
+            target_files = [item for item in target_files if item.get("id") not in excluded]
+
+        total = len(target_files)
+        yield json.dumps({
+            "type": "start",
+            "total": total,
+            "total_discovered": total_in_scope,
+            "truncated": is_truncated,
+            "scope": request.scope,
+        }) + "\n"
+        if total == 0:
+            yield json.dumps({"type": "done", "scanned": 0}) + "\n"
+            return
+
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        semaphore = asyncio.Semaphore(4)
+
+        async def scan_one(file_item: dict[str, Any]) -> None:
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        _site_scan_file(
+                            drive_id, file_item["id"], access_token=x_graph_access_token
+                        ),
+                        timeout=90,
+                    )
+                except asyncio.TimeoutError:
+                    result = {
+                        "item_id": file_item["id"],
+                        "filename": file_item.get("name") or file_item["id"],
+                        "status": "error",
+                        "confidence": 0,
+                        "error": "OCR scan timed out after 90 seconds",
+                    }
+                except Exception as exc:
+                    result = {
+                        "item_id": file_item["id"],
+                        "filename": file_item.get("name") or file_item["id"],
+                        "status": "error",
+                        "confidence": 0,
+                        "error": str(exc),
+                    }
+            await queue.put(result)
+
+        tasks = [asyncio.create_task(scan_one(item)) for item in target_files]
+        completed = 0
+        try:
+            while completed < total:
+                result = await queue.get()
+                completed += 1
+                yield json.dumps({
+                    "type": "progress",
+                    "completed": completed,
+                    "total": total,
+                    "result": result,
+                }) + "\n"
+            await asyncio.gather(*tasks, return_exceptions=True)
+            invalidate_folder_caches()
+            yield json.dumps({"type": "done", "scanned": completed}) + "\n"
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/api/sites/{site_id}/drives/{drive_id}/tag-failures")
+async def list_tag_failures(
+    site_id: str,
+    drive_id: str,
+    status: str = "needs_retry",
+    _session: object = Depends(require_session),
+):
+    if not settings.db_configured:
+        return {"failures": [], "count": 0}
+    from .db.base import SessionLocal
+    from .db.models import TagFailure
+    with SessionLocal() as db:
+        rows = db.query(TagFailure).filter(
+            TagFailure.site_id == site_id,
+            TagFailure.drive_id == drive_id,
+            TagFailure.status == status,
+        ).order_by(TagFailure.last_attempted_at.desc()).all()
+        return {"failures": [{
+            "file_id": row.file_id,
+            "filename": row.filename,
+            "parent_path": row.parent_path,
+            "error_reason": row.error_reason,
+            "status": row.status,
+            "attempt_count": row.attempt_count,
+            "first_failed_at": row.first_failed_at.isoformat() if row.first_failed_at else None,
+            "last_attempted_at": row.last_attempted_at.isoformat() if row.last_attempted_at else None,
+        } for row in rows], "count": len(rows)}
+
+
+@app.post("/api/sites/{site_id}/drives/{drive_id}/retry-tag-failures")
+async def retry_tag_failures(
+    site_id: str,
+    drive_id: str,
+    request: TagFailureActionIn,
+    x_graph_access_token: str | None = Header(default=None),
+    x_sp_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    if not settings.db_configured:
+        return {"ok": True, "results": [], "message": "Database is not configured"}
+    from .db.base import SessionLocal
+    from .db.models import TagFailure
+    with SessionLocal() as db:
+        query = db.query(TagFailure).filter(
+            TagFailure.site_id == site_id,
+            TagFailure.drive_id == drive_id,
+            TagFailure.status == "needs_retry",
+        )
+        if request.file_ids:
+            query = query.filter(TagFailure.file_id.in_(request.file_ids))
+        file_ids = [row.file_id for row in query.all()]
+    result = await bulk_update_site_tags(
+        site_id, drive_id,
+        SiteBulkTagsIn(item_ids=file_ids, auto_from_path=True, recursive=True, scope="all"),
+        x_graph_access_token, x_sp_access_token, _session,
+    ) if file_ids else {"ok": True, "results": []}
+    return result
+
+
+@app.post("/api/sites/{site_id}/drives/{drive_id}/dismiss-tag-failures")
+async def dismiss_tag_failures(
+    site_id: str,
+    drive_id: str,
+    request: TagFailureActionIn,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    if not settings.db_configured:
+        return {"ok": True, "dismissed": 0}
+    from .db.base import SessionLocal
+    from .db.models import TagFailure
+    with SessionLocal() as db:
+        query = db.query(TagFailure).filter(
+            TagFailure.site_id == site_id,
+            TagFailure.drive_id == drive_id,
+            TagFailure.status == "needs_retry",
+        )
+        if request.file_ids:
+            query = query.filter(TagFailure.file_id.in_(request.file_ids))
+        rows = query.all()
+        for row in rows:
+            row.status = "dismissed"
+            row.dismissed_by = x_user_email or "user"
+            row.dismissed_reason = request.reason.strip() or None
+        db.commit()
+        return {"ok": True, "dismissed": len(rows)}
 
 
 @app.post("/api/sites/{site_id}/drives/{drive_id}/items/{item_id}/resolve-tags")
@@ -3174,7 +4033,6 @@ async def resolve_site_tags(
     x_sp_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    del site_id
     allowed = {"ocr", "path", "manual", "skip"}
     try:
         try:
@@ -3213,6 +4071,9 @@ async def resolve_site_tags(
                 sp_access_token=x_sp_access_token,
             )
             if not patch_res.get("ok"):
+                _record_tag_failure(site_id=site_id, drive_id=drive_id, file_id=item_id,
+                                    filename=item_id, parent_path="",
+                                    error_reason=patch_res.get("error") or "SharePoint did not save the tags")
                 raise HTTPException(502, patch_res.get("error") or "SharePoint did not save the tags")
             saved_fields = await graph().get(f"/drives/{drive_id}/items/{item_id}/listItem/fields", access_token=x_graph_access_token)
             if not _sharepoint_tags_match(saved_fields, merged):
@@ -3228,11 +4089,19 @@ async def resolve_site_tags(
                     {k: v for k, v in merged.items() if v},
                     _site_item_tags(saved_fields),
                 )
+            _resolve_tag_failure(site_id=site_id, drive_id=drive_id, file_id=item_id)
             invalidate_folder_caches()
             final_tags = merged
         else:
             final_tags = current
-        return {"ok": True, "item_id": item_id, "tags": final_tags, "updated_fields": list(selected_fields)}
+        # Include any non-fatal vessel REST warning in the response for frontend display
+        vessel_warn = None
+        if selected_fields and patch_res and patch_res.get("match_mode", {}).get("vessel") == "sharepoint_rest_failed":
+            vessel_warn = "Vessel Name tag could not be saved via SharePoint REST (taxonomy write failed). Other tags were saved successfully."
+        resp = {"ok": True, "item_id": item_id, "tags": final_tags, "updated_fields": list(selected_fields)}
+        if vessel_warn:
+            resp["vessel_warning"] = vessel_warn
+        return resp
     except GraphError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
@@ -3358,9 +4227,14 @@ async def admin_switch_site(
     # Attempt to validate the new site's Graph connection
     try:
         from .graph.client import graph
-        test_client = graph(site_name=target_site)
-        # Quick validation: attempt to get a token
-        await test_client.get("/me")
+        test_client = graph(site_config=new_config)
+        test_client._token()
+        if getattr(new_config, "drive_id", None):
+            await test_client.get(f"/drives/{new_config.drive_id}")
+        elif getattr(new_config, "sp_site_id", None):
+            await test_client.get(f"/sites/{new_config.sp_site_id}")
+        else:
+            await test_client.get("/sites/root")
     except Exception as e:
         db = None
         try:
@@ -3398,10 +4272,26 @@ async def admin_switch_site(
     old_active = os.environ.get("ACTIVE_SITE")
     try:
         os.environ["ACTIVE_SITE"] = target_site
+        os.environ["APP_ENV"] = target_site
+
+        # Persist to .env file if target_site is defined in .env
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if f"{target_site.upper()}_DRIVE_ID" in content:
+                    import re
+                    new_content = re.sub(r"^ACTIVE_SITE\s*=.*$", f"ACTIVE_SITE={target_site}", content, flags=re.MULTILINE)
+                    new_content = re.sub(r"^APP_ENV\s*=.*$", f"APP_ENV={target_site}", new_content, flags=re.MULTILINE)
+                    with open(env_path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+            except Exception as env_err:
+                logger.warning(f"Failed to persist ACTIVE_SITE to .env: {env_err}")
+
         # Force new settings to be loaded
         from .config import _SITE_CONFIGS_CACHE
-        if target_site in _SITE_CONFIGS_CACHE:
-            _SITE_CONFIGS_CACHE.pop(target_site)
+        _SITE_CONFIGS_CACHE.clear()
         
         # Reset graph client for new site
         await reset_graph_client()
@@ -4300,6 +5190,7 @@ async def create_vessel(
             vessel_type=vtype,
             requesting_email=email,
             requesting_name=display_name,
+            provisioned_site_ids=payload.provisioned_site_ids,
         )
         if result.get("status") == "pending":
             return JSONResponse(status_code=202, content={
@@ -4343,6 +5234,7 @@ async def update_vessel(
             vessel_type=vtype,
             requesting_email=user_email,
             requesting_name=display_name,
+            provisioned_site_ids=payload.provisioned_site_ids,
         )
         if result.get("status") == "pending":
             return JSONResponse(status_code=202, content={
@@ -4475,6 +5367,121 @@ async def vessel_provision_status(
         if vessel is None:
             raise HTTPException(404, "Vessel not found")
         return {"vessel_id": vessel_id, "is_provisioned": bool(vessel.is_provisioned)}
+
+
+@app.get("/api/admin/site-provisioning/sites")
+async def get_site_provisioning_sites(
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Retrieve all tenant sites with provisioning configuration flags."""
+    from .services.site_provisioning import get_all_configured_sites
+    from .db.base import SessionLocal
+    with SessionLocal() as db:
+        sites = get_all_configured_sites(db)
+        return {"sites": sites, "active_site": settings.active_site}
+
+
+class UpdateSiteProvisioningItem(BaseModel):
+    site_key: str
+    is_available_for_provisioning: bool | None = None
+    is_default_provisioning: bool | None = None
+    display_name: str | None = None
+
+
+class UpdateSiteProvisioningRequest(BaseModel):
+    sites: list[UpdateSiteProvisioningItem]
+
+
+@app.put("/api/admin/site-provisioning/sites")
+async def update_site_provisioning_sites(
+    payload: UpdateSiteProvisioningRequest,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Update provisioning availability and default site settings."""
+    _require_admin(x_user_email)
+    from .db.base import SessionLocal
+    from .db import models as db_models
+    from .services.site_provisioning import get_all_configured_sites
+    with SessionLocal() as db:
+        for item in payload.sites:
+            key = item.site_key.strip().lower()
+            rec = db.query(db_models.SiteConfiguration).filter_by(site_key=key).first()
+            if rec:
+                if item.is_available_for_provisioning is not None:
+                    rec.is_available_for_provisioning = item.is_available_for_provisioning
+                if item.is_default_provisioning is not None:
+                    rec.is_default_provisioning = item.is_default_provisioning
+                if item.display_name is not None:
+                    rec.display_name = item.display_name
+            else:
+                rec = db_models.SiteConfiguration(
+                    site_key=key,
+                    display_name=item.display_name or key,
+                    site_name=key,
+                    site_id=key,
+                    drive_id="",
+                    is_available_for_provisioning=item.is_available_for_provisioning if item.is_available_for_provisioning is not None else True,
+                    is_default_provisioning=item.is_default_provisioning if item.is_default_provisioning is not None else False,
+                    created_by_email=x_user_email or "admin",
+                )
+                db.add(rec)
+        db.commit()
+        updated_sites = get_all_configured_sites(db)
+        return {"success": True, "sites": updated_sites}
+
+
+class ProvisionSitesRequest(BaseModel):
+    site_keys: list[str]
+
+
+@app.post("/api/vessels/{vessel_id}/provision-sites")
+async def provision_vessel_sites(
+    vessel_id: str,
+    payload: ProvisionSitesRequest,
+    _session: object = Depends(require_session),
+):
+    """Provision DMS folder structure for specific site(s) on an existing vessel with diff-based retry."""
+    try:
+        vid = int(vessel_id)
+    except ValueError:
+        raise HTTPException(404, "Vessel not found")
+    from .db.base import SessionLocal
+    from .db import models as db_models
+    with SessionLocal() as db:
+        vessel = db.query(db_models.Vessel).filter_by(id=vid).first()
+        if not vessel:
+            raise HTTPException(404, "Vessel not found")
+        vname = vessel.name
+
+    from .services.site_provisioning import provision_vessel_multi_site
+    result = await provision_vessel_multi_site(vid, vname, payload.site_keys)
+    return result
+
+
+@app.get("/api/vessels/{vessel_id}/site-status")
+async def get_vessel_site_status(
+    vessel_id: str,
+    _session: object = Depends(require_session),
+):
+    """Get per-site provisioning status for a vessel."""
+    try:
+        vid = int(vessel_id)
+    except ValueError:
+        raise HTTPException(404, "Vessel not found")
+    from .db.base import SessionLocal
+    from .db import models as db_models
+    with SessionLocal() as db:
+        vessel = db.query(db_models.Vessel).filter_by(id=vid).first()
+        if not vessel:
+            raise HTTPException(404, "Vessel not found")
+        return {
+            "vessel_id": str(vessel.id),
+            "vessel_name": vessel.name,
+            "is_provisioned": vessel.is_provisioned,
+            "provisioned_site_ids": vessel.provisioned_site_ids or [],
+        }
 
 
 @app.post("/api/vessels/repair-links")

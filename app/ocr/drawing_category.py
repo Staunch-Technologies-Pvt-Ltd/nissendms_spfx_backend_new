@@ -54,6 +54,15 @@ from typing import Any
 # pre-filling the vessel field with a low-confidence guess.
 VESSEL_CONFIDENCE_FLOOR: float = 0.60
 
+
+def is_non_document_filename(filename: str) -> bool:
+    """Return true for operating-system files that should bypass OCR taxonomy."""
+    return (filename or "").strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1] in {
+        "thumbs.db",
+        "desktop.ini",
+        ".ds_store",
+    }
+
 # ── 1. VESSEL MASTER LIST (24 Production Vessels) ─────────────────────────────
 VESSEL_MASTER_LIST: list[str] = [
     "Belle Lune",
@@ -145,7 +154,7 @@ VESSEL_ALIASES: dict[str, tuple[str, ...]] = {
 DRAWING_TAXONOMY: dict[str, dict[str, tuple[str, ...]]] = {
     "Basic": {
         "Basic Drawings": ("basic drawing", "basic drawings", "key plan", "contract plan", "inventory", "legal equipment", "list of inventory"),
-        "Capacity Plan & Dead Weight": ("capacity plan", "deadweight scale", "dead weight", "tank capacity plan", "sounding table"),
+        "Capacity Plan & Dead Weight": ("capacity plan", "deadweight scale", "dead weight", "tank capacity plan", "sounding table", "level gauge", "sounding table for level gauge"),
         "Damage Control Plan": ("damage control", "damage stability", "damage control plan", "damage control booklet"),
         "Docking Plan": ("docking plan", "docking drawing", "dry docking plan", "keel block plan"),
         "EEDI Technical file": ("eedi", "eedi technical file", "energy efficiency design index", "eeoi"),
@@ -166,7 +175,13 @@ DRAWING_TAXONOMY: dict[str, dict[str, tuple[str, ...]]] = {
         "Bulkhead plans": ("bulkhead plan", "watertight bulkhead", "collision bulkhead", "transverse bulkhead", "bulkhead construction", "bulkhead plans", "joiner bhd", "bhd", "bulkhead"),
         "Cargo Securing Manual": ("cargo securing manual", "csm", "cargo lashing manual", "cargo securing plan"),
         "Container Stowage Plan": ("container stowage", "container securing", "bay plan", "lashing plan", "container arrangement", "stowage plan"),
-        "Hull Drawings": ("hull drawing", "hull drawings", "hull structure", "hull construction"),
+        "Hull Drawings": (
+            "hull drawing", "hull drawings", "hull structure", "hull construction",
+            "hull part", "(hull part)", "hull parts", "(hull parts)",
+            "sounding table (hull part)", "sounding table(hull part)",
+            "sounding table (for level gauge) (hull part)", "sounding table(for level gauge)(hull part)",
+            "sounding table for level gauge (hull part)", "level gauge (hull part)", "level gauge(hull part)",
+        ),
         "Makers List of Hull parts": ("makers list of hull", "hull maker list", "hull equipment list", "hull fittings maker"),
         "Midship Section": ("midship section", "typical midship", "transverse section", "midship construction"),
         "Mooring Arrangement": ("mooring arrangement", "mooring plan", "towing and mooring", "fairlead arrangement"),
@@ -180,7 +195,7 @@ DRAWING_TAXONOMY: dict[str, dict[str, tuple[str, ...]]] = {
     "Machinery": {
         "Arrangement of Engine Room": ("arrangement of engine room", "engine room arrangement", "er layout", "machinery arrangement", "er plan", "ecr", "engine control room"),
         "Machinery Drawings": ("machinery drawing", "machinery drawings", "engine drawings", "piping drawing"),
-        "Machinery Makers List": ("machinery makers list", "machinery maker", "engine maker list", "equipment maker list"),
+        "Machinery Makers List": ("machinery makers list", "machinery maker", "engine maker list", "equipment maker list", "machinery part", "spare parts", "spare part", "tool list", "spare parts and tool list"),
         "Machinery Particulars": ("machinery particulars", "machinery data", "principal machinery particulars", "engine specification"),
         "Pipeline Diagram": ("pipeline diagram", "piping diagram", "bilge piping", "ballast piping", "fuel oil piping", "lube oil piping", "cooling water piping"),
         "Shafting Arrangements": ("shafting arrangement", "shaft alignment", "intermediate shaft", "propeller shaft", "thrust shaft", "shafting arrangements"),
@@ -814,6 +829,14 @@ def _classify_vessel_tiered(
 
     parsed_names, imo_map, hull_map = _parse_known_vessels(known_vessels)
 
+    # The vessel folder is the authoritative SharePoint location. Prefer an
+    # exact known vessel there over noisy OCR text from the document body.
+    if source_path:
+        folder_vessel = _extract_vessel_from_folder_path(source_path)
+        matched_folder_vessel = _match_known_vessel(folder_vessel or "", known_vessels)
+        if matched_folder_vessel:
+            return {"value": matched_folder_vessel, "confidence": 0.99, "tier": 1}
+
     # ── Tier 1: Exact IMO Number match in document text or filename ──
     if imo_map:
         imo_matches = re.findall(r"\b(?:imo|imo\s*no\.?|imo\s*num\.?|imo\s*number|imo\s*#)\s*[:\-\.#]?\s*([0-9]{7})\b", f"{fn_lower}\n{full_text_lower}", re.IGNORECASE)
@@ -910,12 +933,12 @@ def _classify_vessel_tiered(
         for seg in segments:
             matched_vessel = _match_known_vessel(seg, known_vessels)
             if matched_vessel:
-                return {"value": matched_vessel, "confidence": 0.80, "tier": 2}
+                return {"value": matched_vessel, "confidence": 0.45, "tier": 2}
 
         # If not matched in known vessels, derive vessel name from folder path
         folder_v = _extract_vessel_from_folder_path(source_path)
         if folder_v:
-            return {"value": folder_v, "confidence": 0.85, "tier": 2}
+            return {"value": folder_v, "confidence": 0.45, "tier": 2}
 
     return {"value": "", "confidence": 0.0, "tier": 2}
 
@@ -1027,17 +1050,25 @@ def _classify_group_tiered(
     fn_lower = filename.lower()
     path_lower = (source_path or "").lower()
 
-    # Manual cues from source path (e.g. folder contains "Main Engine", "MB MAIN ENGINE", "Manuals")
+    # Parse path segments to avoid false manual trigger from parent 'Drawings and Manuals' folder
+    path_segments = [s.strip().lower() for s in (source_path or "").replace("\\", "/").split("/") if s.strip()]
+    clean_segments = [
+        s for s in path_segments
+        if not any(s.startswith(p) for p in ("drawings and manuals", "drawings & manuals", "drawing and manual"))
+    ]
+    clean_path = " / ".join(clean_segments)
+
+    # Manual cues from clean path (excluding the parent "Drawings and Manuals" folder)
     path_has_manual = (
-        "manuals" in path_lower or "manual" in path_lower or
-        "main engine" in path_lower or "mb main engine" in path_lower or
-        "auxiliary engine" in path_lower or "boiler" in path_lower or
-        "steering gear" in path_lower or "deck machinery" in path_lower or
-        "operation" in path_lower or "maintenance" in path_lower
+        "manuals" in clean_path or "manual" in clean_path or
+        "main engine" in clean_path or "mb main engine" in clean_path or
+        "auxiliary engine" in clean_path or "boiler" in clean_path or
+        "steering gear" in clean_path or "deck machinery" in clean_path or
+        "operation" in clean_path or "maintenance" in clean_path
     )
     path_has_drawing = (
-        ("drawings" in path_lower or "drawing" in path_lower or "dwg" in path_lower)
-        and not any(p in path_lower for p in ("drawings and manuals", "drawings & manuals", "drawing and manual"))
+        "drawings" in clean_path or "drawing" in clean_path or "dwg" in clean_path or
+        any(s in ("hull", "electrical", "machinery", "basic", "safety", "other drawings") for s in clean_segments)
     )
 
     manual_tier1_patterns = [
@@ -1059,16 +1090,18 @@ def _classify_group_tiered(
 
     drawing_tier1_patterns = [
         r"\bdwg(?:\.|\s+)?no\b",
-        r"\bdrawing\s+no\b",
+        r"\bdrawing\s+no\.?\b",
         r"\bfinished\s+plan\b",
         r"\blist\s+of\s+finished\s+drawings\b",
         r"\bfinished\s+drawings\b",
         r"\bgeneral\s+arrangement\s+plan\b",
+        r"\bgeneral\s+arrangement\b",
         r"\bsingle\s+line\s+diagram\b",
         r"\bschematic\s+diagram\b",
         r"\bkey\s+plan\b",
         r"\bdocking\s+plan\b",
         r"\bga\s+drawing\b",
+        r"\bga\s+plan\b",
         r"\bmidship\s+section\b",
         r"\bcapacity\s+plan\b",
         r"\bwheelhouse\s+arrangement\b",
@@ -1077,6 +1110,34 @@ def _classify_group_tiered(
         r"\bcable\s+plan\b",
         r"\bpenetration\s+(?:register|plan|drawing)\b",
         r"\bpipe\s+(?:plan|diagram|drawing)\b",
+        r"\bmachinery\s+parts?\b",
+        r"\bspare\s+parts?\s*(?:&|and)\s*tools?\s+list\b",
+        r"\bspare\s+parts?\s+list\b",
+        # ── Hull part / sounding table cues (always drawings) ──
+        r"\bhull\s+part\b",
+        r"\(hull\s+part\)",
+        r"\bsounding\s+table\b",
+        r"\blevel\s+gauge\b",
+        # ── Deck plan / fire plan / condition plan cues ──
+        # Ship drawings (deck plans, GA, fire plans) always have a symbol legend:
+        r"\bcondition\s+plan\b",
+        r"\bplan\s+on\s+deck\b",
+        r"\bdeck\s+plan\b",
+        r"\bprofile\s+(?:and|\&)\s+deck\b",
+        r"\bfire\s+control\s+plan\b",
+        r"\bfire\s+(?:and|\&)\s+safety\s+plan\b",
+        r"\bfire\s+fighting\s+plan\b",
+        r"\blife\s+saving\s+appliances\s+plan\b",
+        r"\bdamage\s+control\s+plan\b",
+        r"\bshell\s+expansion\b",
+        r"\bmidship\s+construction\b",
+        r"\bmooring\s+arrangement\b",
+        # Legend/symbol tables are present on virtually ALL ship technical drawings:
+        r"\bsymbol\b.{0,40}\bexplanation\b",
+        r"\bexplanation\b.{0,40}\bremarks\b",
+        r"\bsymbol\b.{0,40}\bremarks\b",
+        r"\bship\s+no\.?\b",
+        r"\bhull\s+no\.?\b",
     ]
 
     # Filename manual and drawing keyword checks
@@ -1085,19 +1146,21 @@ def _classify_group_tiered(
         "specification", "spare", "spares", "tool", "tools", "procedure",
         "service", "repair", "data", "component", "guide",
         "manual", "operator", "list of spare", "technical data",
-        "manoeuvering", "maneuvering", "parts", "accessories with engine",
+        "manoeuvering", "maneuvering", "spare parts", "parts list", "accessories with engine",
         "parts book", "parts catalog", "parts catalogue", "catalog", "catalogue",
         "troubleshooting", "handbook", "booklet", "egr"
     )
     _DRAWING_FN_KEYWORDS = (
         "dwg", "drawing", "plan", "diagram", "layout", "arrangement",
-        "elevation", "detail", "section", "register", "schematic", "ga drawing"
+        "elevation", "detail", "section", "register", "schematic", "ga drawing",
+        "hull part", "hull parts", "(hull part)", "sounding table", "level gauge"
     )
     fn_has_manual = any(k in fn_lower for k in _MANUAL_FN_KEYWORDS)
     fn_has_drawing = any(k in fn_lower for k in _DRAWING_FN_KEYWORDS)
+    fn_has_machinery_part_drawing = bool(re.search(r"\bmachinery\s+parts?\b", fn_lower, re.IGNORECASE))
     # Equipment section code e.g. MB-1, MB-2, ME-1, AE-2 (marine equipment manual volumes)
     is_equipment_code = bool(re.match(r"^[a-z]{2}-\d+", fn_lower))
-    if is_equipment_code and not fn_has_drawing:
+    if is_equipment_code and not fn_has_drawing and not fn_has_machinery_part_drawing:
         fn_has_manual = True
 
     # ── Tier 1: Check filename cues FIRST (highest confidence) ──
@@ -1121,16 +1184,36 @@ def _classify_group_tiered(
     if path_has_drawing and not path_has_manual and not fn_has_manual:
         return {"value": "Drawing", "confidence": 0.95, "tier": 1}
 
-    # Check text: only check drawing patterns in text if document is NOT an equipment manual
-    # (Engine & equipment manuals frequently include figure schematics labeled 'DRAWING NO.')
-    if text_is_usable and not fn_has_manual and not path_has_manual:
+    # Check text for drawing cues FIRST.
+    # Important: even if filename suggests manual, legend tables in drawings can contain
+    # phrases like 'plan on deck', 'symbol / explanation / remarks', 'drawing no.' etc.
+    # Engine manuals are excluded ONLY when path also confirms a manual sub-folder.
+    _is_certain_manual_path = path_has_manual and not path_has_drawing
+    if text_is_usable and not _is_certain_manual_path:
         for pat in drawing_tier1_patterns:
-            if re.search(pat, combined, re.IGNORECASE):
-                return {"value": "Drawing", "confidence": 0.94, "tier": 1}
+            if re.search(pat, combined, re.IGNORECASE | re.DOTALL):
+                return {"value": "Drawing", "confidence": 0.95, "tier": 1}
 
     if text_is_usable:
         for pat in manual_tier1_patterns:
             if re.search(pat, combined, re.IGNORECASE):
+                # Additional guard: if strong drawing visual structure cues are present
+                # in the document, don't let a Manual pattern override it.
+                # (e.g. 'operation manual' in the notes section of a fire control plan)
+                _drawing_visual_cues = [
+                    r"\bsymbol\b", r"\bexplanation\b", r"\bremarks\b",
+                    r"\bplan\s+on\s+deck\b", r"\bcondition\s+plan\b",
+                    r"\bship\s+no\.?\b", r"\bhull\s+no\.?\b",
+                    r"\bdeck\s+plan\b", r"\bfire\s+control\s+plan\b",
+                    r"\bgeneral\s+arrangement\b",
+                ]
+                _drawing_visual_count = sum(
+                    1 for p in _drawing_visual_cues
+                    if re.search(p, combined, re.IGNORECASE)
+                )
+                if _drawing_visual_count >= 2 and not _is_certain_manual_path:
+                    # Document has drawing visual structure despite manual-sounding text
+                    return {"value": "Drawing", "confidence": 0.93, "tier": 1}
                 return {"value": "Manual", "confidence": 0.94, "tier": 1}
 
     # Tier 2: Keyword scoring
@@ -1211,6 +1294,13 @@ def _classify_category_and_subcategory_tiered(
     best_subcat: str | None = None
     best_subcat_score = 0.0
     matched_keywords: list[str] = []
+
+    # Explicit Hull Part drawing cue in filename or header (takes absolute precedence for Drawing group)
+    if group_type == "Drawing" and re.search(r"\(hull\s+part(?:s)?\)|hull\s+part(?:s)?", f"{fn_lower}\n{header_text}", re.IGNORECASE):
+        best_cat = "Hull"
+        best_subcat = "Hull Drawings"
+        best_subcat_score = 999.0
+        matched_keywords.append("Hull (hull part)")
 
     # Check specific sub-categories and their keywords
     for cat_name, subcats in taxonomy.items():
@@ -1328,6 +1418,35 @@ def classify_all_fields_tiered(
         vessel_res = {"value": "", "confidence": vessel_res["confidence"], "tier": vessel_res["tier"]}
     vessel_name = vessel_res["value"] or ""
 
+    # Windows/macOS metadata files are not documents, even when they sit inside
+    # a valid drawing folder and contain OCR-like binary noise.
+    if is_non_document_filename(filename):
+        path_vessel = vessel_name if vessel_name else "{vessel}"
+        return {
+            "vessel": vessel_res,
+            "department": dept_res,
+            "group": {"value": "Drawing", "confidence": 0.99, "tier": 1},
+            "category": {"value": "To Be Classified", "confidence": 0.99, "tier": 1},
+            "sub_category": {"value": "To Be Classified", "confidence": 0.99, "tier": 1},
+            "matched_keywords": [],
+            "overall_confidence": 0.99,
+            "suggested_path": "/".join([department, path_vessel, "Drawings and Manuals", "To be Classified"]),
+            "vessel_in_filename_only": False,
+            "vessel_name": vessel_res["value"],
+            "group_name": "Drawing",
+            "category_name": "To Be Classified",
+            "sub_category_name": "To Be Classified",
+        }
+
+    # Detect whether vessel was identified from filename alias only (not found in OCR body text).
+    # This happens when e.g. N-2119 in filename → Bow Fighter, but "Bow Fighter" is absent from PDF content.
+    vessel_in_filename_only = False
+    if vessel_name:
+        # Check if the actual vessel name appears in the OCR body text
+        vessel_name_in_text = bool(text_is_usable and norm_text and vessel_name.lower() in norm_text.lower())
+        if not vessel_name_in_text:
+            vessel_in_filename_only = True
+
     # 3. Group (Drawing / Manual)
     group_res = _classify_group_tiered(norm_text, filename, text_is_usable=text_is_usable, source_path=source_path)
     group = group_res["value"]
@@ -1340,11 +1459,20 @@ def classify_all_fields_tiered(
     sub_category = subcat_res["value"]
 
     # If Category is unambiguously a Manual category (e.g. Main Engine), ensure Group is Manual
-    if category in MANUAL_TAXONOMY and group != "Manual":
+    # (Excludes shared categories like Electrical or Safety which exist in both Drawing and Manual taxonomies)
+    if category in MANUAL_TAXONOMY and category not in DRAWING_TAXONOMY and group != "Manual":
         group = "Manual"
         group_res = {"value": "Manual", "confidence": max(group_res.get("confidence", 0.90), 0.96), "tier": 1}
         cat_res, subcat_res, matched_kws = _classify_category_and_subcategory_tiered(
             norm_text, filename, "Manual", text_is_usable=text_is_usable, source_path=source_path
+        )
+        category = cat_res["value"]
+        sub_category = subcat_res["value"]
+    elif category in DRAWING_TAXONOMY and category not in MANUAL_TAXONOMY and group != "Drawing":
+        group = "Drawing"
+        group_res = {"value": "Drawing", "confidence": max(group_res.get("confidence", 0.90), 0.96), "tier": 1}
+        cat_res, subcat_res, matched_kws = _classify_category_and_subcategory_tiered(
+            norm_text, filename, "Drawing", text_is_usable=text_is_usable, source_path=source_path
         )
         category = cat_res["value"]
         sub_category = subcat_res["value"]
@@ -1379,6 +1507,9 @@ def classify_all_fields_tiered(
         "matched_keywords": matched_kws,
         "overall_confidence": overall_conf,
         "suggested_path": "/".join(suggested_path_parts),
+        # Vessel provenance: True when vessel was detected from filename alias only,
+        # not from the file's text content. UI should flag this as "vessel name not found in file".
+        "vessel_in_filename_only": vessel_in_filename_only,
         # Flat legacy convenience aliases:
         "vessel_name": vessel_res["value"],
         "group_name": group_res["value"],

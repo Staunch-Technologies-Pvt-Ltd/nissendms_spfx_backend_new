@@ -105,6 +105,7 @@ class Settings:
             site_raw = "local"
 
         p = site_raw.upper()  # prefix: e.g. LOCAL / DEV / PROD / NISSENKAIUN_SG / SITE_A
+        base_p = "LOCAL" if _prefixed("LOCAL", "AZURE_TENANT_ID", raw) else "DEV"
 
         # --- Site Identity ---
         self.active_site           = site_raw
@@ -112,13 +113,13 @@ class Settings:
         self.sp_site_name          = _prefixed(p, "SP_SITE_NAME", raw, f"Vessel DMS ({site_raw})")
 
         # --- Microsoft Entra / Graph ---
-        self.azure_tenant_id       = _prefixed(p, "AZURE_TENANT_ID", raw)
-        self.graph_client_id       = _prefixed(p, "GRAPH_CLIENT_ID", raw)
-        self.graph_client_secret   = _prefixed(p, "GRAPH_CLIENT_SECRET", raw)
+        self.azure_tenant_id       = _prefixed(p, "AZURE_TENANT_ID", raw) or _prefixed(base_p, "AZURE_TENANT_ID", raw)
+        self.graph_client_id       = _prefixed(p, "GRAPH_CLIENT_ID", raw) or _prefixed(base_p, "GRAPH_CLIENT_ID", raw)
+        self.graph_client_secret   = _prefixed(p, "GRAPH_CLIENT_SECRET", raw) or _prefixed(base_p, "GRAPH_CLIENT_SECRET", raw)
         self.graph_authority       = "https://login.microsoftonline.com"
         self.graph_scope           = "https://graph.microsoft.com/.default"
         self.graph_base_url        = "https://graph.microsoft.com/v1.0"
-        self.sharepoint_site_url   = _prefixed(p, "SHAREPOINT_SITE_URL", raw, "")
+        self.sharepoint_site_url   = _prefixed(p, "SHAREPOINT_SITE_URL", raw) or _prefixed(base_p, "SHAREPOINT_SITE_URL", raw, "")
 
         # --- Legacy container settings (unused in SPO-only runtime) ---
         self.container_type_id     = ""
@@ -129,21 +130,21 @@ class Settings:
 
         # --- Database ---
         self.database_url          = ""  # not used directly; resolved below
-        self.db_host               = _prefixed(p, "DB_HOST", raw)
-        self.db_port               = _prefixed_int(p, "DB_PORT", raw, 5432)
-        self.db_name               = _prefixed(p, "DB_NAME", raw)
-        self.db_user               = _prefixed(p, "DB_USER", raw)
-        self.db_password           = _prefixed(p, "DB_PASSWORD", raw)
+        self.db_host               = _prefixed(p, "DB_HOST", raw) or _prefixed(base_p, "DB_HOST", raw)
+        self.db_port               = _prefixed_int(p, "DB_PORT", raw, 0) or _prefixed_int(base_p, "DB_PORT", raw, 5432)
+        self.db_name               = _prefixed(p, "DB_NAME", raw) or _prefixed(base_p, "DB_NAME", raw)
+        self.db_user               = _prefixed(p, "DB_USER", raw) or _prefixed(base_p, "DB_USER", raw)
+        self.db_password           = _prefixed(p, "DB_PASSWORD", raw) or _prefixed(base_p, "DB_PASSWORD", raw)
 
         # --- CORS ---
-        self.allowed_origins       = _prefixed(p, "ALLOWED_ORIGINS", raw, "*")
+        self.allowed_origins       = _prefixed(p, "ALLOWED_ORIGINS", raw) or _prefixed(base_p, "ALLOWED_ORIGINS", raw, "*")
 
         # --- Email automation ---
-        self.graph_sender_mailbox  = _prefixed(p, "GRAPH_SENDER_MAILBOX", raw)
-        self.ai_banto_recipient    = _prefixed(p, "AI_BANTO_RECIPIENT", raw)
+        self.graph_sender_mailbox  = _prefixed(p, "GRAPH_SENDER_MAILBOX", raw) or _prefixed(base_p, "GRAPH_SENDER_MAILBOX", raw, "")
+        self.ai_banto_recipient    = _prefixed(p, "AI_BANTO_RECIPIENT", raw) or _prefixed(base_p, "AI_BANTO_RECIPIENT", raw, "")
 
         # --- Approval workflow ---
-        self.admin_emails          = _prefixed(p, "ADMIN_EMAILS", raw)
+        self.admin_emails          = _prefixed(p, "ADMIN_EMAILS", raw) or _prefixed(base_p, "ADMIN_EMAILS", raw, "")
         self.notify_sender_email   = ""
 
         # --- Shared / fixed ---

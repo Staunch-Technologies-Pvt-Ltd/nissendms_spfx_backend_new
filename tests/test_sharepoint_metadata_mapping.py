@@ -147,6 +147,40 @@ class TestSharePointMetadataMapping(unittest.TestCase):
         self.assertEqual(res["sub_category"]["value"], "Operation & Maintenance Manual")
         self.assertEqual(res["vessel"]["value"], "")
 
+    def test_machinery_spare_parts_tool_list_is_drawing(self):
+        from app.ocr.drawing_category import classify_all_fields_tiered
+
+        res = classify_all_fields_tiered(
+            "PRINCIPAL PARTICULARS BOW FRATERNITY N-2120 SPARE PARTS & TOOL LIST (MACHINERY PART) FINISHED PLAN",
+            filename="N-2120_M-51_SPARE PART'S & TOOL LIST (MACHINERY PART).pdf",
+            source_path="Technical/Bow Fraternity/Drawings and Manuals/Drawings/Machinery",
+        )
+        self.assertEqual(res["group"]["value"], "Drawing")
+        self.assertEqual(res["category"]["value"], "Machinery")
+        self.assertEqual(res["sub_category"]["value"], "Machinery Makers List")
+
+    def test_windows_thumbnail_database_is_unclassified(self):
+        from app.ocr.drawing_category import classify_all_fields_tiered
+
+        res = classify_all_fields_tiered(
+            "binary thumbnail cache noise and drawing hull arrangement text",
+            filename="Thumbs.db",
+            source_path="Technical/Cameroun Express/Drawings and Manuals/Drawings/Hull",
+        )
+        self.assertEqual(res["category"]["value"], "To Be Classified")
+        self.assertEqual(res["sub_category"]["value"], "To Be Classified")
+        self.assertIn("To be Classified", res["suggested_path"])
+
+    def test_folder_vessel_overrides_wrong_ocr_vessel(self):
+        from app.ocr.drawing_category import classify_all_fields_tiered
+
+        res = classify_all_fields_tiered(
+            "SHIP NAME GHANA EXPRESS TEST RESULTS OF ANTI-HEELING SYSTEM ONBOARD FUNCTIONAL TEST",
+            filename="SNo.718 FT-11-1 TEST RESULTS OF ANTI-HEELING SYSTEM ONBOARD FUNCTIONALTEST.pdf",
+            source_path="Technical and Crewing New/Cameroun Express/Drawings and Manuals/Drawings/Test Results",
+        )
+        self.assertEqual(res["vessel"]["value"], "Cameroun Express")
+
 
 if __name__ == "__main__":
     unittest.main()

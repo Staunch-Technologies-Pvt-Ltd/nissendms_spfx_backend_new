@@ -26,9 +26,17 @@ async def get_container_drive_id(container_id: str) -> str:
     return data["id"]
 
 
-async def get_root_item_id(drive_id: str) -> str:
-    data = await graph().get(f"/drives/{drive_id}/root")
-    return data["id"]
+_DRIVE_ROOT_ID_CACHE: dict[str, str] = {}
+
+
+async def get_root_item_id(drive_id: str, access_token: str | None = None) -> str:
+    cached = _DRIVE_ROOT_ID_CACHE.get(drive_id)
+    if cached:
+        return cached
+    data = await graph().get(f"/drives/{drive_id}/root", access_token=access_token)
+    root_id = data["id"]
+    _DRIVE_ROOT_ID_CACHE[drive_id] = root_id
+    return root_id
 
 
 async def get_item(
@@ -39,7 +47,7 @@ async def get_item(
     """Fetch a single driveItem by id with the standard field selection."""
     return await graph().get(
         f"/drives/{drive_id}/items/{item_id}"
-        "?$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl",
+        "?$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl,@microsoft.graph.downloadUrl",
         access_token=access_token,
     )
 
@@ -47,7 +55,7 @@ async def get_item(
 async def list_children(drive_id: str, item_id: str, access_token: str | None = None) -> list[dict]:
     items, url = [], (
         f"/drives/{drive_id}/items/{item_id}/children"
-        "?$top=200&$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl"
+        "?$top=200&$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl,@microsoft.graph.downloadUrl"
     )
     while url:
         data = await graph().get(url, access_token=access_token)
@@ -715,6 +723,35 @@ async def _update_taxonomy_with_sharepoint_rest(
 
                     if response.status_code >= 400:
                         last_error = response.text[:1000]
+                        # Detect SharePoint OData errors (e.g. PersonalSiteNotFound) —
+                        # these are service-side configuration issues, not field-name errors.
+                        # Log them clearly and treat as a non-retryable failure for this candidate.
+                        try:
+                            err_body = response.json()
+                            odata_err = err_body.get("odata.error") or {}
+                            if odata_err:
+                                odata_code = odata_err.get("code", "")
+                                odata_msg = (odata_err.get("message") or {}).get("value", "")
+                                _logger.warning(
+                                    "_update_taxonomy_with_sharepoint_rest: SharePoint OData error "
+                                    "(code=%s) for item_id=%s, token=%s: %s",
+                                    odata_code, item_id, token_label, odata_msg,
+                                )
+                                # PersonalSiteNotFound means the REST endpoint hit a
+                                # user-profile service error — this is a SharePoint
+                                # configuration issue unrelated to our field/token.
+                                # Mark as non-retryable so we don't waste further attempts.
+                                if "PersonalSiteNotFound" in odata_code or "PersonalSiteNotFound" in odata_msg:
+                                    last_error = f"SharePoint personal site not found (service configuration issue). OData: {odata_msg}"
+                                    return {
+                                        "ok": False,
+                                        "status": response.status_code,
+                                        "error": last_error,
+                                        "odata_code": odata_code,
+                                    }
+                                last_error = f"{odata_code}: {odata_msg}" if odata_msg else last_error
+                        except Exception:
+                            pass
                         _logger.debug(
                             "_update_taxonomy_with_sharepoint_rest: candidate '%s' returned HTTP %s: %s",
                             candidate, response.status_code, last_error,
@@ -743,7 +780,47 @@ async def _update_taxonomy_with_sharepoint_rest(
                             candidate, val_cand, item_id, token_label,
                         )
                         return {"ok": True, "field": candidate}
-                    last_error = str(errors)
+
+                    # Check if error is due to file lock (e.g. SPFileLockException / -2147018884)
+                    is_lock_error = any(
+                        "2147018884" in str(e.get("ErrorCode") or "")
+                        or "locked" in (e.get("ErrorMessage") or "").lower()
+                        or "filelock" in (e.get("ErrorMessage") or "").lower()
+                        for e in errors if isinstance(e, dict)
+                    )
+
+                    # When locked by an open editor, retry with bNewDocumentUpdate=True (can bypass shared lock check)
+                    if is_lock_error:
+                        try:
+                            payload_unlock = {
+                                "formValues": [{"FieldName": candidate, "FieldValue": val_cand}],
+                                "bNewDocumentUpdate": True,
+                            }
+                            resp_unlock = await client.post(url, json=payload_unlock, headers=req_headers)
+                            if resp_unlock.status_code == 200:
+                                b_unlock = resp_unlock.json()
+                                vr_unlock = (
+                                    b_unlock.get("d", {}).get("ValidateUpdateListItem", [])
+                                    if isinstance(b_unlock, dict) else []
+                                )
+                                r_unlock = vr_unlock.get("results", []) if isinstance(vr_unlock, dict) else (vr_unlock if isinstance(vr_unlock, list) else [])
+                                errs_unlock = [r for r in r_unlock if isinstance(r, dict) and r.get("HasException")]
+                                if not errs_unlock and r_unlock:
+                                    _logger.info(
+                                        "_update_taxonomy_with_sharepoint_rest: updated field '%s' via bNewDocumentUpdate=True for locked item_id=%s",
+                                        candidate, item_id
+                                    )
+                                    return {"ok": True, "field": candidate}
+                        except Exception as unlock_exc:
+                            _logger.debug("bNewDocumentUpdate retry failed: %s", unlock_exc)
+
+                    if is_lock_error:
+                        last_error = "File is locked (open in Excel/Office). Please close the open file tab in your browser and try again."
+                    elif errors:
+                        msg = errors[0].get("ErrorMessage") or str(errors[0])
+                        last_error = msg
+                    else:
+                        last_error = str(errors)
 
             if got_401 and not tried_app:
                 tried_app = True
@@ -1044,6 +1121,7 @@ async def update_file_columns(
     # Managed metadata must be written through SharePoint REST. A Graph PATCH
     # to the hidden note field can return 200 while leaving the visible field
     # empty, so do not treat that hidden-field write as a successful vessel tag.
+    vessel_rest_error: dict[str, Any] | None = None
     if semantic_values.get("vessel"):
         try:
             item_meta = await graph().get(
@@ -1055,36 +1133,137 @@ async def update_file_columns(
                 site_id, "vessel", semantic_values["vessel"], access_token=access_token
             ) if site_id else None
             if not term_info:
-                return {"ok": False, "attempted": True, "reason": "vessel_term_not_found"}
-            rest_result = await _update_taxonomy_with_sharepoint_rest(
-                drive_id,
-                item_id,
-                "Vessel_x0020_Name_x0020_",
-                term_info[0],
-                term_info[1],
-                access_token=access_token,
-                sp_access_token=sp_access_token,
-            )
-            if not rest_result.get("ok"):
-                _logger.warning(
-                    "SharePoint REST vessel update failed for item_id=%s: %s",
-                    item_id,
-                    rest_result,
-                )
-                return {
-                    "ok": False,
-                    "attempted": True,
-                    "status": rest_result.get("status"),
-                    "error": rest_result.get("error") or "SharePoint taxonomy update failed",
+                vessel_rest_error = {
+                    "reason": "vessel_term_not_found",
+                    "error": "Could not resolve the vessel term in the SharePoint Term Store.",
                 }
-            patch_payload.pop("VesselName", None)
-            patch_payload.pop("Vessel_x0020_Name_x0020_", None)
-            patch_payload.pop("i62be25c1f7249f48f51efaf91f1f739", None)
-            matched_by["vessel"] = "sharepoint_validate_update"
+                _logger.warning(
+                    "SharePoint REST vessel update skipped for item_id=%s because the term could not be resolved.",
+                    item_id,
+                )
+            else:
+                rest_result = await _update_taxonomy_with_sharepoint_rest(
+                    drive_id,
+                    item_id,
+                    "Vessel_x0020_Name_x0020_",
+                    term_info[0],
+                    term_info[1],
+                    access_token=access_token,
+                    sp_access_token=sp_access_token,
+                )
+                if not rest_result.get("ok"):
+                    odata_code = rest_result.get("odata_code", "")
+                    err_msg = rest_result.get("error") or "SharePoint taxonomy update failed"
+                    # PersonalSiteNotFound is a SharePoint service-side configuration
+                    # issue (the account has no OneDrive/personal site provisioned).
+                    # Treat it as a soft warning so the rest of the tag save can still
+                    # succeed for other columns (Group, Category, Department, etc.).
+                    if "PersonalSiteNotFound" in odata_code or "PersonalSiteNotFound" in err_msg:
+                        _logger.warning(
+                            "SharePoint REST vessel update skipped for item_id=%s: "
+                            "PersonalSiteNotFound — ensure the SharePoint user profile "
+                            "/ OneDrive is provisioned for this tenant account. "
+                            "Other column tags will still be saved.",
+                            item_id,
+                        )
+                        vessel_rest_error = {
+                            "status": rest_result.get("status"),
+                            "error": err_msg,
+                            "warning_only": True,
+                        }
+                    else:
+                        vessel_rest_error = {
+                            "status": rest_result.get("status"),
+                            "error": err_msg,
+                        }
+                        _logger.warning(
+                            "SharePoint REST vessel update failed for item_id=%s: %s",
+                            item_id,
+                            rest_result,
+                        )
+                else:
+                    # SharePoint REST is the authoritative write for taxonomy-backed vessel fields.
+                    # After a successful REST write, do not send an additional empty Graph PATCH.
+                    # We only verify the visible term label when the field is present in the response.
+                    saved_fields = await graph().get(
+                        f"/drives/{drive_id}/items/{item_id}/listItem/fields",
+                        access_token=access_token,
+                    )
+                    saved_vessel = ""
+                    for key in (
+                        "VesselName",
+                        "vesselname",
+                        "Vessel Name",
+                        "vessel",
+                        "vessel_name",
+                        "Vessel_x0020_Name",
+                        "Vessel_x0020_Name_x0020_",
+                    ):
+                        if key in saved_fields:
+                            value = saved_fields.get(key)
+                            if isinstance(value, dict):
+                                value = value.get("Label") or value.get("name") or value.get("Value") or ""
+                            saved_vessel = str(value or "").split("|", 1)[0].strip()
+                            if saved_vessel:
+                                break
+                    if not saved_vessel:
+                        for note_key in saved_fields.keys():
+                            if note_key.lower().endswith("_0") and "vessel" in note_key.lower():
+                                value = saved_fields.get(note_key)
+                                if isinstance(value, dict):
+                                    value = value.get("Label") or value.get("name") or value.get("Value") or ""
+                                saved_vessel = str(value or "").split("|", 1)[0].strip()
+                                if saved_vessel:
+                                    break
+
+                    expected_vessel = semantic_values.get("vessel", "").strip()
+                    if expected_vessel and saved_vessel:
+                        expected_norm = " ".join(expected_vessel.split()).casefold()
+                        saved_norm = " ".join(saved_vessel.split()).casefold()
+                        if saved_norm != expected_norm:
+                            vessel_rest_error = {
+                                "reason": "vessel_not_persisted",
+                                "error": f"Vessel term write was accepted but the saved value did not match the requested vessel ({saved_vessel!r} != {expected_vessel!r}).",
+                            }
+                            _logger.warning(
+                                "SharePoint REST vessel write mismatch for item_id=%s: saved=%s requested=%s",
+                                item_id,
+                                saved_vessel,
+                                expected_vessel,
+                            )
+
+                    if not vessel_rest_error:
+                        patch_payload.pop("VesselName", None)
+                        patch_payload.pop("Vessel_x0020_Name_x0020_", None)
+                        patch_payload.pop("i62be25c1f7249f48f51efaf91f1f739", None)
+                        matched_by["vessel"] = "sharepoint_validate_update"
         except Exception as exc:
-            return {"ok": False, "attempted": True, "error": str(exc)}
+            vessel_rest_error = {"error": str(exc)}
+            _logger.warning("SharePoint REST vessel write raised an exception for item_id=%s: %s", item_id, exc)
+
+    if vessel_rest_error:
+        patch_payload.pop("VesselName", None)
+        patch_payload.pop("Vessel_x0020_Name_x0020_", None)
+        patch_payload.pop("i62be25c1f7249f48f51efaf91f1f739", None)
+        matched_by["vessel"] = "sharepoint_rest_failed"
 
     final_payload = patch_payload
+
+    # If the vessel value was already persisted via SharePoint REST, there is
+    # nothing left to patch in Graph. Avoid sending an empty PATCH payload.
+    if semantic_values.get("vessel") and not final_payload:
+        _logger.info(
+            "update_file_columns: vessel term already persisted via REST for item_id=%s; skipping empty Graph PATCH.",
+            item_id,
+        )
+        return {
+            "ok": True,
+            "attempted": True,
+            "patched_fields": [],
+            "match_mode": matched_by,
+            "graph_result": {},
+            "rest_only": True,
+        }
 
     try:
         result = await graph().patch(

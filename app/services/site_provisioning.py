@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Any
 
-from ..config import settings, Settings
+from ..config import settings, Settings, set_session_site, clear_session_site, get_active_drive_id
 from ..graph import drive as gd
 from ..graph.client import graph
 from .. import template
@@ -26,11 +26,12 @@ def sanitize_name(name: str) -> str:
     return name.strip(". ")
 
 
-def get_all_configured_sites(db) -> list[dict[str, Any]]:
+def get_all_configured_sites(db, include_hidden: bool = False) -> list[dict[str, Any]]:
     """Retrieve all configured and registered sites with provisioning metadata.
     
     Includes sites from Settings (e.g. dev, local, prod) and any persisted in
     the site_configurations table.
+    Filters out hidden sites by default unless include_hidden is True.
     """
     discovered = Settings.discover_available_sites()
     sites_dict: dict[str, dict[str, Any]] = {}
@@ -46,26 +47,34 @@ def get_all_configured_sites(db) -> list[dict[str, Any]]:
                     "site_name": conf.sp_site_name or key,
                     "site_id": getattr(conf, "sp_site_id", "") or key,
                     "drive_id": conf.drive_id,
+                    "web_url": conf.sharepoint_site_url or getattr(conf, "web_url", ""),
                     "is_available_for_provisioning": True,
                     "is_default_provisioning": (key == settings.active_site),
+                    "is_hidden": False,
                 }
             except Exception as e:
                 logger.debug("Could not load settings config for %s: %s", key, e)
 
     # 2. Sites from database site_configurations
+    from ..config import compute_sp_site_url
     db_records = db.query(models.SiteConfiguration).all()
     for rec in db_records:
         key = rec.site_key.lower()
+        rec_is_hidden = bool(getattr(rec, "is_hidden", False))
         if key in sites_dict:
             # DB record takes precedence for user-configured toggle flags
             sites_dict[key]["is_available_for_provisioning"] = rec.is_available_for_provisioning
             sites_dict[key]["is_default_provisioning"] = rec.is_default_provisioning
+            sites_dict[key]["is_hidden"] = rec_is_hidden
             if rec.display_name:
                 sites_dict[key]["display_name"] = rec.display_name
             if rec.drive_id:
                 sites_dict[key]["drive_id"] = rec.drive_id
             if rec.site_id:
                 sites_dict[key]["site_id"] = rec.site_id
+            computed = compute_sp_site_url(key, rec.site_name or rec.display_name)
+            if "/sites/" in computed or not sites_dict[key].get("web_url"):
+                sites_dict[key]["web_url"] = computed
         else:
             sites_dict[key] = {
                 "site_key": key,
@@ -73,11 +82,16 @@ def get_all_configured_sites(db) -> list[dict[str, Any]]:
                 "site_name": rec.site_name or key,
                 "site_id": rec.site_id,
                 "drive_id": rec.drive_id,
+                "web_url": compute_sp_site_url(key, rec.site_name or rec.display_name),
                 "is_available_for_provisioning": rec.is_available_for_provisioning,
                 "is_default_provisioning": rec.is_default_provisioning,
+                "is_hidden": rec_is_hidden,
             }
 
-    return list(sites_dict.values())
+    all_sites = list(sites_dict.values())
+    if not include_hidden:
+        return [s for s in all_sites if not s.get("is_hidden")]
+    return all_sites
 
 
 def get_available_provisioning_sites(db) -> dict[str, dict[str, Any]]:
@@ -218,15 +232,21 @@ async def provision_vessel_to_drive(
     is_active_site: bool = False,
 ) -> dict[str, Any]:
     """Idempotently provisions the entire DMS folder hierarchy for a vessel on a specific drive.
-    
+
     Creates:
       1. Main department folders: Technical & Crewing, Commercial & Chartering, Insurance
       2. Vessel root folder under each main folder
       3. Full template subtrees under each vessel root
-    
+      4. FLAT_MAIN_FOLDERS (e.g. "Kaizen - Knowledge Bank") at the drive root with their
+         FLAT_TEMPLATE sub-trees — these are global/shared and not vessel-specific, but are
+         ensured on every provisioning call so the folder always exists on every site.
+
     Returns:
       {"site": site_key, "success": True, "error": None} or {"site": site_key, "success": False, "error": str}
     """
+    provision_context = f"provision:{site_key}:{vessel_id}"
+    context_token = settings.set_current_session(provision_context)
+    set_session_site(provision_context, site_key)
     try:
         root_id = await gd.get_root_item_id(drive_id)
         mains_to_provision = [
@@ -272,13 +292,51 @@ async def provision_vessel_to_drive(
             if sub_specs:
                 await _provision_subtree_for_drive(
                     drive_id, ship_id, ship_root_path, sub_specs,
-                    is_active_site=is_active_site, vessel_id=vessel_id,
+                    is_active_site=True, vessel_id=vessel_id,
+                )
+
+        # 4. Ensure FLAT_MAIN_FOLDERS (e.g. "Kaizen - Knowledge Bank") at drive root.
+        #    These are global/shared folders — not vessel-specific — but they must be
+        #    provisioned on every site so the folder exists even if no script ran it before.
+        for flat_main in template.FLAT_MAIN_FOLDERS:
+            try:
+                flat_folder = await gd.ensure_folder(drive_id, root_id, flat_main)
+                flat_id = flat_folder["id"]
+                logger.info("Ensured flat folder '%s' (id=%s) on drive %s", flat_main, flat_id, drive_id)
+
+                if is_active_site:
+                    with SessionLocal() as db:
+                        flat_row = db.query(models.Folder).filter_by(path=flat_main).one_or_none()
+                        if flat_row is None:
+                            flat_row = models.Folder(
+                                path=flat_main, name=flat_main, kind="main",
+                                drive_item_id=flat_id, month_driven=False,
+                                vessel_id=None,  # global — not vessel-specific
+                            )
+                            db.add(flat_row)
+                            db.commit()
+
+                # Provision the flat subtree (e.g. Kaizen sub-folders)
+                flat_specs = template.FLAT_TEMPLATE.get(flat_main, [])
+                if flat_specs:
+                    await _provision_subtree_for_drive(
+                        drive_id, flat_id, flat_main, flat_specs,
+                        is_active_site=is_active_site, vessel_id=None,
+                    )
+            except Exception as flat_err:
+                # Non-fatal: log and continue — vessel folders are more important
+                logger.warning(
+                    "Could not ensure flat folder '%s' on drive %s: %s",
+                    flat_main, drive_id, flat_err,
                 )
 
         return {"site": site_key, "success": True, "error": None}
     except Exception as e:
         logger.exception("Failed provisioning vessel '%s' on site '%s' (drive=%s): %s", vessel_name, site_key, drive_id, e)
         return {"site": site_key, "success": False, "error": str(e)}
+    finally:
+        settings.reset_current_session(context_token)
+        clear_session_site(provision_context)
 
 
 async def provision_vessel_multi_site(
@@ -300,7 +358,7 @@ async def provision_vessel_multi_site(
             return {"error": f"Vessel with id {vessel_id} not found", "results": {}}
 
         available_sites = get_available_provisioning_sites(db)
-        existing_provisioned = set(vessel.provisioned_site_ids or [])
+        existing_provisioned = set(vessel.provisioned_site_ids or []) if vessel.is_provisioned else set()
         active_site = (settings.active_site or "dev").lower()
 
     # 1. Filter against available sites (deactivated site guard)
@@ -335,7 +393,7 @@ async def provision_vessel_multi_site(
                     vessel_id=vessel_id,
                     drive_id=drive_id,
                     site_key=resolved_key,
-                    is_active_site=is_active,
+                    is_active_site=True,
                 ))
                 attempt_keys.append(resolved_key)
             except Exception as res_err:

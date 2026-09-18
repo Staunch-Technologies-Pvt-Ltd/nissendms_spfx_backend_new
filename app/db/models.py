@@ -9,11 +9,12 @@
 from datetime import date, datetime
 
 # pyrefly: ignore [missing-import]
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, Integer, func, LargeBinary, JSON
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, Integer, func, LargeBinary, JSON, UniqueConstraint
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
+from ..config import get_active_drive_id
 
 
 class Vessel(Base):
@@ -42,11 +43,15 @@ class Vessel(Base):
 
 class Folder(Base):
     __tablename__ = "folders"
+    __table_args__ = (
+        UniqueConstraint("site_id", "path", name="uq_folders_site_path"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     # Logical path within the container, e.g.
     # "Technical & Crewing/MV Horizon/Month End Reports".
-    path: Mapped[str] = mapped_column(String(1024), unique=True, index=True)
+    site_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True, default=get_active_drive_id)
+    path: Mapped[str] = mapped_column(String(1024), index=True)
     name: Mapped[str] = mapped_column(String(400))
     kind: Mapped[str] = mapped_column(String(40))  # main/ship/folder/leaf/month_driven/month
     drive_item_id: Mapped[str] = mapped_column(String(256), index=True)
@@ -677,6 +682,7 @@ class SiteConfiguration(Base):
     drive_id: Mapped[str] = mapped_column(String(512))
     is_available_for_provisioning: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default_provisioning: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_hidden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by_email: Mapped[str] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

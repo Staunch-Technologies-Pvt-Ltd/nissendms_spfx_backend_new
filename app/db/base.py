@@ -1,14 +1,29 @@
 """Database engine, session factory, and declarative base."""
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker, with_loader_criteria
 
-from ..config import settings
+from ..config import get_active_drive_id, settings
 
 
 class Base(DeclarativeBase):
     pass
+
+
+def _active_site_id() -> str:
+    return get_active_drive_id()
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _scope_folder_queries(execute_state):
+    """Keep logical folder paths isolated when multiple sites share a DB."""
+    if execute_state.is_select and not execute_state.is_column_load:
+        from .models import Folder
+        site_id = _active_site_id()
+        execute_state.statement = execute_state.statement.options(
+            with_loader_criteria(Folder, lambda folder: folder.site_id == site_id, include_aliases=True)
+        )
 
 
 # Engine is created when a DATABASE_URL is configured. In stub mode this

@@ -125,11 +125,14 @@ VESSEL_ALIASES: dict[str, tuple[str, ...]] = {
     "Lignum Web": ("lignum web", "lignum-web", "lignum_web"),
     "Maersk EI Banco": (
         "maersk ei banco", "maersk el banco", "maersk-ei-banco", "maersk-el-banco",
-        "maersk_ei_banco", "maersk_el_banco", "ei banco", "el banco"
+        "maersk_ei_banco", "maersk_el_banco", "ei banco", "el banco",
+        "9964493", "imo 9964493", "imo: 9964493", "imo:9964493", "imo no. 9964493", "imo number : 9964493"
     ),
     "Maersk EI Palomar": (
         "maersk ei palomar", "maersk el palomar", "maersk-ei-palomar", "maersk-el-palomar",
-        "maersk_ei_palomar", "maersk_el_palomar", "ei palomar", "el palomar"
+        "maersk_ei_palomar", "maersk_el_palomar", "ei palomar", "el palomar",
+        "9964481", "imo 9964481", "imo: 9964481", "imo:9964481", "imo no. 9964481", "imo number : 9964481",
+        "5450", "s.no.5450", "s.no 5450", "sno.5450", "sno 5450", "f452301"
     ),
     "Maersk Ferrato": ("maersk ferrato", "maersk-ferrato", "maersk_ferrato"),
     "Maersk Finisterre": ("maersk finisterre", "maersk-finisterre", "maersk_finisterre"),
@@ -829,14 +832,6 @@ def _classify_vessel_tiered(
 
     parsed_names, imo_map, hull_map = _parse_known_vessels(known_vessels)
 
-    # The vessel folder is the authoritative SharePoint location. Prefer an
-    # exact known vessel there over noisy OCR text from the document body.
-    if source_path:
-        folder_vessel = _extract_vessel_from_folder_path(source_path)
-        matched_folder_vessel = _match_known_vessel(folder_vessel or "", known_vessels)
-        if matched_folder_vessel:
-            return {"value": matched_folder_vessel, "confidence": 0.99, "tier": 1}
-
     # ── Tier 1: Exact IMO Number match in document text or filename ──
     if imo_map:
         imo_matches = re.findall(r"\b(?:imo|imo\s*no\.?|imo\s*num\.?|imo\s*number|imo\s*#)\s*[:\-\.#]?\s*([0-9]{7})\b", f"{fn_lower}\n{full_text_lower}", re.IGNORECASE)
@@ -926,19 +921,23 @@ def _classify_vessel_tiered(
                     if folder_v and _norm_match_key(cand) == _norm_match_key(folder_v):
                         return {"value": folder_v, "confidence": 0.95, "tier": 1}
 
-    # ── Tier 2: Source folder breadcrumbs fallback ──
+    # ── Tier 2: Source folder breadcrumbs fallback (used only when text & filename have no vessel) ──
     if source_path:
-        norm_path = source_path.replace("\\", "/").replace(">", "/")
-        segments = [s.strip() for s in norm_path.split("/") if s.strip()]
-        for seg in segments:
-            matched_vessel = _match_known_vessel(seg, known_vessels)
-            if matched_vessel:
-                return {"value": matched_vessel, "confidence": 0.45, "tier": 2}
-
-        # If not matched in known vessels, derive vessel name from folder path
         folder_v = _extract_vessel_from_folder_path(source_path)
         if folder_v:
-            return {"value": folder_v, "confidence": 0.45, "tier": 2}
+            matched_folder_vessel = _match_known_vessel(folder_v, known_vessels)
+            if matched_folder_vessel:
+                return {"value": matched_folder_vessel, "confidence": 0.85, "tier": 2}
+
+        norm_path = source_path.replace("\\", "/").replace(">", "/")
+        segments = [s.strip() for s in norm_path.split("/") if s.strip()]
+        for seg in reversed(segments):
+            matched_vessel = _match_known_vessel(seg, known_vessels)
+            if matched_vessel:
+                return {"value": matched_vessel, "confidence": 0.85, "tier": 2}
+
+        if folder_v:
+            return {"value": folder_v, "confidence": 0.50, "tier": 2}
 
     return {"value": "", "confidence": 0.0, "tier": 2}
 
@@ -1442,8 +1441,48 @@ def classify_all_fields_tiered(
     # This happens when e.g. N-2119 in filename → Bow Fighter, but "Bow Fighter" is absent from PDF content.
     vessel_in_filename_only = False
     if vessel_name:
-        # Check if the actual vessel name appears in the OCR body text
-        vessel_name_in_text = bool(text_is_usable and norm_text and vessel_name.lower() in norm_text.lower())
+        vessel_name_in_text = False
+        if text_is_usable and norm_text:
+            nt_lower = norm_text.lower()
+            # Check canonical name, aliases, and normalized "ei" / "el" variants
+            v_aliases = [vessel_name] + list(VESSEL_ALIASES.get(vessel_name, ()))
+            expanded_aliases: set[str] = set()
+            for a in v_aliases:
+                a_clean = a.strip().lower()
+                if a_clean:
+                    expanded_aliases.add(a_clean)
+                    if " ei " in a_clean:
+                        expanded_aliases.add(a_clean.replace(" ei ", " el "))
+                    if " el " in a_clean:
+                        expanded_aliases.add(a_clean.replace(" el ", " ei "))
+                    if a_clean.startswith("ei "):
+                        expanded_aliases.add("el " + a_clean[3:])
+                    if a_clean.startswith("el "):
+                        expanded_aliases.add("ei " + a_clean[3:])
+
+            for cand_alias in expanded_aliases:
+                if len(cand_alias) >= 3:
+                    pat = _make_flexible_phrase_regex(cand_alias)
+                    if pat and re.search(pat, nt_lower, re.IGNORECASE):
+                        vessel_name_in_text = True
+                        break
+                    elif cand_alias in nt_lower:
+                        vessel_name_in_text = True
+                        break
+
+            # Also check if vessel's IMO number or hull number appears in text
+            if not vessel_name_in_text:
+                parsed_names, imo_map, hull_map = _parse_known_vessels(known_vessels)
+                for imo_num, v_matched in imo_map.items():
+                    if v_matched == vessel_name and imo_num in nt_lower:
+                        vessel_name_in_text = True
+                        break
+                if not vessel_name_in_text:
+                    for h_num, v_matched in hull_map.items():
+                        if v_matched == vessel_name and len(h_num) >= 3 and h_num in _norm_match_key(nt_lower):
+                            vessel_name_in_text = True
+                            break
+
         if not vessel_name_in_text:
             vessel_in_filename_only = True
 

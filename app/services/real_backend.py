@@ -17,7 +17,7 @@ from urllib.parse import unquote
 from sqlalchemy import func, or_ as sa_or
 
 from .. import template
-from ..config import settings
+from ..config import settings, Settings
 from ..db.base import SessionLocal
 from ..db import models
 from ..graph import drive as gd
@@ -890,7 +890,24 @@ class RealBackend:
     # -------------------------------------------------------------- vessels
     async def list_vessels(self):
         with SessionLocal() as db:
+            active_site = str(settings.active_site or "").lower()
+            active_drive = str(settings.drive_id or "")
+            site_keys = {active_site} if active_site else set()
+            for site_key, site_config in Settings.discover_available_sites().items():
+                try:
+                    if str(Settings.load_site_config(site_key).drive_id or "") == active_drive:
+                        site_keys.add(site_key.lower())
+                except ValueError:
+                    pass
+            for record in db.query(models.SiteConfiguration).all():
+                if str(record.drive_id or "") == active_drive:
+                    site_keys.add(str(record.site_key).lower())
+
             rows = db.query(models.Vessel).order_by(models.Vessel.created_at.desc().nulls_last(), models.Vessel.id.desc()).all()
+            rows = [
+                vessel for vessel in rows
+                if not vessel.provisioned_site_ids or any(str(site).lower() in site_keys for site in (vessel.provisioned_site_ids or []))
+            ]
 
             return [
                 {
@@ -1026,7 +1043,7 @@ class RealBackend:
                     hull_number=hull_number,
                     vessel_type=vessel_type,
                     is_provisioned=False,
-                    provisioned_site_ids=[],
+                    provisioned_site_ids=final_target_sites,
                 )
                 db.add(v_db)
                 db.commit()
@@ -1041,7 +1058,7 @@ class RealBackend:
                 "hull_number": hull_number,
                 "vessel_type": vessel_type,
                 "is_provisioned": False,
-                "provisioned_site_ids": [],
+                "provisioned_site_ids": final_target_sites,
             }
             # Background task for multi-site folder creation (non-blocking)
             from .site_provisioning import provision_vessel_multi_site
@@ -2609,9 +2626,35 @@ class RealBackend:
 
     async def children(self, folder_id):
         drive_id = await self._drive()
+        resolved_folder_id = folder_id
         try:
-            parent_path = await self._folder_path(drive_id, folder_id)
-            items = await gd.list_children(drive_id, folder_id)
+            parent_path = await self._folder_path(drive_id, resolved_folder_id)
+            items = await gd.list_children(drive_id, resolved_folder_id)
+        except GraphError as first_error:
+            # Folder IDs cached before a SharePoint move/site switch become
+            # invalid. Recover through the stable logical DB path once before
+            # surfacing a 404 to the Documents module.
+            if first_error.status != 404 or not settings.db_configured:
+                raise
+            try:
+                with SessionLocal() as db:
+                    stale = db.query(models.Folder).filter_by(drive_item_id=folder_id).one_or_none()
+                    stale_path = stale.path if stale else None
+                if not stale_path:
+                    raise first_error
+                resolved_folder_id = await self.resolve_path(stale_path)
+                parent_path = await self._folder_path(drive_id, resolved_folder_id)
+                items = await gd.list_children(drive_id, resolved_folder_id)
+                with SessionLocal() as db:
+                    current = db.query(models.Folder).filter_by(drive_item_id=folder_id).one_or_none()
+                    if current:
+                        current.drive_item_id = resolved_folder_id
+                        db.commit()
+                log.info("children: recovered stale folder id %s as %s via path %s", folder_id, resolved_folder_id, stale_path)
+            except Exception:
+                raise first_error
+
+        try:
             async def with_tags(item):
                 try:
                     fields = await graph().get(

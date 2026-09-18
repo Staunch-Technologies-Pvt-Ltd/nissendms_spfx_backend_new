@@ -237,6 +237,12 @@ def graph(site_name: str | None = None, site_config: object | None = None) -> Gr
     if site_config is not None:
         return GraphClient(site_config=site_config)
     
+    # Resolve the current request's configured site, so a session switch does
+    # not reuse the process-wide client created for the startup site.
+    if not site_name:
+        from ..config import settings as current_settings
+        site_name = str(current_settings.active_site or "").lower() or None
+
     # If site_name is specified, use per-site caching
     if site_name:
         if site_name not in _site_clients:

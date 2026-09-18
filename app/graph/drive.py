@@ -549,6 +549,12 @@ async def _resolve_term_guid(
     elif norm_val in ("electrical", "electric", "electricpart"):
         aliases.extend(["electrical", "electricaldrawings"])
 
+    # Spanish article / spelling normalization ("el" vs "ei", e.g. "Maersk El Palomar" vs "Maersk EI Palomar")
+    if "el" in norm_val:
+        aliases.append(norm_val.replace("el", "ei"))
+    if "ei" in norm_val:
+        aliases.append(norm_val.replace("ei", "el"))
+
     for a in aliases:
         if a in terms:
             return terms[a]

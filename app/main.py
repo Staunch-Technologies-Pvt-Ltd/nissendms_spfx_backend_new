@@ -1,6 +1,6 @@
 import time
 
-_FLAT_TREE_CACHE = {"data": None, "timestamp": 0}
+_FLAT_TREE_CACHE = {"data": None, "timestamp": 0, "drive_id": None}
 _FOLDER_CHILDREN_CACHE = {}  # folder_id -> (data, timestamp)
 CACHE_TTL_FLAT_TREE = 5   # 5 seconds — short enough to reflect SPO uploads quickly
 CACHE_TTL_CHILDREN = 3    # 3 seconds — near-real-time for folder contents
@@ -9,17 +9,64 @@ CACHE_TTL_CHILDREN = 3    # 3 seconds — near-real-time for folder contents
 _FOLDER_CHILDREN_TAGS_CACHE: dict = {}  # cache_key -> (timestamp, list[decorated_item])
 CACHE_TTL_CHILDREN_TAGS = 300  # 5 minutes — covers repeated navigations; invalidated on edits
 
-_LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
+_LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0, "drive_id": None}
 CACHE_TTL_LIVE_SPO_FILES = 60   # 60 seconds
 
 _FOLDER_RECURSIVE_COUNTS_CACHE: dict[str, tuple[float, dict[str, int]]] = {}
 _FOLDER_PARENT_MAP: dict[str, str] = {}  # folder_id -> parent_folder_id
 CACHE_TTL_FOLDER_RECURSIVE_COUNTS = 600  # 10 minutes (invalidated on changes)
 
+
+import re
+import urllib.parse
+
+async def _resolve_drive_folder_id(
+    drive_id: str,
+    folder_ref: str,
+    access_token: str | None = None,
+) -> str:
+    """Resolve a drive item ID, folder name, or slash-delimited folder path."""
+    reference = (folder_ref or '').strip()
+    if '%' in reference:
+        reference = urllib.parse.unquote(reference).strip()
+    root_id = await gd.get_root_item_id(drive_id, access_token=access_token)
+    if not reference or reference.lower() == 'root':
+        return root_id
+
+    try:
+        item = await gd.get_item(drive_id, reference, access_token=access_token)
+        if item.get('folder') is not None or item.get('id'):
+            return str(item.get('id') or reference)
+    except GraphError:
+        pass
+
+    # If reference starts with synthetic sf_ prefix (e.g. sf_4_ghana_express), strip it
+    if reference.lower().startswith('sf_'):
+        reference = re.sub(r'^sf_\d+_', '', reference, flags=re.IGNORECASE).replace('_', ' ')
+
+    segments = [part.strip() for part in reference.replace('>', '/').split('/') if part.strip()]
+    current_id = root_id
+    for segment in segments:
+        clean_seg = re.sub(r'^sf_\d+_', '', segment, flags=re.IGNORECASE).replace('_', ' ') if segment.lower().startswith('sf_') else segment
+        children = await gd.list_children(drive_id, current_id, access_token=access_token)
+        normalized = ' '.join(clean_seg.split()).casefold()
+        match = next(
+            (
+                child for child in children
+                if child.get('folder') is not None
+                and ' '.join(str(child.get('name') or '').split()).casefold() == normalized
+            ),
+            None,
+        )
+        if not match or not match.get('id'):
+            raise HTTPException(status_code=404, detail=f'SharePoint folder not found: {reference}')
+        current_id = str(match['id'])
+    return current_id
+
 def invalidate_folder_caches(folder_id: str = None):
     global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE, _FOLDER_RECURSIVE_COUNTS_CACHE, _FOLDER_PARENT_MAP, _FOLDER_CHILDREN_TAGS_CACHE
-    _FLAT_TREE_CACHE = {"data": None, "timestamp": 0}
-    _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0}
+    _FLAT_TREE_CACHE = {"data": None, "timestamp": 0, "drive_id": None}
+    _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0, "drive_id": None}
     if folder_id:
         _FOLDER_CHILDREN_CACHE.pop(folder_id, None)
         _FOLDER_CHILDREN_TAGS_CACHE.pop(folder_id, None)
@@ -83,6 +130,17 @@ _profile_cache: dict[str, dict] = {}
 
 app = FastAPI(title="Vessel DMS", version="1.0.0")
 logger = logging.getLogger("vessel_dms")
+
+
+@app.middleware("http")
+async def session_site_context(request: Request, call_next):
+    """Resolve the session-selected site for every Graph and DB operation."""
+    session_id = request.headers.get("x-session-id") or request.query_params.get("session_id")
+    token = settings.set_current_session(session_id)
+    try:
+        return await call_next(request)
+    finally:
+        settings.reset_current_session(token)
 
 _GRAPH_RECURSIVE_SEMAPHORE = asyncio.Semaphore(15)
 
@@ -698,10 +756,13 @@ async def _sharepoint_access_health_snapshot(probe_item_id: str | None = None) -
 
 VESSEL_TYPES = {
     "Bulk Carrier",
+    "Container Ship",
     "Container Carrier",
     "Gas Carrier",
     "Oil Tanker",
     "Chemical Tanker",
+    "General Cargo",
+    "Offshore Support",
     "Reffer Carrier",
     "Other Cargo Ships",
 }
@@ -983,6 +1044,17 @@ async def _startup():
                             )
                             _logger.warning(
                                 "DB schema drift repaired: added missing site_configurations.is_default_provisioning"
+                            )
+                        if "is_hidden" not in site_cols:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE site_configurations "
+                                    "ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN "
+                                    "NOT NULL DEFAULT FALSE"
+                                )
+                            )
+                            _logger.warning(
+                                "DB schema drift repaired: added missing site_configurations.is_hidden"
                             )
 
                 _logger.info("Database safety-net create_all completed.")
@@ -1961,7 +2033,10 @@ def get_site_info(x_session_id: str | None = Header(default=None)):
 
 
 @app.get("/api/config/available-sites")
-def get_available_sites(_session: object = Depends(require_session)):
+def get_available_sites(
+    include_hidden: bool = Query(default=False),
+    _session: object = Depends(require_session),
+):
     """Return list of all available sites in the tenant that can be switched to."""
     from .config import Settings
     available_sites = Settings.discover_available_sites()
@@ -1970,8 +2045,15 @@ def get_available_sites(_session: object = Depends(require_session)):
     configured_sites = [
         {
             "name": site_info["name"],
+            "site_key": site_info["name"],
             "display_name": site_info["sp_site_name"],
+            "sp_site_name": site_info["sp_site_name"],
             "configured": site_info["configured"],
+            "site_id": site_info.get("site_id", ""),
+            "drive_id": site_info.get("drive_id", ""),
+            "web_url": site_info.get("web_url", ""),
+            "default_library_name": "Shared Documents" if "nks" in site_info["name"].lower() or "doc" in site_info["name"].lower() else "Documents",
+            "is_hidden": False,
         }
         for site_info in available_sites.values()
         if site_info["configured"]
@@ -1981,25 +2063,294 @@ def get_available_sites(_session: object = Depends(require_session)):
         from .db.models import SiteConfiguration
         db = SessionLocal()
         try:
-            existing_names = {site["name"] for site in configured_sites}
-            configured_sites.extend({
-                "name": record.site_key,
-                "display_name": record.display_name,
-                "configured": True,
-                "site_id": record.site_id,
-                "drive_id": record.drive_id,
-            } for record in db.query(SiteConfiguration).order_by(SiteConfiguration.display_name).all()
-                    if record.site_key not in existing_names)
+            existing_map = {site["name"].lower(): site for site in configured_sites}
+            from .config import compute_sp_site_url
+            for record in db.query(SiteConfiguration).order_by(SiteConfiguration.display_name).all():
+                rk = (record.site_key or "").lower()
+                rec_hidden = bool(getattr(record, "is_hidden", False))
+                if rk in existing_map:
+                    existing_map[rk]["is_hidden"] = rec_hidden
+                    if record.display_name:
+                        existing_map[rk]["display_name"] = record.display_name
+                        existing_map[rk]["sp_site_name"] = record.display_name
+                else:
+                    new_entry = {
+                        "name": record.site_key,
+                        "site_key": record.site_key,
+                        "display_name": record.display_name,
+                        "sp_site_name": record.display_name,
+                        "configured": True,
+                        "site_id": record.site_id or "",
+                        "drive_id": record.drive_id or "",
+                        "web_url": compute_sp_site_url(record.site_key, getattr(record, "site_name", None) or record.display_name),
+                        "default_library_name": "Shared Documents" if "nks" in (record.site_key or "").lower() else "Documents",
+                        "is_hidden": rec_hidden,
+                    }
+                    configured_sites.append(new_entry)
+                    existing_map[rk] = new_entry
         finally:
             db.close()
+
+    if not include_hidden:
+        configured_sites = [s for s in configured_sites if not s.get("is_hidden")]
+
     return {
         "sites": configured_sites,
         "current_site": settings.active_site,
     }
 
 
+@app.get("/api/documents/aliases")
+def get_document_aliases(_session: object = Depends(require_session)):
+    """Return canonical department and vessel alias mappings for intelligent classification."""
+    from .ocr.drawing_category import VESSEL_ALIASES
+    
+    department_aliases = {
+        "Technical & Crewing": [
+            "technical and crewing new", "technical and crewing  new", "technical & crewing",
+            "technical & crewing new", "technical", "crewing", "technical and crewing",
+            "technical & crewing", "technical/crewing"
+        ],
+        "Commercial & Chartering": [
+            "commercial and chartering", "commercial & chartering", "commercial", "chartering",
+            "commercial & operations", "operations"
+        ],
+        "Insurance": [
+            "insurance", "claims", "insurance & claims"
+        ],
+        "Kaizen - Knowledge Bank": [
+            "kaizen", "knowledge bank", "kaizen - knowledge bank", "kaizen-knowledge bank"
+        ],
+    }
+
+    vessel_aliases = {k: list(v) for k, v in VESSEL_ALIASES.items()}
+
+    return {
+        "departments": department_aliases,
+        "vessels": vessel_aliases,
+    }
+
+
+
+
 class SwitchSiteRequest(BaseModel):
     site_name: str = Field(..., description="Target site name to switch to")
+
+
+class AutoSwitchSiteRequest(BaseModel):
+    """Switch to a discovered (not yet configured) tenant site by auto-registering it."""
+    site_id: str = Field(..., description="SharePoint site ID from discover-sites")
+    site_name: str = Field(..., description="Human-readable site name (becomes site_key)")
+    drive_id: str = Field(..., description="Document library drive ID")
+    display_name: str = Field("", description="Optional display name for UI")
+    web_url: str = Field("", description="SharePoint site URL")
+    reason: str = Field("", description="Audit reason")
+
+
+@app.post("/api/admin/switch-site-auto")
+async def admin_switch_site_auto(
+    request: AutoSwitchSiteRequest,
+    x_user_email: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Auto-register a discovered tenant site and switch to it (admin only).
+
+    Upserts the site into site_configurations then performs a session-scoped switch.
+    """
+    admin_email = _require_admin(x_user_email)
+    from .config import Settings, set_session_site
+    from .db.base import engine
+    from sqlalchemy import text
+
+    # Derive a safe site_key from the site name
+    import re
+    raw_key = (request.display_name or request.site_name).strip().lower()
+    site_key = re.sub(r"[^a-z0-9]+", "_", raw_key).strip("_") or "site"
+    display = request.display_name or request.site_name
+
+    if not request.drive_id or not request.site_id:
+        raise HTTPException(status_code=400, detail="site_id and drive_id are required")
+
+    # Upsert the site into site_configurations so load_site_config can resolve it
+    if engine:
+        try:
+            with engine.begin() as conn:
+                existing = conn.execute(
+                    text("SELECT id FROM site_configurations WHERE LOWER(site_key)=:k LIMIT 1"),
+                    {"k": site_key}
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        text("""UPDATE site_configurations
+                                SET drive_id=:d, site_id=:sid, display_name=:dn, web_url=:wu
+                                WHERE LOWER(site_key)=:k"""),
+                        {"d": request.drive_id, "sid": request.site_id,
+                         "dn": display, "wu": request.web_url, "k": site_key}
+                    )
+                else:
+                    conn.execute(
+                        text("""INSERT INTO site_configurations
+                                (site_key, display_name, site_name, site_id, drive_id, web_url, is_default_provisioning)
+                                VALUES (:k, :dn, :sn, :sid, :d, :wu, false)"""),
+                        {"k": site_key, "dn": display, "sn": request.site_name,
+                         "sid": request.site_id, "d": request.drive_id,
+                         "wu": request.web_url}
+                    )
+        except Exception as db_err:
+            raise HTTPException(status_code=500, detail=f"Failed to register site: {db_err}") from db_err
+
+    # Invalidate config cache so load_site_config picks up the new row
+    from .config import _SITE_CONFIGS_CACHE
+    _SITE_CONFIGS_CACHE.pop(site_key, None)
+
+    # Load the newly registered config
+    try:
+        site_config = Settings.load_site_config(site_key)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Site was registered but config could not be loaded: {e}") from e
+
+    # Switch session to the new site
+    if x_session_id:
+        set_session_site(x_session_id, site_key)
+    invalidate_folder_caches()
+
+    # Audit log
+    try:
+        from .db.base import SessionLocal
+        from .db import models as m
+        db = SessionLocal()
+        try:
+            db.add(m.SiteConfigurationChange(
+                changed_by_email=admin_email,
+                changed_by_name=admin_email,
+                previous_site=settings.active_site,
+                new_site=site_key,
+                new_db_name=site_config.db_name,
+                new_drive_id=site_config.drive_id,
+                new_site_name=display,
+                status="success",
+                reason=request.reason or "Auto-registered from tenant discovery",
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "site_key": site_key,
+        "new_site": site_key,
+        "new_site_name": display,
+        "new_db_name": site_config.db_name or "In-Memory",
+        "new_drive_id": site_config.drive_id,
+        "message": f"Switched to '{display}'",
+    }
+
+
+
+@app.get("/api/documents/sites")
+async def get_document_sites(
+    x_session_id: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Return configured sites (.env + DB) that Documents can browse."""
+    from .config import Settings, get_session_site
+    from .db.base import engine
+    from sqlalchemy import text
+
+    active_site = get_session_site(x_session_id) or settings.active_site
+    sites = []
+
+    # Build from .env discovered sites
+    for key, info in Settings.discover_available_sites().items():
+        if not info.get("configured"):
+            continue
+        try:
+            config = Settings.load_site_config(key)
+        except ValueError:
+            continue
+        sites.append({
+            "site_key": key,
+            "sp_site_name": info.get("sp_site_name") or config.sp_site_name,
+            "site_id": key,
+            "drive_id": config.drive_id,
+            "web_url": config.sharepoint_site_url,
+        })
+
+    # Enrich with DB site_configurations (prefer DB-stored site_id and display_name)
+    if engine:
+        try:
+            existing = {s["site_key"] for s in sites}
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT site_key, display_name, site_name, site_id, drive_id FROM site_configurations ORDER BY display_name")
+                ).mappings().all()
+                for r in rows:
+                    k = r["site_key"]
+                    d_name = r["display_name"] or r["site_name"] or k
+                    if k in existing:
+                        # Update site_id from DB (DB has real SharePoint site_id)
+                        for s in sites:
+                            if s["site_key"] == k:
+                                s["site_id"] = r["site_id"] or k
+                                s["sp_site_name"] = d_name
+                                break
+                    elif r["drive_id"]:
+                        from .config import compute_sp_site_url
+                        sites.append({
+                            "site_key": k,
+                            "sp_site_name": d_name,
+                            "site_id": r["site_id"] or k,
+                            "drive_id": r["drive_id"],
+                            "web_url": compute_sp_site_url(k, r.get("site_name") or d_name),
+                        })
+                        existing.add(k)
+        except Exception:
+            pass
+
+    # Configured site URLs are not always present in environment settings.
+    # Resolve them from Graph so links for secondary target sites use their
+    # actual SharePoint site path instead of the host web part's site URL.
+    for site in sites:
+        from .config import compute_sp_site_url
+        curr_url = site.get("web_url", "")
+        if not curr_url or (curr_url == "https://nissenkaiunsingapore.sharepoint.com" and any(x in (site.get("site_key", "") + site.get("sp_site_name", "")).lower() for x in ("nks", "docman", "external"))):
+            site["web_url"] = compute_sp_site_url(site.get("site_key", ""), site.get("sp_site_name", ""))
+
+        if site.get("site_id") and "," in site["site_id"] and "/sites/" not in (site.get("web_url") or "") and not any(x in site.get("site_key", "").lower() for x in ("dev", "root", "communication")):
+            try:
+                site_info = await graph().get(
+                    f"/sites/{quote(site['site_id'], safe='')}?$select=webUrl"
+                )
+                if site_info.get("webUrl"):
+                    site["web_url"] = site_info["webUrl"]
+            except Exception:
+                pass
+
+    return {"sites": sites, "active_site": active_site}
+
+
+@app.post("/api/sites/active")
+async def set_active_document_site(
+    request: SwitchSiteRequest,
+    x_session_id: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Set the configured SharePoint site for the current session."""
+    from .config import Settings, set_session_site
+
+    target = request.site_name.strip().lower()
+    try:
+        config = Settings.load_site_config(target)
+    except ValueError:
+        config = _registered_site_config(target)
+        if config is None:
+            raise HTTPException(status_code=400, detail=f"Site '{target}' is not configured")
+    if x_session_id:
+        set_session_site(x_session_id, target)
+    return {"success": True, "active_site": target, "site_name": config.sp_site_name, "drive_id": config.drive_id}
 
 
 @app.post("/api/config/switch-site")
@@ -2040,49 +2391,72 @@ async def switch_site(
 
 @app.get("/api/admin/site-configuration")
 async def get_admin_site_configuration(
+    include_hidden: bool = Query(default=False),
     x_user_email: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
     """Get current site configuration and list of available sites (admin only)."""
     admin_email = _require_admin(x_user_email)
     
-    from .config import Settings
+    from .config import Settings, get_settings_for_session
     
+    # Use session-scoped settings so a switched site is reflected immediately
+    # without requiring a page reload or server restart.
+    session_settings = get_settings_for_session(x_session_id)
     available_sites = Settings.discover_available_sites()
-    current_site = settings.active_site
+    current_site = session_settings.active_site
     
     # Get current site details
     try:
         current_config = Settings.load_site_config(current_site)
     except ValueError:
-        current_config = settings
+        current_config = session_settings
     
-    configured_sites = [
-        {
-            "name": site_info["name"],
-            "display_name": site_info["sp_site_name"],
-            "configured": site_info["configured"],
-        }
-        for site_info in available_sites.values()
-        if site_info["configured"]
-    ]
-    if settings.db_configured:
-        from .db.base import SessionLocal
-        from .db.models import SiteConfiguration
-        db = SessionLocal()
-        try:
-            existing_names = {site["name"] for site in configured_sites}
-            configured_sites.extend({
-                "name": record.site_key,
-                "display_name": record.display_name,
+    # Build configured sites from .env + DB, with display_name and actual drive info
+    configured_sites_map: dict[str, dict] = {}
+    for key, site_info in available_sites.items():
+        if site_info.get("configured"):
+            configured_sites_map[key] = {
+                "name": key,
+                "display_name": site_info["sp_site_name"],
                 "configured": True,
-                "site_id": record.site_id,
-                "drive_id": record.drive_id,
-            } for record in db.query(SiteConfiguration).order_by(SiteConfiguration.display_name).all()
-                    if record.site_key not in existing_names)
-        finally:
-            db.close()
-    
+                "is_hidden": False,
+            }
+
+    # Enrich from DB — adds site_id, real drive_id, correct display_name, and is_hidden flag
+    from .db.base import engine as _db_engine
+    if _db_engine:
+        try:
+            from sqlalchemy import text
+            with _db_engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT site_key, display_name, site_name, site_id, drive_id, "
+                        "COALESCE(is_hidden, FALSE) AS is_hidden "
+                        "FROM site_configurations ORDER BY display_name"
+                    )
+                ).mappings().all()
+                for r in rows:
+                    k = r["site_key"]
+                    d_name = r["display_name"] or r["site_name"] or k
+                    entry = {
+                        "name": k,
+                        "display_name": d_name,
+                        "configured": True,
+                        "site_id": r["site_id"],
+                        "drive_id": r["drive_id"],
+                        "is_hidden": bool(r["is_hidden"]),
+                    }
+                    configured_sites_map[k] = entry
+        except Exception:
+            pass
+
+    if not include_hidden:
+        configured_sites = [s for s in configured_sites_map.values() if not s.get("is_hidden")]
+    else:
+        configured_sites = list(configured_sites_map.values())
+
     return {
         "current_site": current_site,
         "current_site_name": current_config.sp_site_name,
@@ -2096,6 +2470,11 @@ async def get_admin_site_configuration(
 class AdminSwitchSiteRequest(BaseModel):
     site_name: str = Field(..., description="Target site name to switch to")
     reason: str | None = Field(default=None, description="Optional reason for the switch")
+
+
+class SiteVisibilityUpdate(BaseModel):
+    """Payload for PATCH /api/admin/site-configurations/{site_key}/visibility."""
+    is_hidden: bool
 
 
 class SaveSiteConfigurationRequest(BaseModel):
@@ -2164,6 +2543,103 @@ async def save_admin_site_configuration(
             db.add(record)
         db.commit()
         return {"success": True, "site": {"name": site_key, "display_name": record.display_name, "site_id": record.site_id, "drive_id": record.drive_id}}
+    finally:
+        db.close()
+
+
+@app.patch("/api/admin/site-configurations/{site_key}/visibility")
+async def set_site_visibility(
+    site_key: str,
+    payload: SiteVisibilityUpdate,
+    x_user_email: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Show or hide a site in the configured-sites pickers (admin only).
+
+    This is a non-destructive display preference — the site_configurations row
+    is never deleted and all vessel provisioning continues to resolve normally
+    regardless of is_hidden.  Only the picker UIs respect the flag.
+
+    Cannot hide the currently active site for this session.
+    """
+    admin_email = _require_admin(x_user_email)
+
+    from .config import get_session_site, _SITE_CONFIGS_CACHE
+    from .db.base import SessionLocal
+    from .db.models import SiteConfiguration
+    from sqlalchemy import text
+
+    key = site_key.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="site_key is required")
+
+    # Guard: cannot hide the currently active site (session-aware)
+    if payload.is_hidden:
+        session_active = (get_session_site(x_session_id) or settings.active_site or "").lower()
+        if key == session_active:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot hide the currently active site. Switch to a different site first.",
+            )
+
+    if not settings.db_configured:
+        raise HTTPException(status_code=503, detail="A database is required to manage site configurations.")
+
+    db = SessionLocal()
+    try:
+        record = db.query(SiteConfiguration).filter(SiteConfiguration.site_key == key).first()
+        if not record:
+            from .config import Settings
+            conf = None
+            try:
+                conf = Settings.load_site_config(key)
+            except Exception:
+                pass
+            if conf:
+                record = SiteConfiguration(
+                    site_key=key,
+                    display_name=conf.sp_site_name or key,
+                    site_name=conf.sp_site_name or key,
+                    site_id=getattr(conf, "sp_site_id", "") or key,
+                    drive_id=conf.drive_id or "",
+                    is_available_for_provisioning=True,
+                    is_default_provisioning=(key == settings.active_site),
+                    is_hidden=payload.is_hidden,
+                    created_by_email=admin_email,
+                )
+                db.add(record)
+                db.commit()
+                _SITE_CONFIGS_CACHE.pop(key, None)
+                return {
+                    "success": True,
+                    "site_key": key,
+                    "display_name": record.display_name or record.site_name or key,
+                    "is_hidden": payload.is_hidden,
+                }
+            raise HTTPException(status_code=404, detail=f"Site '{key}' not found in site_configurations.")
+
+        # Apply the column — use raw SQL to tolerate the column not existing yet in older
+        # migrations (it will be added by the startup schema-drift check or manual ALTER).
+        try:
+            db.execute(
+                text("UPDATE site_configurations SET is_hidden = :v WHERE site_key = :k"),
+                {"v": payload.is_hidden, "k": key},
+            )
+            db.commit()
+        except Exception as upd_err:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to update visibility: {upd_err}") from upd_err
+
+        # Invalidate config cache so the next load picks up the new flag
+        _SITE_CONFIGS_CACHE.pop(key, None)
+
+        return {
+            "success": True,
+            "site_key": key,
+            "display_name": record.display_name or record.site_name or key,
+            "is_hidden": payload.is_hidden,
+        }
     finally:
         db.close()
 
@@ -2283,6 +2759,8 @@ def _site_item_tags(fields: dict[str, Any]) -> dict[str, str]:
         "vessel": _pick_sp_field(fields, ["VesselName", "vesselname", "Vessel Name", "vessel", "vessel_name", "ship", "shipname", "ShipName", "Vessel_x0020_Name", "Vessel_x0020_Name_x0020_"]),
         "group": _pick_sp_field(fields, ["Group", "group", "DMS_Group", "vessel_group", "vesselgroup"]),
         "category": _pick_sp_field(fields, ["Category", "category", "DMS_Category", "document_category", "doc_category"]),
+        "sub_category": _pick_sp_field(fields, ["SubCategory", "subcategory", "Sub_x0020_Category", "DMS_SubCategory", "sub_category", "DMS_Sub_x0020_Category", "Subcategory"]),
+        "document_section": _pick_sp_field(fields, ["DocumentSection", "documentsection", "Document_x0020_Section", "document_section", "Section", "section"]),
     }
 
 
@@ -2471,7 +2949,7 @@ async def discover_site_drives(site_id: str, _session: object = Depends(require_
         raise HTTPException(status_code=502, detail=f"SharePoint library discovery failed: {exc}") from exc
 
 
-@app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/children")
+@app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id:path}/children")
 async def site_folder_children(
     site_id: str,
     drive_id: str,
@@ -2480,7 +2958,7 @@ async def site_folder_children(
     _session: object = Depends(require_session),
 ):
     del site_id
-    parent_id = await gd.get_root_item_id(drive_id, access_token=x_graph_access_token) if folder_id == "root" else folder_id
+    parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
     try:
         items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         from .ocr.drawing_category import _extract_vessel_from_folder_path
@@ -2587,7 +3065,6 @@ async def site_folder_children(
 
         now = time.time()
         # Collect folder items that need background count computation
-        _uncached_folder_ids: list[str] = []
         for it in decorated_items:
             if it.get("folder") and it.get("id"):
                 ck = f"{drive_id}:{it['id']}"
@@ -2605,27 +3082,12 @@ async def site_folder_children(
                         "total_files": child_count if isinstance(child_count, int) else 0,
                         "is_estimated": True,
                     } if isinstance(child_count, int) else None
-                    _uncached_folder_ids.append(it["id"])
 
-        # Fire-and-forget: compute accurate counts in background so next load is correct.
-        # This populates direct_subfolders / direct_files properly instead of relying on
-        # the childCount estimate which lumps folders and files together.
-        if _uncached_folder_ids:
-            _bg_token = x_graph_access_token
-            _bg_drive = drive_id
-            _bg_parent = parent_id
-            async def _compute_counts_bg() -> None:
-                for _fid in _uncached_folder_ids:
-                    try:
-                        await get_folder_recursive_counts(
-                            _bg_drive, _fid,
-                            parent_id=_bg_parent,
-                            access_token=_bg_token,
-                            max_depth=1,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-            asyncio.ensure_future(_compute_counts_bg())
+        # Do not launch recursive count walks from this request. The folder
+        # browser calls this endpoint while navigating, and a fire-and-forget
+        # walk for every child folder can continue across view changes and
+        # fan out into hundreds of Graph /children requests. The immediate
+        # Graph childCount estimate above is sufficient for the folder cards.
 
         direct_folders = len([i for i in items if i.get("folder")])
         direct_files = len([i for i in items if not i.get("folder")])
@@ -2662,6 +3124,136 @@ async def site_folder_children(
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
+_RECURSIVE_TREE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_RECURSIVE_TREE_INFLIGHT: dict[str, asyncio.Task] = {}
+CACHE_TTL_RECURSIVE_TREE = 600.0  # 10 minutes cache for instant tree loading
+
+
+@app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/recursive")
+async def site_folder_recursive_tree(
+    site_id: str,
+    drive_id: str,
+    folder_id: str,
+    request: Request,
+    x_graph_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    cache_key = f"{drive_id}:{folder_id}"
+    active = _RECURSIVE_TREE_INFLIGHT.get(cache_key)
+    if active is not None:
+        return await asyncio.shield(active)
+
+    task = asyncio.create_task(_build_site_folder_recursive_tree(
+        drive_id=drive_id,
+        folder_id=folder_id,
+        request=request,
+        x_graph_access_token=x_graph_access_token,
+    ))
+    _RECURSIVE_TREE_INFLIGHT[cache_key] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _RECURSIVE_TREE_INFLIGHT.get(cache_key) is task:
+            _RECURSIVE_TREE_INFLIGHT.pop(cache_key, None)
+
+
+async def _build_site_folder_recursive_tree(
+    drive_id: str,
+    folder_id: str,
+    request: Request,
+    x_graph_access_token: str | None,
+) -> dict[str, Any]:
+    """Return every live folder and file below a drive item.
+
+    Documents uses this as its read-only live overlay; template rows remain
+    separate so empty provisionable folders are still visible.
+    """
+    cache_key = f"{drive_id}:{folder_id}"
+    now_ts = time.time()
+    cached = _RECURSIVE_TREE_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < CACHE_TTL_RECURSIVE_TREE:
+        return cached[1]
+
+    root_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
+    folders: list[dict[str, Any]] = []
+    visited: set[str] = set()
+
+    async def walk(parent_id: str, parent_path: str, depth: int) -> None:
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        if depth > 8 or len(folders) >= 2000 or parent_id in visited:
+            return
+        visited.add(parent_id)
+        children = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        next_nodes = []
+        for item in children:
+            path = f"{parent_path}/{item.get('name', '')}".strip("/")
+            node = {
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "parent_id": parent_id,
+                "path": path,
+                "depth": depth,
+                "web_url": item.get("webUrl", ""),
+                "is_folder": bool(item.get("folder")),
+                "size": item.get("size"),
+                "created_date_time": item.get("createdDateTime"),
+                "last_modified_date_time": item.get("lastModifiedDateTime"),
+            }
+            folders.append(node)
+            if item.get("folder"):
+                next_nodes.append((item.get("id", ""), path))
+        await asyncio.gather(*(walk(child_id, child_path, depth + 1) for child_id, child_path in next_nodes if child_id))
+
+    await walk(root_id, "", 0)
+
+    # Fast concurrent tag enrichment via Graph $batch for files
+    file_items = [it for it in folders if not it.get("is_folder") and it.get("id")]
+    BATCH_SIZE = 20
+    fields_by_id: dict[str, dict] = {}
+    if file_items:
+        sem = asyncio.Semaphore(5)
+        async def _fetch_chunk(chunk):
+            batch_requests = [
+                {
+                    "id": it["id"],
+                    "method": "GET",
+                    "url": f"/drives/{drive_id}/items/{it['id']}/listItem/fields",
+                }
+                for it in chunk
+            ]
+            async with sem:
+                try:
+                    batch_resp = await graph().post(
+                        "/$batch",
+                        json={"requests": batch_requests},
+                        access_token=x_graph_access_token,
+                    )
+                    return batch_resp.get("responses", [])
+                except Exception:
+                    return []
+
+        chunks = [file_items[i: i + BATCH_SIZE] for i in range(0, min(len(file_items), 500), BATCH_SIZE)]
+        chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
+        for resp_list in chunk_results:
+            for resp_item in resp_list:
+                if resp_item.get("status") == 200:
+                    fields_by_id[resp_item["id"]] = resp_item.get("body") or {}
+
+    for it in folders:
+        if not it.get("is_folder"):
+            raw_fields = fields_by_id.get(it["id"], {})
+            it["tags"] = _site_item_tags(raw_fields)
+        else:
+            it["tags"] = {}
+
+    result = {"root_id": root_id, "folders": folders, "truncated": len(folders) >= 10000}
+    _RECURSIVE_TREE_CACHE[cache_key] = (now_ts, result)
+    return result
+
+
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/subfolder-counts")
 async def site_subfolder_counts(
     site_id: str,
@@ -2671,7 +3263,7 @@ async def site_subfolder_counts(
     _session: object = Depends(require_session),
 ):
     del site_id
-    parent_id = await gd.get_root_item_id(drive_id, access_token=x_graph_access_token) if folder_id == "root" else folder_id
+    parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
     try:
         items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         folder_items = [i for i in items if i.get("folder") and i.get("id")]
@@ -4182,6 +4774,7 @@ async def get_site_term_store_vessels(site_id: str, _session: object = Depends(r
 async def admin_switch_site(
     request: AdminSwitchSiteRequest,
     x_user_email: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
     """Switch the active site globally and persist to database (admin only).
@@ -4198,8 +4791,7 @@ async def admin_switch_site(
     """
     admin_email = _require_admin(x_user_email)
     
-    from .config import Settings
-    from .graph.client import reset_graph_client
+    from .config import Settings, set_session_site
     from .db.base import SessionLocal
     from .db import models as m
     
@@ -4223,78 +4815,20 @@ async def admin_switch_site(
     # Cannot switch to the same site
     if target_site == previous_site:
         raise HTTPException(status_code=400, detail="Target site is already active")
-    
-    # Attempt to validate the new site's Graph connection
-    try:
-        from .graph.client import graph
-        test_client = graph(site_config=new_config)
-        test_client._token()
-        if getattr(new_config, "drive_id", None):
-            await test_client.get(f"/drives/{new_config.drive_id}")
-        elif getattr(new_config, "sp_site_id", None):
-            await test_client.get(f"/sites/{new_config.sp_site_id}")
-        else:
-            await test_client.get("/sites/root")
-    except Exception as e:
-        db = None
-        try:
-            db = SessionLocal()
-            change_log = m.SiteConfigurationChange(
-                changed_by_email=admin_email,
-                changed_by_name=admin_email,
-                previous_site=previous_site,
-                new_site=target_site,
-                previous_db_name=previous_config.db_name,
-                previous_drive_id=previous_config.drive_id,
-                previous_site_name=previous_config.sp_site_name,
-                new_db_name=new_config.db_name,
-                new_drive_id=new_config.drive_id,
-                new_site_name=new_config.sp_site_name,
-                status="failed",
-                error_message=f"Graph connection validation failed: {str(e)}",
-                reason=request.reason,
-            )
-            db.add(change_log)
-            db.commit()
-        except Exception as log_error:
-            logger.warning(f"Failed to log site switch failure: {log_error}")
-        finally:
-            if db:
-                db.close()
-        
-        raise HTTPException(
-            status_code=400,
-            detail=f"Target site SharePoint connection failed: {str(e)}"
-        )
-    
-    # Update the global settings by setting ACTIVE_SITE in environment
-    import os
-    old_active = os.environ.get("ACTIVE_SITE")
-    try:
-        os.environ["ACTIVE_SITE"] = target_site
-        os.environ["APP_ENV"] = target_site
 
-        # Persist to .env file if target_site is defined in .env
-        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-        if os.path.exists(env_path):
-            try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if f"{target_site.upper()}_DRIVE_ID" in content:
-                    import re
-                    new_content = re.sub(r"^ACTIVE_SITE\s*=.*$", f"ACTIVE_SITE={target_site}", content, flags=re.MULTILINE)
-                    new_content = re.sub(r"^APP_ENV\s*=.*$", f"APP_ENV={target_site}", new_content, flags=re.MULTILINE)
-                    with open(env_path, "w", encoding="utf-8") as f:
-                        f.write(new_content)
-            except Exception as env_err:
-                logger.warning(f"Failed to persist ACTIVE_SITE to .env: {env_err}")
-
-        # Force new settings to be loaded
-        from .config import _SITE_CONFIGS_CACHE
-        _SITE_CONFIGS_CACHE.clear()
-        
-        # Reset graph client for new site
-        await reset_graph_client()
+    # NOTE: We intentionally skip a live Graph API connection test here.
+    # A blocking `await graph_client.get(...)` call has no timeout and can
+    # hang for 30+ seconds, causing the browser to appear frozen and the user
+    # to manually reload the page.  Config validation above is sufficient —
+    # the subsequent _loadData() / _loadDocumentSites() calls from the frontend
+    # will naturally surface any connectivity issues without blocking the switch.
+    
+    # Keep the switch scoped to the requesting session. Mutating ACTIVE_SITE in
+    # .env causes uvicorn --reload to restart and leaves other users on a
+    # partially reconfigured process.
+    try:
+        if x_session_id:
+            set_session_site(x_session_id, target_site)
         
         # Invalidate caches
         invalidate_folder_caches()
@@ -4336,16 +4870,6 @@ async def admin_switch_site(
         }
     
     except Exception as e:
-        # Rollback: restore previous site
-        if old_active:
-            os.environ["ACTIVE_SITE"] = old_active
-        else:
-            os.environ.pop("ACTIVE_SITE", None)
-        
-        # Clear cache to force reload
-        from .config import _SITE_CONFIGS_CACHE
-        _SITE_CONFIGS_CACHE.clear()
-        
         # Log the rollback
         db = None
         try:
@@ -4880,6 +5404,7 @@ async def _bg_refresh_live_spo_files(folder_ids_to_fetch: list[str]):
 
         _LIVE_SPO_FILES_CACHE["data"] = live_spo_files
         _LIVE_SPO_FILES_CACHE["timestamp"] = time.time()
+        _LIVE_SPO_FILES_CACHE["drive_id"] = drive_id_val
         _FLAT_TREE_CACHE["data"] = None
     except Exception as exc:
         logging.getLogger(__name__).warning("Background SPO files fetch warning: %s", exc)
@@ -4900,7 +5425,7 @@ async def list_vessels_flat_tree(
     now = time.time()
     # When filtering by vessel, skip cache and do a fast targeted DB query
     if not vessel_name and not vessel_window:
-        if not force_refresh and _FLAT_TREE_CACHE["data"] is not None and (now - _FLAT_TREE_CACHE["timestamp"]) < CACHE_TTL_FLAT_TREE:
+        if not force_refresh and _FLAT_TREE_CACHE.get("drive_id") == settings.drive_id and _FLAT_TREE_CACHE["data"] is not None and (now - _FLAT_TREE_CACHE["timestamp"]) < CACHE_TTL_FLAT_TREE:
             return _FLAT_TREE_CACHE["data"]
 
     def clean(s: str) -> str:
@@ -4986,6 +5511,7 @@ async def list_vessels_flat_tree(
 
                 await _recurse_categories(cat_nodes, f"{vname} > {mname}")
         _FLAT_TREE_CACHE["data"] = out
+        _FLAT_TREE_CACHE["drive_id"] = settings.drive_id
         _FLAT_TREE_CACHE["timestamp"] = time.time()
         return out
 
@@ -4994,6 +5520,22 @@ async def list_vessels_flat_tree(
 
     out = []
     with SessionLocal() as db:
+        active_drive = str(settings.drive_id or "")
+        active_site_keys = {str(settings.active_site or "").lower()}
+        from .config import Settings
+        for site_key, site_info in Settings.discover_available_sites().items():
+            try:
+                if str(Settings.load_site_config(site_key).drive_id or "") == active_drive:
+                    active_site_keys.add(site_key.lower())
+            except ValueError:
+                pass
+        for record in db.query(db_models.SiteConfiguration).all():
+            if str(record.drive_id or "") == active_drive:
+                active_site_keys.add(str(record.site_key).lower())
+        eligible_vessel_ids = [
+            vessel.id for vessel in db.query(Vessel).all()
+            if any(str(site).lower() in active_site_keys for site in (vessel.provisioned_site_ids or []))
+        ]
         # Build approved file map: uploadFolderId -> list of (filename, fileId)
         approved_files: dict[str, list[dict]] = {}
         approved_rows = (
@@ -5019,6 +5561,7 @@ async def list_vessels_flat_tree(
                 Folder.kind.in_(["leaf", "month_driven", "drawing_classifier"]),
                 Folder.drive_item_id.isnot(None),
                 Folder.vessel_id.isnot(None),
+                Vessel.id.in_(eligible_vessel_ids),
             )
         )
         if vessel_name:
@@ -5029,6 +5572,7 @@ async def list_vessels_flat_tree(
             # batches on demand.
             recent_ids = [
                 vessel_id for (vessel_id,) in db.query(Vessel.id)
+                .filter(Vessel.id.in_(eligible_vessel_ids))
                 .order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc())
                 .offset(vessel_offset)
                 .limit(vessel_window)
@@ -5036,6 +5580,81 @@ async def list_vessels_flat_tree(
             ]
             q = q.filter(Vessel.id.in_(recent_ids))
         results = q.order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc(), Folder.path.asc()).all()
+
+        # The folder table can contain IDs and paths from an older SharePoint
+        # structure or drive. When Graph is available, use the live drive as
+        # the source of truth for Documents instead of walking stale rows.
+        # Do not recursively walk the whole SharePoint drive here. This
+        # endpoint is used by List View and a full live walk issues one
+        # /children request per folder, quickly triggering Graph 429s. Live
+        # site folders are loaded on demand by the site-folder endpoints;
+        # this response uses database rows plus the cached file overlay below.
+        if False and settings.graph_configured and settings.drive_id:
+            from .graph import drive as live_drive
+
+            live_rows: list[dict[str, Any]] = []
+            live_vessel_names: list[str] = []
+            root_id = await live_drive.get_root_item_id(settings.drive_id)
+
+            async def walk_live(parent_id: str, parent_path: str) -> None:
+                children = await live_drive.list_children(settings.drive_id, parent_id)
+                for item in children:
+                    item_path = f"{parent_path}/{item.get('name', '')}".strip("/")
+                    if item.get("folder"):
+                        parts = [part for part in item_path.split("/") if part]
+                        if len(parts) >= 2 and parts[0] in template.MAIN_FOLDERS:
+                            if parts[1] not in live_vessel_names:
+                                live_vessel_names.append(parts[1])
+                        await walk_live(item["id"], item_path)
+
+            await walk_live(root_id, "")
+            if vessel_name:
+                live_vessel_names = [name for name in live_vessel_names if name.lower() == vessel_name.strip().lower()]
+            elif vessel_window:
+                start = vessel_offset
+                live_vessel_names = live_vessel_names[start:start + vessel_window]
+
+            allowed = {name.lower() for name in live_vessel_names}
+            live_rows_by_folder: dict[str, dict[str, Any]] = {}
+
+            async def build_live_rows(parent_id: str, parent_path: str) -> None:
+                children = await live_drive.list_children(settings.drive_id, parent_id)
+                for item in children:
+                    item_path = f"{parent_path}/{item.get('name', '')}".strip("/")
+                    parts = [part for part in item_path.split("/") if part]
+                    if item.get("folder"):
+                        if len(parts) >= 3 and parts[0] in template.MAIN_FOLDERS and parts[1].lower() in allowed:
+                            group, vessel, category = parts[0], parts[1], parts[2]
+                            key = item_path.lower()
+                            live_rows_by_folder.setdefault(key, {
+                                "srNo": str(len(live_rows_by_folder) + 1),
+                                "vesselName": vessel,
+                                "group": group,
+                                "category": category,
+                                "subCategory": parts[-1],
+                                "subFolderPath": " > ".join([vessel, group, *parts[2:]]),
+                                "fileName": None,
+                                "fileId": None,
+                                "canUpload": True,
+                                "groupKey": f"{vessel}||{group}||{category}||{parts[-1]}||{item_path}",
+                                "uploadFolderId": item["id"],
+                                "monthDriven": False,
+                            })
+                        await build_live_rows(item["id"], item_path)
+                    elif len(parts) >= 3 and parts[0] in template.MAIN_FOLDERS and parts[1].lower() in allowed:
+                        folder_path = "/".join(parts[:-1])
+                        row = live_rows_by_folder.get(folder_path.lower())
+                        if row:
+                            if row["fileName"] is None:
+                                row["fileName"] = item.get("name")
+                                row["fileId"] = item.get("id")
+                            else:
+                                live_rows.append({**row, "fileName": item.get("name"), "fileId": item.get("id")})
+
+            await build_live_rows(root_id, "")
+            live_rows.extend(live_rows_by_folder.values())
+            if live_rows:
+                return live_rows
 
         # A vessel-specific refresh must return the current SharePoint contents in
         # the same response. The shared cache is intentionally background-refreshed
@@ -5091,7 +5710,10 @@ async def list_vessels_flat_tree(
     # Return any already-cached SPO files, refresh that cache in the background,
     # and let the client fetch a folder live only when the user opens it.
     now_live = time.time()
-    if settings.graph_configured and (now_live - _LIVE_SPO_FILES_CACHE.get("timestamp", 0)) >= CACHE_TTL_LIVE_SPO_FILES:
+    # Do not start a background request for every DB leaf folder. Documents
+    # loads must remain DB-fast; SharePoint files are fetched on demand from
+    # the site-folder children endpoint instead of flooding Graph here.
+    if False and settings.graph_configured and (now_live - _LIVE_SPO_FILES_CACHE.get("timestamp", 0)) >= CACHE_TTL_LIVE_SPO_FILES:
         folder_ids_to_fetch = list(dict.fromkeys(
             f.drive_item_id for f, v in results
             if f.drive_item_id
@@ -5166,6 +5788,7 @@ async def list_vessels_flat_tree(
     # Only store unfiltered results in the shared cache.
     if not vessel_name and not vessel_window:
         _FLAT_TREE_CACHE["data"] = out
+        _FLAT_TREE_CACHE["drive_id"] = settings.drive_id
         _FLAT_TREE_CACHE["timestamp"] = time.time()
     return out
 
@@ -5371,6 +5994,7 @@ async def vessel_provision_status(
 
 @app.get("/api/admin/site-provisioning/sites")
 async def get_site_provisioning_sites(
+    include_hidden: bool = Query(default=False),
     x_user_email: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
@@ -5378,7 +6002,7 @@ async def get_site_provisioning_sites(
     from .services.site_provisioning import get_all_configured_sites
     from .db.base import SessionLocal
     with SessionLocal() as db:
-        sites = get_all_configured_sites(db)
+        sites = get_all_configured_sites(db, include_hidden=include_hidden)
         return {"sites": sites, "active_site": settings.active_site}
 
 

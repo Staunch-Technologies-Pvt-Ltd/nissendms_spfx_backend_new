@@ -1,7 +1,6 @@
 """APScheduler jobs for Vessel DMS.
 
 Jobs:
-  precreate_next_month  – daily @ 01:00, creates next month's SP folders.
   session_sweep         – every 15 min, expires stale sessions and runs
                           periodic Graph spot-checks for active accounts.
   reconcile_pool        – every 5 min, retries stuck vessel-folder-pool
@@ -12,6 +11,7 @@ All jobs are only active when Graph + DB are configured (real mode).
 from datetime import date, datetime, timedelta, timezone
 import asyncio
 import logging
+import time
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import text
@@ -19,13 +19,8 @@ from sqlalchemy import text
 from .config import settings
 from .db import models
 from .db.base import SessionLocal
-from .services.classify import classify
-from .ocr.dates import month_label
-from .graph.client import GraphError, graph
 
 log = logging.getLogger(__name__)
-
-PRECREATE_DAY = 20
 
 # --------------------------------------------------------------- vessel pool
 POOL_TARGET_SIZE = 5
@@ -45,260 +40,6 @@ SLOT_BUILD_TIMEOUT_SECONDS = 600
 _POOL_RECONCILE_LOCK_KEY = 987654321
 
 
-def _next_month(year, month):
-    return (year + 1, 1) if month == 12 else (year, month + 1)
-
-
-async def _log_sp_permission_diagnostics(drive_id: str) -> None:
-    """Run narrow SPO probes so 403s identify which operation is denied."""
-    from .graph import drive as gd
-
-    diag: dict[str, dict] = {}
-
-    async def _record(op: str, coro):
-        try:
-            result = await coro
-            diag[op] = {"ok": True, "result": result}
-            return result
-        except GraphError as e:
-            diag[op] = {"ok": False, "status": e.status, "error": str(e)}
-            return None
-        except Exception as e:
-            diag[op] = {"ok": False, "error": str(e)}
-            return None
-
-    root = await _record(
-        "drive_root_read",
-        graph().get(f"/drives/{drive_id}/root?$select=id,name,webUrl"),
-    )
-    root_id = str((root or {}).get("id") or "")
-
-    children = []
-    if root_id:
-        listed = await _record("drive_children_list", gd.list_children(drive_id, root_id))
-        children = listed or []
-    else:
-        diag.setdefault(
-            "drive_children_list",
-            {"ok": False, "error": "Skipped because drive_root_read did not return root id."},
-        )
-
-    if root_id:
-        probe_name = f"__perm_probe_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        created = await _record("folder_create_probe", gd.ensure_folder(drive_id, root_id, probe_name))
-        created_id = str((created or {}).get("id") or "")
-        if created_id:
-            await _record("folder_delete_probe", gd.delete_item(drive_id, created_id))
-        else:
-            diag.setdefault(
-                "folder_delete_probe",
-                {"ok": False, "error": "Skipped because folder_create_probe failed."},
-            )
-    else:
-        diag.setdefault(
-            "folder_create_probe",
-            {"ok": False, "error": "Skipped because drive_root_read did not return root id."},
-        )
-        diag.setdefault(
-            "folder_delete_probe",
-            {"ok": False, "error": "Skipped because folder_create_probe was not attempted."},
-        )
-
-    first_item_id = ""
-    first_item = next((it for it in children if it.get("id")), None)
-    if first_item:
-        first_item_id = str(first_item.get("id") or "")
-    if first_item_id:
-        await _record(
-            "listitem_fields_read_probe",
-            graph().get(f"/drives/{drive_id}/items/{first_item_id}/listItem/fields"),
-        )
-    else:
-        diag.setdefault(
-            "listitem_fields_read_probe",
-            {"ok": False, "error": "Skipped because no probe item was found under drive root."},
-        )
-
-    log.warning(
-        "[precreate_next_month] SPO permission diagnostics for drive %s: %s",
-        drive_id,
-        diag,
-    )
-
-
-async def _normalize_month_driven_rows_for_drive(
-    drive_id: str,
-) -> list[tuple[str, str, int | None]]:
-    """Return month-driven parent rows bound to the active drive.
-
-    Repairs stale cached drive_item_id values by resolving folder path on the
-    active drive and writing the corrected id back to DB.
-    """
-    from .graph import drive as gd
-
-    with SessionLocal() as db:
-        db_rows = [
-            (r.id, str(r.drive_item_id or "").strip(), str(r.path or "").strip(), r.vessel_id)
-            for r in db.query(models.Folder).filter_by(month_driven=True).all()
-        ]
-
-    resolved_rows: list[tuple[str, str, int | None]] = []
-    updates: dict[int, str] = {}
-    repaired = 0
-    skipped = 0
-
-    for row_id, cached_item_id, path, vessel_id in db_rows:
-        if not path:
-            skipped += 1
-            continue
-
-        resolved_item_id = cached_item_id
-        cached_valid = False
-
-        if cached_item_id:
-            try:
-                await gd.get_item(drive_id, cached_item_id, select="id")
-                cached_valid = True
-            except GraphError as e:
-                if e.status == 403:
-                    raise
-                cached_valid = False
-            except Exception:
-                cached_valid = False
-
-        if not cached_valid:
-            try:
-                by_path = await gd.get_item_by_path(drive_id, path, select="id")
-                resolved_item_id = str(by_path.get("id") or "").strip()
-            except GraphError as e:
-                if e.status == 403:
-                    raise
-                resolved_item_id = ""
-            except Exception:
-                resolved_item_id = ""
-
-        if not resolved_item_id:
-            skipped += 1
-            continue
-
-        resolved_rows.append((resolved_item_id, path, vessel_id))
-        if resolved_item_id != cached_item_id:
-            updates[row_id] = resolved_item_id
-            repaired += 1
-
-    if updates:
-        with SessionLocal() as db:
-            records = db.query(models.Folder).filter(models.Folder.id.in_(list(updates.keys()))).all()
-            for rec in records:
-                rec.drive_item_id = updates[rec.id]
-            db.commit()
-
-    if repaired or skipped:
-        log.info(
-            "[precreate_next_month] normalized month-driven parents for active drive: repaired=%d skipped=%d total=%d",
-            repaired,
-            skipped,
-            len(db_rows),
-        )
-
-    return resolved_rows
-
-
-async def precreate_next_month(force: bool = False) -> int:
-    """Ensure next month's folders exist. Returns how many were processed."""
-    from .services import get_backend
-    from .services.real_backend import RealBackend
-    from .graph import drive as gd
-
-    if not (settings.graph_configured and settings.db_configured):
-        return 0
-    backend = get_backend()
-    if not isinstance(backend, RealBackend):
-        return 0
-    today = date.today()
-    if not force and today.day < PRECREATE_DAY:
-        return 0
-
-    if not hasattr(backend, "_drive") or not hasattr(backend, "_ensure_month"):
-        log.warning(
-            "[precreate_next_month] Backend %s is missing _drive or _ensure_month; skipping.",
-            backend.__class__.__name__,
-        )
-        return 0
-
-    ny, nm = _next_month(today.year, today.month)
-    label = month_label(ny, nm) 
-    drive_id = await backend._drive()
-    rows = await _normalize_month_driven_rows_for_drive(drive_id)
-    if not rows:
-        return 0
-
-    # Pass 1: batch-create the month folder itself for every vessel/main in one go.
-    try:
-        month_items = await gd.batch_create_folders(
-            drive_id, [(item_id, label) for item_id, _, _ in rows]
-        )
-    except GraphError as e:
-        msg = str(e).lower()
-        if e.status == 403 and "access denied" in msg:
-            await _log_sp_permission_diagnostics(drive_id)
-            log.warning(
-                "[precreate_next_month] Skipping precreate: Graph access denied for drive %s. "
-                "Check app permissions and site/library grants; run /api/debug/sharepoint-access-health. Error: %s",
-                drive_id,
-                e,
-            )
-            return 0
-        raise
-
-    with SessionLocal() as db:
-        month_paths = {}  # (item_id) -> (mpath, month_item_id)
-        for item_id, path, vessel_id in rows:
-            item = month_items.get((item_id, label))
-            if not item:
-                continue
-            mpath = f"{path}/{label}"
-            backend._upsert(db, mpath, label, "month", item["id"], False, vessel_id)
-            month_paths[item_id] = (mpath, item["id"], vessel_id, path)
-        db.commit()
-
-    # Pass 2: batch-create every category subfolder across every month folder in one go.
-    cat_targets = []  # (month_item_id, cat_name, mpath, vessel_id)
-    for item_id, path, vessel_id in rows:
-        entry = month_paths.get(item_id)
-        if not entry:
-            continue
-        mpath, month_item_id, vid, orig_path = entry
-        categories = classify(orig_path.split("/")).get("categories", [])
-        for cat in categories:
-            cat_targets.append((month_item_id, cat, mpath, vid))
-
-    if cat_targets:
-        try:
-            cat_items = await gd.batch_create_folders(
-                drive_id, [(mid, cat) for mid, cat, _, _ in cat_targets]
-            )
-        except GraphError as e:
-            msg = str(e).lower()
-            if e.status == 403 and "access denied" in msg:
-                await _log_sp_permission_diagnostics(drive_id)
-                log.warning(
-                    "[precreate_next_month] Category precreate skipped: Graph access denied for drive %s. "
-                    "Month folder rows were processed, but category leaf precreate could not continue. "
-                    "Check app permissions and site/library grants; run /api/debug/sharepoint-access-health. Error: %s",
-                    drive_id,
-                    e,
-                )
-                return len(rows)
-            raise
-        with SessionLocal() as db:
-            for month_item_id, cat, mpath, vid in cat_targets:
-                item = cat_items.get((month_item_id, cat))
-                if item:
-                    backend._upsert(db, f"{mpath}/{cat}", cat, "leaf", item["id"], False, vid)
-            db.commit()
-
-    return len(rows)
 async def reconcile_pool() -> dict:
     """Retry stuck vessel-folder-pool replenishments and top up the pool to
     POOL_TARGET_SIZE if it's short.
@@ -408,6 +149,123 @@ async def reconcile_pool() -> dict:
             len(stuck_jobs) + len(stuck_slots), built,
         )
     return {"retried_stuck": len(stuck_jobs) + len(stuck_slots), "built": built}
+
+async def refresh_dashboard_stats_cache() -> dict:
+    """Re-scan every SharePoint site's drive and re-warm the Home dashboard's
+    stats cache ("all sites" view) in the background.
+
+    Without this, the counters/site table on Home are computed live on
+    whichever request happens to land after the cache (CACHE_TTL_DASHBOARD_STATS,
+    120s) expires — the request that pays for the full multi-site Graph scan
+    is whichever user opens the page at the wrong moment, and with 17k+ files
+    across a large library that scan is slow. Running the scan here instead,
+    on a schedule slightly faster than the cache TTL, means real page loads
+    almost always hit a warm cache and just get "last refreshed" answered
+    instantly.
+    """
+    from .services import get_backend
+    from .services import real_backend as rb
+    from .services.real_backend import RealBackend
+
+    backend = get_backend()
+    if not isinstance(backend, RealBackend):
+        return {"skipped": "not_real_backend"}
+
+    # Back off for a few minutes after a scan that hit Graph throttling,
+    # instead of re-scanning every 100s into a still-exhausted quota. Time-
+    # based (not "skip while any cached row has an error"), so a stale error
+    # can never stop the next real scan from running and clearing it.
+    since = time.time() - rb._DASHBOARD_LAST_THROTTLED_AT
+    if since < 300:
+        log.info(
+            "[refresh_dashboard_stats_cache] skipped — last scan was throttled %.0fs ago",
+            since,
+        )
+        return {"skipped": "recently_throttled"}
+
+    try:
+        stats = await backend.get_dashboard_stats(force_refresh=True, site_key=None)
+        log.info(
+            "[refresh_dashboard_stats_cache] files=%s folders=%s sites=%s truncated=%s",
+            stats.get("total_files"), stats.get("total_folders"),
+            stats.get("total_sites"), stats.get("truncated"),
+        )
+        return {"total_files": stats.get("total_files"), "total_sites": stats.get("total_sites")}
+    except asyncio.CancelledError:
+        # asyncio.CancelledError is a BaseException (not Exception) since
+        # Python 3.8, so the handler below never caught it — it fell through
+        # to APScheduler's own executor, which logs an uncaught job error as
+        # a multi-frame ERROR traceback. That looked like a crash, but it's
+        # just this scan being torn down mid-flight because the app itself
+        # is shutting down or restarting (e.g. uvicorn --reload picking up a
+        # code change while this job happened to be running) — normal during
+        # development, not a real failure. Log it briefly and re-raise so
+        # the event loop's own cancellation still completes correctly.
+        log.info("[refresh_dashboard_stats_cache] cancelled (server shutting down/restarting)")
+        raise
+    except Exception as exc:
+        # Best-effort — a failed background refresh just leaves the previous
+        # cached figures in place (or falls through to a live scan on the
+        # next request) rather than breaking anything.
+        log.warning("[refresh_dashboard_stats_cache] Unhandled error: %s", exc)
+        return {"error": str(exc)}
+
+
+async def reconcile_native_deletions() -> dict:
+    """Backfill Deleted By / reason for folder & file deletions this backend
+    didn't capture directly (native SharePoint UI deletions, or a client-side
+    Graph delete whose log-deletion call didn't land) — see
+    RealBackend.reconcile_native_deletions. This is also what feeds the live
+    deletion popup (top-header alert bell) for those items, since a new
+    deletion_log row is what /api/alerts/all surfaces."""
+    from .services import get_backend
+    from .services.real_backend import RealBackend
+
+    backend = get_backend()
+    if not isinstance(backend, RealBackend):
+        return {"skipped": "not_real_backend"}
+    try:
+        return await backend.reconcile_native_deletions()
+    except Exception as exc:
+        log.warning("[reconcile_native_deletions] Unhandled error: %s", exc)
+        return {"error": str(exc)}
+
+
+async def reconcile_vessel_folders() -> dict:
+    """Remove vessels from the DB whose SharePoint ship folder was deleted
+    directly in SharePoint Online (outside the app), so the Vessels list
+    stays in sync with SharePoint even if nobody opens the page to trigger
+    the on-demand check in RealBackend.list_vessels()."""
+    from .services import get_backend
+    from .services.real_backend import RealBackend
+
+    backend = get_backend()
+    if not isinstance(backend, RealBackend):
+        return {"skipped": "not_real_backend"}
+    try:
+        return await backend.reconcile_vessel_folders(force=True)
+    except Exception as exc:
+        log.warning("[reconcile_vessel_folders] Unhandled error: %s", exc)
+        return {"error": str(exc)}
+
+
+async def ensure_template_month_folders() -> dict:
+    """See services/folder_structure.ensure_current_month_folders."""
+    from .services import get_backend
+    from .services.real_backend import RealBackend
+    from .services import folder_structure
+
+    backend = get_backend()
+    if not isinstance(backend, RealBackend):
+        return {"skipped": "not_real_backend"}
+    try:
+        result = await folder_structure.ensure_current_month_folders(backend)
+        log.info("[ensure_template_month_folders] %s", result)
+        return result
+    except Exception as exc:
+        log.warning("[ensure_template_month_folders] Unhandled error: %s", exc)
+        return {"error": str(exc)}
+
 
 def _sweep_sessions() -> None:
     """Synchronous job: expire stale sessions + Graph account revalidation.
@@ -546,13 +404,29 @@ def start_scheduler() -> AsyncIOScheduler | None:
         return None
     sched = AsyncIOScheduler()
 
-    # Pre-create next month's SharePoint folders (daily at 01:00)
+    # NOTE: the former precreate_next_month job (daily pre-creation of next
+    # month's folders + category leaves) was removed — the app no longer
+    # auto-creates folder/leaf template structures in SharePoint Online.
+    # A month folder is created only when a file is uploaded into it.
+
+    # Folder Structure Mode (Modes 2 & 4 only): create the current month's
+    # folder + template categories under month-driven folders. Daily and on
+    # startup; idempotent. Vessels in Modes 1/3 are never touched.
     sched.add_job(
-        precreate_next_month,
+        ensure_template_month_folders,
         "cron",
-        hour=1,
-        minute=0,
-        id="precreate_next_month",
+        hour=0,
+        minute=20,
+        id="ensure_template_month_folders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    sched.add_job(
+        ensure_template_month_folders,
+        "date",
+        run_date=datetime.now(),
+        id="ensure_template_month_folders_startup",
         replace_existing=True,
     )
 
@@ -575,9 +449,53 @@ def start_scheduler() -> AsyncIOScheduler | None:
         replace_existing=True,
     )
 
+    # Vessels: detect folders deleted directly in SharePoint Online and
+    # remove the matching vessel from the DB (every 10 minutes).
+    sched.add_job(
+        reconcile_vessel_folders,
+        "interval",
+        minutes=10,
+        id="reconcile_vessel_folders",
+        next_run_time=datetime.now(),
+        replace_existing=True,
+    )
+
+    # Home dashboard stats: keep the "all sites" cache warm (every 100s,
+    # just under CACHE_TTL_DASHBOARD_STATS's 120s) so page loads read from
+    # cache instead of triggering a live multi-site scan. Also runs once on
+    # startup so the first Home load after a deploy/restart is fast too.
+    sched.add_job(
+        refresh_dashboard_stats_cache,
+        "interval",
+        seconds=100,
+        id="refresh_dashboard_stats_cache",
+        next_run_time=datetime.now(),
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Recycle Bin: backfill Deleted By / reason for deletions this backend
+    # didn't capture directly — native SharePoint UI deletes, or a missed
+    # client-side log-deletion call (every 45 seconds; near-real-time for
+    # the live deletion popup without needing Graph webhook subscriptions).
+    sched.add_job(
+        reconcile_native_deletions,
+        "interval",
+        seconds=45,
+        id="reconcile_native_deletions",
+        next_run_time=datetime.now(),
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     sched.start()
     log.info(
-        "Scheduler started: precreate_next_month (daily) + session_sweep (15 min) "
-        "+ reconcile_pool (5 min)"
+        "Scheduler started: session_sweep (15 min) "
+        "+ reconcile_pool (5 min) + reconcile_vessel_folders (10 min) "
+        "+ refresh_dashboard_stats_cache (100 sec) "
+        "+ reconcile_native_deletions (45 sec) "
+        "+ ensure_template_month_folders (daily 00:20)"
     )
     return sched

@@ -5,6 +5,7 @@ request helpers. Tokens are cached by MSAL and refreshed automatically.
 """
 import asyncio
 import random
+import time
 
 import httpx
 import msal
@@ -13,8 +14,9 @@ from ..config import settings
 
 
 class GraphError(RuntimeError):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, retry_after: float | None = None):
         self.status = status
+        self.retry_after = retry_after
         super().__init__(f"Graph {status}: {message}")
 
 
@@ -27,6 +29,14 @@ class GraphClient:
             client_credential=self._cfg.graph_client_secret,
         )
         self._http: httpx.AsyncClient | None = None
+        # Set whenever Graph reports its per-app request quota is fully
+        # spent (SharePoint Embedded's `activityLimitReached`/`quota`
+        # throttle, with a retryAfterSeconds in the hundreds — distinct
+        # from the ordinary few-second burst 429 the retry loop below
+        # already handles). While now < this timestamp, every request
+        # fails immediately without touching the network, instead of
+        # adding more load to an app that is already fully throttled.
+        self._throttled_until: float = 0.0
 
     def _client(self) -> httpx.AsyncClient:
         # One pooled, keep-alive client reused across calls (avoids a new TLS
@@ -96,6 +106,26 @@ class GraphClient:
         access_token: str | None = None,
     ) -> httpx.Response:
         url = path if path.startswith("http") else f"{settings.graph_base_url}{path}"
+        # Hard guard: never touch the production NKSDocMan site outside prod.
+        from .guard import assert_allowed
+        assert_allowed(url, operation=f"graph {method}")
+
+        # The app's whole request quota may already be spent from a previous
+        # call (see _throttled_until below) — fail fast without hitting the
+        # network rather than adding another doomed request on top of an
+        # already-throttled app. This is what actually lets the throttle
+        # clear: without it, every folder click / vessel-filter change during
+        # the cooldown fired a fresh request (each itself retrying up to 6
+        # times), which is what kept re-triggering `activityLimitReached`.
+        now = time.monotonic()
+        if now < self._throttled_until:
+            remaining = self._throttled_until - now
+            raise GraphError(
+                429,
+                f"Microsoft Graph request quota exhausted for this app — retry in {remaining:.0f}s",
+                retry_after=remaining,
+            )
+
         # Graph can throttle a burst for longer than the usual short retry
         # window. Keep retries bounded, but give 429 responses enough time to
         # recover before surfacing the error to the API caller.
@@ -135,14 +165,54 @@ class GraphClient:
                 await asyncio.sleep(delay)
                 continue
             # SharePoint Embedded throttles bursts (429) / transient 503.
-            if resp.status_code in (429, 503) and attempt < 5:
-                retry_after = resp.headers.get("Retry-After")
+            if resp.status_code in (429, 503):
+                retry_after_hdr = resp.headers.get("Retry-After")
                 try:
-                    delay = min(float(retry_after), 30) if retry_after else min(2 ** attempt, 16)
+                    retry_after: float | None = float(retry_after_hdr) if retry_after_hdr else None
                 except (TypeError, ValueError):
-                    delay = min(2 ** attempt, 16)
-                await asyncio.sleep(delay + random.random())
-                continue
+                    retry_after = None
+
+                # Distinguish a short burst throttle (fine to retry inline,
+                # capped at 30s) from the app's whole request quota being
+                # exhausted — Graph's `activityLimitReached`/`quota` error,
+                # whose retryAfterSeconds runs into the hundreds. Retrying
+                # that inline (even capped at 30s) just spends more quota on
+                # a doomed attempt; the body also carries retryAfterSeconds
+                # even when no Retry-After header is present, so fall back to
+                # reading it from there.
+                is_quota_exhausted = bool(retry_after and retry_after > 30)
+                body_retry_after: float | None = None
+                if resp.status_code == 429:
+                    try:
+                        err = resp.json().get("error") or {}
+                        code = str(err.get("code", "")).lower()
+                        inner_code = str((err.get("innerError") or {}).get("code", "")).lower()
+                        if code == "activitylimitreached" or inner_code in ("quota", "throttledrequest"):
+                            is_quota_exhausted = True
+                        body_retry_raw = err.get("retryAfterSeconds")
+                        if body_retry_raw is not None:
+                            body_retry_after = float(body_retry_raw)
+                    except Exception:
+                        pass
+                if retry_after is None:
+                    retry_after = body_retry_after
+                if body_retry_after and body_retry_after > 30:
+                    is_quota_exhausted = True
+
+                if is_quota_exhausted:
+                    wait = min(retry_after, 300) if retry_after else 60.0
+                    self._throttled_until = time.monotonic() + wait
+                    raise GraphError(
+                        429,
+                        f"Microsoft Graph request quota exhausted for this app — "
+                        f"retry in {wait:.0f}s ({resp.text[:200]})",
+                        retry_after=wait,
+                    )
+
+                if attempt < 5:
+                    delay = min(retry_after, 30) if retry_after else min(2 ** attempt, 16)
+                    await asyncio.sleep(delay + random.random())
+                    continue
             break
         if resp.status_code >= 400:
             raise GraphError(resp.status_code, resp.text)
@@ -177,6 +247,8 @@ class GraphClient:
         If ``access_token`` is a delegated user token it is used as-is;
         otherwise the app acquires its own SP-scoped client-credentials token.
         """
+        from .guard import assert_allowed
+        assert_allowed(url, operation=f"sharepoint-rest {method}")
         token = access_token or self._sp_token()
         headers = {
             "Authorization": f"Bearer {token}",

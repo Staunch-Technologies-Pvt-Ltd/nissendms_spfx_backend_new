@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, File, Request, UploadFile, Form
+from fastapi import APIRouter, HTTPException, File, Header, Request, UploadFile, Form
 from pydantic import BaseModel, Field
 import requests
 import msal
@@ -587,6 +587,40 @@ def delete_email_log(log_id: int):
     global _IN_MEMORY_LOGS
     _IN_MEMORY_LOGS = [x for x in _IN_MEMORY_LOGS if x["id"] != log_id]
     return {"success": True, "message": f"Log #{log_id} removed."}
+
+
+@router.delete("/email-logs")
+@router.delete("/api/email-logs")
+def clear_all_email_logs(x_user_email: str | None = Header(default=None)):
+    """Purge every row of the AI Bento Email grid (Vessel / Tag / Subject /
+    Recipient / Status / Attached File) so it starts empty, ready for real
+    usage. Deletes data only — the email_log / email_attachment table
+    schemas, and every other endpoint on this router (send, resend,
+    tag suggestion, etc.), are untouched."""
+    if not x_user_email or x_user_email.strip().lower() not in settings.admin_email_set:
+        raise HTTPException(403, "Only an administrator can clear the AI Bento Email log.")
+
+    deleted = 0
+    db = _get_db_session()
+    if db:
+        try:
+            from .db.models import EmailLog, EmailAttachment
+            # Attachments first: email_attachment.email_log_id has no
+            # ON DELETE CASCADE at the DB level, and a bulk Query.delete()
+            # bypasses the ORM-level relationship cascade, so deleting
+            # EmailLog rows first would violate the foreign key.
+            db.query(EmailAttachment).delete(synchronize_session=False)
+            deleted = db.query(EmailLog).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+
+    global _IN_MEMORY_LOGS
+    in_memory_deleted = len(_IN_MEMORY_LOGS)
+    _IN_MEMORY_LOGS = []
+    total = deleted or in_memory_deleted
+    logger.info("AI Bento Email log cleared by %s (%s record(s) removed)", x_user_email, total)
+    return {"success": True, "message": f"Cleared {total} email log record(s).", "deleted": total}
 
 
 @router.get("/email-log/{log_id}")

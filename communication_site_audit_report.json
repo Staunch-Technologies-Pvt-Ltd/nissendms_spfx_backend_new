@@ -1,0 +1,52 @@
+{
+  "site_key": "dev",
+  "display_name": "Communication Site",
+  "drive_id": "b!QA8hXI6Jh0e9VrSce-NnCyVRkjL0R_NBlMiHPEsFO8Ibb7kfR_YkQJtcYD4uxLe3",
+  "folder_rows": [],
+  "vessels": [
+    {
+      "vessel_id": 232,
+      "name": "mvtest3",
+      "is_provisioned": true,
+      "provisioned_site_key": "dev",
+      "provisioned_site_ids": [
+        "dev"
+      ],
+      "vessel_folder_path": "mvtest3",
+      "created_at": "2026-09-21 15:35:31.869767"
+    },
+    {
+      "vessel_id": 235,
+      "name": "mvtest45678",
+      "is_provisioned": true,
+      "provisioned_site_key": "dev",
+      "provisioned_site_ids": [
+        "dev"
+      ],
+      "vessel_folder_path": "mvtest45678",
+      "created_at": "2026-09-21 16:51:31.312611"
+    },
+    {
+      "vessel_id": 236,
+      "name": "mvtest456788",
+      "is_provisioned": true,
+      "provisioned_site_key": "dev",
+      "provisioned_site_ids": [
+        "dev"
+      ],
+      "vessel_folder_path": "mvtest456788",
+      "created_at": "2026-09-21 17:50:01.624070"
+    },
+    {
+      "vessel_id": 126,
+      "name": "Dutches Emerald",
+      "is_provisioned": true,
+      "provisioned_site_key": null,
+      "provisioned_site_ids": [
+        "dev"
+      ],
+      "vessel_folder_path": null,
+      "created_at": "2026-08-29 14:01:19.058035"
+    }
+  ]
+}

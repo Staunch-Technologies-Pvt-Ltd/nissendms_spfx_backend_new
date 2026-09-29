@@ -1,0 +1,203 @@
+{
+  "template_id": "vessel_management",
+  "version": 1,
+  "_help": [
+    "Editable data for Settings > Vessel Settings > Folder Structure Mode.",
+    "root: folder under the library root that holds the main folders; '' = library root (where existing Technical & Crewing / Commercial & Chartering / Insurance folders live).",
+    "per_ship: created under <main>/<vessel name>/ for every vessel the mode is applied to.",
+    "common: created once under <main>/, shared by all vessels.",
+    "common_folder (optional): wrapper folder under <main>/ that holds the common folders; names follow the spec headings and the folders existing libraries already have. Remove the key to put common folders directly under <main>/.",
+    "A node is {name, children?, month_driven?}; a plain string is a leaf. month_driven folders get their children inside month folders created lazily (current month by the daily job, others on upload). Month folder names use the app's existing label (ocr/dates.py month_label, e.g. 'September 2026') so uploads and the job never create two folders for one month.",
+    "Names containing / \\\\ : * ? \" < > | are sanitised the same way as all other app folders (e.g. 'Flag / MPA' -> 'Flag - MPA').",
+    "Matching to existing folders is case-insensitive, ignores spaces/punctuation and treats '&', 'and' and nothing as equal."
+  ],
+  "root": "",
+  "main_folders": [
+    {
+      "name": "Technical & Crewing",
+      "common_folder": "Common for all ships",
+      "per_ship": [
+        {
+          "name": "Month End Reports",
+          "month_driven": true,
+          "children": [
+            "Main Engine",
+            "Aux Engine",
+            "Cooling Water",
+            "Inspection Reports",
+            "Defect Reports",
+            "Guarantee Claims",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Service Agreements",
+          "children": [
+            "Technical Management",
+            "Crew Management",
+            "Vendor & Service Provider",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Registration",
+          "children": [
+            "Flag & MPA",
+            "Ship Builder",
+            "Radio & Telecom",
+            "Crewing & SMOU",
+            "Novation",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Drawings and Manuals",
+          "children": [
+            "Drawing",
+            "Manual",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Incidents"
+        },
+        {
+          "name": "Crewing"
+        }
+      ],
+      "common": [
+        {
+          "name": "Vendor & Service Agreements",
+          "children": [
+            "Vendor & Service Provider Agreement",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Vendor Management",
+          "children": [
+            {
+              "name": "PO & Invoice",
+              "children": [
+                "Purchase Order",
+                "Vendor Invoice"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Commercial & Chartering",
+      "common_folder": "Common Agreements (Not Ship Specific)",
+      "per_ship": [
+        {
+          "name": "Agreements",
+          "children": [
+            "Charter Party",
+            "Pool Agreement",
+            "Commission Agreement",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Invoices & Payments",
+          "month_driven": true,
+          "children": [
+            "Invoice",
+            "Payments",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "Claims & Disputes",
+          "month_driven": true,
+          "children": [
+            "Disputes",
+            "Claims",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "To be Classified"
+        }
+      ],
+      "common": [
+        {
+          "name": "Agreements",
+          "children": [
+            "Charter Party",
+            "Pool Agreement",
+            "Commission Agreement",
+            "To be Classified"
+          ]
+        },
+        {
+          "name": "To be Classified"
+        }
+      ]
+    },
+    {
+      "name": "Insurance",
+      "common_folder": "Common (Not Ship Specific)",
+      "per_ship": [
+        {
+          "name": "P&I"
+        },
+        {
+          "name": "H&M"
+        },
+        {
+          "name": "War Risk"
+        },
+        {
+          "name": "Flag / MPA"
+        },
+        {
+          "name": "USA Related"
+        }
+      ],
+      "common": [
+        {
+          "name": "Agreements"
+        },
+        {
+          "name": "Miscellaneous"
+        }
+      ]
+    },
+    {
+      "name": "Kaizen – Knowledge Bank",
+      "per_ship": [],
+      "common": [
+        {
+          "name": "Class"
+        },
+        {
+          "name": "Flag / Port State"
+        },
+        {
+          "name": "Procedures and Work Instructions"
+        },
+        {
+          "name": "Lessons Learned"
+        },
+        {
+          "name": "Circulars and Guidance"
+        },
+        {
+          "name": "Equipment Maker"
+        },
+        {
+          "name": "SIRE/OCIMF/RightShip"
+        },
+        {
+          "name": "Shipyard"
+        },
+        {
+          "name": "Templates"
+        }
+      ]
+    }
+  ]
+}

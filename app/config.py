@@ -4,6 +4,8 @@ Single .env file holds all three environments (local / dev / prod).
 Set APP_ENV=local|dev|prod to activate the right block.
 Shared keys (no prefix) are always read directly.
 """
+import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -49,40 +51,257 @@ def _prefixed_int(prefix: str, key: str, raw: _RawEnv, default: int = 0) -> int:
         return default
 
 
-def compute_sp_site_url(site_key: str = "", site_name: str = "", base_url: str = "") -> str:
-    """Compute the correct SharePoint site collection URL for a logical site.
-    
-    Ensures secondary site collections (like NKSDocMan or NissenKaiunExternal)
-    are routed to their actual site paths (/sites/NKSDocMan) instead of the
-    tenant root Communication site.
+def _normalize_site_token(value: str | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+_SITE_REGISTRY_CACHE: dict[str, object] = {"data": None, "ts": 0.0}
+_SITE_REGISTRY_TTL_SECONDS = 30.0
+
+
+def _get_site_registry() -> dict[str, dict]:
+    """The live, config/env-driven site registry (see Settings.discover_
+    available_sites — one entry per configured .env prefix, e.g. LOCAL_*,
+    DEV_*, NKSDOCMAN_*, NISSENKAIUNEXTERNAL_*), short-TTL-cached so
+    site_alias_matches (called many times per request) doesn't re-read
+    .env and hit the DB on every comparison."""
+    now = time.time()
+    cached = _SITE_REGISTRY_CACHE["data"]
+    if cached is not None and (now - _SITE_REGISTRY_CACHE["ts"]) < _SITE_REGISTRY_TTL_SECONDS:
+        return cached  # type: ignore[return-value]
+    try:
+        sites = Settings.discover_available_sites()
+    except Exception:
+        sites = cached or {}
+    _SITE_REGISTRY_CACHE["data"] = sites
+    _SITE_REGISTRY_CACHE["ts"] = now
+    return sites  # type: ignore[return-value]
+
+
+def _resolve_configured_site_key(normalized_token: str) -> str | None:
+    """Resolve an already-normalized site token to the real, configured
+    site_key it identifies — using only the live site registry (env/config
+    + site_configurations DB rows), never a hardcoded list of site names.
+    Returns None if it doesn't match any currently configured site."""
+    if not normalized_token:
+        return None
+    try:
+        sites = _get_site_registry()
+    except Exception:
+        return None
+
+    # 1. Exact match on the configured site_key itself (the .env prefix,
+    # lowercased — e.g. "local", "dev", "nksdocman", "nissenkaiunexternal").
+    if normalized_token in sites:
+        return normalized_token
+
+    tokens = normalized_token.split()
+
+    # 2. The site_key appears as a whole word in the value (handles values
+    # like "Vessel DMS (dev)" -> normalized "vessel dms dev", which
+    # contains the configured site_key "dev" as a token).
+    for key in sites:
+        if key and key in tokens:
+            return key
+
+    # 3. Match against that site's own configured display name / SharePoint
+    # URL (handles a value recorded under its human label rather than its
+    # site_key, e.g. sp_site_name "Communication Site" or "NKSDocMan").
+    for key, info in sites.items():
+        for raw_candidate in (info.get("sp_site_name"), info.get("web_url"), info.get("name")):
+            candidate = _normalize_site_token(raw_candidate)
+            if candidate and (candidate == normalized_token or candidate in normalized_token or normalized_token in candidate):
+                return key
+
+    return None
+
+
+def site_alias_matches(site_a: str | None, site_b: str | None) -> bool:
+    """Treat two site references as the same site only when they resolve to
+    the same CONFIGURED site (see _resolve_configured_site_key) — driven
+    entirely by the live env/config site registry, never by a hardcoded
+    list of site-name synonyms in code. A value that happens to be
+    "local" is only the same site as "nksdocman" if the site registry
+    itself says so (e.g. both prefixes point at the same drive_id);
+    otherwise they are two distinct configured sites and must not be
+    merged, however similar their names look.
     """
-    base = (base_url or "https://nissenkaiunsingapore.sharepoint.com").strip().rstrip("/")
+    if site_a is None and site_b is None:
+        return True
+    if site_a is None or site_b is None:
+        return False
+
+    a_norm = _normalize_site_token(site_a)
+    b_norm = _normalize_site_token(site_b)
+    if not a_norm or not b_norm:
+        return a_norm == b_norm
+    if a_norm == b_norm:
+        return True
+
+    a_key = _resolve_configured_site_key(a_norm)
+    b_key = _resolve_configured_site_key(b_norm)
+    if not (a_key and b_key):
+        return False
+    if a_key == b_key:
+        return True
+    # Two configured site keys are the same site when the registry maps
+    # them to the same document library (drive_id) — e.g. an .env prefix
+    # and a site_configurations row describing the same SharePoint site.
+    try:
+        sites = _get_site_registry()
+    except Exception:
+        return False
+    a_drive = str((sites.get(a_key) or {}).get("drive_id") or "").strip()
+    b_drive = str((sites.get(b_key) or {}).get("drive_id") or "").strip()
+    return bool(a_drive and a_drive == b_drive)
+
+
+_ENV_SITE_URL_CACHE: dict[str, object] = {"data": None, "ts": 0.0}
+_SITE_CONFIG_ROWS_CACHE: dict[str, object] = {"data": None, "ts": 0.0}
+
+
+def _env_site_urls() -> dict[str, str]:
+    """{env prefix (lowercased): <PREFIX>_SHAREPOINT_SITE_URL} for every site
+    that sets one in .env, plus "" -> SHAREPOINT_TENANT_URL if defined.
+    Short-TTL cached (same window as the site registry)."""
+    now = time.time()
+    cached = _ENV_SITE_URL_CACHE["data"]
+    if cached is not None and (now - _ENV_SITE_URL_CACHE["ts"]) < _SITE_REGISTRY_TTL_SECONDS:
+        return cached  # type: ignore[return-value]
+    urls: dict[str, str] = {}
+    try:
+        raw = _RawEnv()
+        entries = dict(raw.__dict__)
+        entries.update(raw.model_extra or {})
+        for key, value in entries.items():
+            k = str(key).lower()
+            v = str(value or "").strip()
+            if not v or v.startswith("<"):
+                continue
+            if k.endswith("_sharepoint_site_url"):
+                urls[k[: -len("_sharepoint_site_url")]] = v.rstrip("/")
+            elif k == "sharepoint_tenant_url":
+                urls[""] = v.rstrip("/")
+    except Exception:
+        urls = cached or {}  # type: ignore[assignment]
+    _ENV_SITE_URL_CACHE["data"] = urls
+    _ENV_SITE_URL_CACHE["ts"] = now
+    return urls
+
+
+def _site_config_rows() -> list[dict]:
+    """site_configurations rows (site_key, site_name, display_name, drive_id),
+    short-TTL cached. [] if the DB isn't reachable."""
+    now = time.time()
+    cached = _SITE_CONFIG_ROWS_CACHE["data"]
+    if cached is not None and (now - _SITE_CONFIG_ROWS_CACHE["ts"]) < _SITE_REGISTRY_TTL_SECONDS:
+        return cached  # type: ignore[return-value]
+    rows: list[dict] = []
+    try:
+        from .db.base import engine
+        if engine:
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                rows = [
+                    dict(r) for r in conn.execute(
+                        text("SELECT site_key, site_name, display_name, drive_id FROM site_configurations")
+                    ).mappings().all()
+                ]
+    except Exception:
+        rows = cached or []  # type: ignore[assignment]
+    _SITE_CONFIG_ROWS_CACHE["data"] = rows
+    _SITE_CONFIG_ROWS_CACHE["ts"] = now
+    return rows
+
+
+def _url_origin(url: str | None) -> str:
+    from urllib.parse import urlparse
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def _url_has_site_path(url: str | None) -> bool:
+    from urllib.parse import urlparse
+    path = urlparse((url or "").strip()).path.lower()
+    return path.startswith("/sites/") or path.startswith("/teams/")
+
+
+def _is_generic_site_label(name: str | None, site_key: str | None) -> bool:
+    """True for the placeholder labels the app generates itself when no real
+    site name is configured (e.g. "Vessel DMS (local)") — not a site path."""
+    n = (name or "").strip().lower()
+    return not n or n == "vessel dms" or n == f"vessel dms ({(site_key or '').strip().lower()})"
+
+
+def compute_sp_site_url(site_key: str = "", site_name: str = "", base_url: str = "", drive_id: str = "") -> str:
+    """SharePoint site collection URL for a logical site — resolved only
+    from configuration (.env + the site_configurations table), never from
+    site names hardcoded in code. In priority order:
+
+    1. The site's own ``<SITE_KEY>_SHAREPOINT_SITE_URL`` from .env, when it
+       points at a site path (``/sites/...`` or ``/teams/...``).
+    2. When that .env URL is only the tenant root and ``drive_id`` is given:
+       a site_configurations row under a *different* site_key that uses the
+       same drive describes the same site — use its URL. (This is how
+       LOCAL_*, whose drive is NKSDocMan's, resolves to /sites/NKSDocMan.)
+    3. The site's own .env URL as-is (a tenant-root site, e.g. the
+       Communication site configured as DEV_SHAREPOINT_SITE_URL).
+    4. ``site_name`` itself if it's already a URL.
+    5. ``<tenant root>/sites/<site_name>`` using the name from config/DB.
+    6. The tenant root.
+
+    The tenant root comes from ``base_url``, the site's own .env URL, any
+    other ``*_SHAREPOINT_SITE_URL`` in .env, or ``SHAREPOINT_TENANT_URL``.
+    ``base_url`` is only ever used for its scheme+host (callers pass the
+    default site's URL there as a tenant hint).
+    """
     key_clean = (site_key or "").strip().lower()
-    name_clean = (site_name or "").strip().lower()
+    env_urls = _env_site_urls()
+    own_url = env_urls.get(key_clean, "") if key_clean else ""
 
-    # Root Communication site
-    if key_clean in ("dev", "communication", "root") and not any(k in name_clean for k in ("nks", "docman", "external")):
-        return base
-    if name_clean in ("communication site", "communication", "root"):
-        return base
+    tenant_root = (
+        _url_origin(base_url)
+        or _url_origin(own_url)
+        or next((_url_origin(u) for k, u in sorted(env_urls.items()) if _url_origin(u)), "")
+    )
 
-    # NKSDocMan site
-    if "nks" in key_clean or "docman" in key_clean or "nks" in name_clean or "docman" in name_clean or key_clean == "local":
-        return f"{base}/sites/NKSDocMan"
+    # 1. Explicit, full site URL configured for this site.
+    if own_url and _url_has_site_path(own_url):
+        return own_url
 
-    # External site
-    if "external" in key_clean or "external" in name_clean:
-        return f"{base}/sites/NissenKaiunExternal"
+    # 2. Same drive registered under another site_key in site_configurations.
+    drive_clean = (drive_id or "").strip()
+    if drive_clean:
+        for row in _site_config_rows():
+            row_key = (row.get("site_key") or "").strip().lower()
+            if not row_key or row_key == key_clean:
+                continue
+            if (row.get("drive_id") or "").strip() != drive_clean:
+                continue
+            row_name = row.get("site_name") or row.get("display_name") or ""
+            return compute_sp_site_url(row_key, row_name, tenant_root)
 
-    # If site_name or site_key starts with http, return it
-    if (site_name or "").startswith("http://") or (site_name or "").startswith("https://"):
-        return site_name
+    # 3. The site's own .env URL (tenant-root site).
+    if own_url:
+        return own_url
 
-    target = site_name.strip() if site_name and site_name.strip().lower() not in ("vessel dms", "") else site_key.strip()
-    if target and target.lower() not in ("dev", "communication site", "root", "default", "vessel dms"):
-        return f"{base}/sites/{target}"
+    # 4. site_name is already a URL.
+    name = (site_name or "").strip()
+    if name.lower().startswith(("http://", "https://")):
+        return name.rstrip("/")
 
-    return base
+    # 5. Named site collection under the tenant root.
+    if tenant_root and not _is_generic_site_label(name, key_clean):
+        return f"{tenant_root}/sites/{name}"
+
+    # 6. Tenant root.
+    return tenant_root
 
 
 class Settings:
@@ -310,7 +529,7 @@ class Settings:
                 "configured": is_configured,
                 "site_id": site_id,
                 "drive_id": drive_id,
-                "web_url": compute_sp_site_url(site_key, sp_site_name, configured_url),
+                "web_url": compute_sp_site_url(site_key, sp_site_name, configured_url, drive_id=drive_id),
             }
         
         # Enrich display names from DB SiteConfiguration table
@@ -349,6 +568,42 @@ class Settings:
         except Exception:
             pass
 
+        return sites
+
+    @staticmethod
+    def discover_visible_sites() -> dict[str, dict]:
+        """Like discover_available_sites(), minus any site an admin removed
+        or hid from Site Management (site_configurations.is_removed /
+        is_hidden).
+
+        discover_available_sites() re-derives .env-backed sites (LOCAL_*,
+        DEV_*, PROD_*, ...) on every call, so it can never "forget" one of
+        those — removal is recorded as a flag on the site_configurations
+        row instead (see DELETE /api/admin/site-configurations/{site_key}).
+        Any caller that lists sites for something an admin-facing screen —
+        the dashboard's counters/site table included — should call this
+        instead of discover_available_sites() directly, or a removed site
+        keeps showing up everywhere except Site Management.
+        """
+        sites = Settings.discover_available_sites()
+        try:
+            from .db.base import engine
+            if engine:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    rows = conn.execute(
+                        text(
+                            "SELECT site_key, COALESCE(is_hidden, FALSE) AS is_hidden, "
+                            "COALESCE(is_removed, FALSE) AS is_removed FROM site_configurations"
+                        )
+                    ).mappings().all()
+                    excluded = {
+                        (r["site_key"] or "").strip().lower()
+                        for r in rows if r["is_hidden"] or r["is_removed"]
+                    }
+                    sites = {k: v for k, v in sites.items() if k not in excluded}
+        except Exception:
+            pass
         return sites
 
     @staticmethod
@@ -485,7 +740,8 @@ class Settings:
         new_settings.sharepoint_site_url = compute_sp_site_url(
             site_name,
             new_settings.sp_site_name,
-            _prefixed(p, "SHAREPOINT_SITE_URL", raw, "")
+            _prefixed(p, "SHAREPOINT_SITE_URL", raw, ""),
+            drive_id=new_settings.drive_id,
         )
         
         # Cache it
@@ -494,60 +750,48 @@ class Settings:
         return new_settings
 
 
-# Per-session and global site override tracking
+# Per-session site override tracking.
+#
+# There used to also be a "global active site override" here that got
+# written to site_configurations.is_default_provisioning and re-read at
+# startup. It was mutated as a side effect of set_session_site() (see
+# below) and of the per-call provisioning tokens in site_provisioning.py,
+# so switching one user's viewed site — or provisioning one vessel to a
+# non-default site — silently reassigned the default provisioning site for
+# the entire app, for every other user, persisted across restarts. That
+# was the root cause of vessels/folders ending up provisioned against the
+# wrong site (Phase 1 Part A). It has been removed: the global default
+# provisioning site is now simply whatever ACTIVE_SITE is set to in .env
+# (see Settings.active_site). Changing the app-wide default requires
+# updating .env and restarting; there is no in-app action that changes it.
 _SESSION_SITE_OVERRIDES: dict[str, str] = {}
-_GLOBAL_ACTIVE_SITE_OVERRIDE: str | None = None
-_PERSISTED_SITE_INITIALIZED: bool = False
-
-
-def _init_persisted_active_site():
-    global _GLOBAL_ACTIVE_SITE_OVERRIDE, _PERSISTED_SITE_INITIALIZED
-    if _PERSISTED_SITE_INITIALIZED:
-        return
-    _PERSISTED_SITE_INITIALIZED = True
-    try:
-        from .db.base import engine
-        from sqlalchemy import text
-        if engine:
-            with engine.connect() as conn:
-                row = conn.execute(
-                    text("SELECT site_key FROM site_configurations WHERE is_default_provisioning = TRUE LIMIT 1")
-                ).mappings().first()
-                if row and row["site_key"]:
-                    _GLOBAL_ACTIVE_SITE_OVERRIDE = str(row["site_key"]).strip().lower()
-    except Exception:
-        pass
-
-
-def set_global_active_site(site_name: str):
-    """Set the global active site override across all sessions and persist to DB."""
-    global _GLOBAL_ACTIVE_SITE_OVERRIDE
-    clean_name = site_name.strip().lower()
-    _GLOBAL_ACTIVE_SITE_OVERRIDE = clean_name
-    try:
-        from .db.base import engine
-        from sqlalchemy import text
-        if engine:
-            with engine.connect() as conn:
-                conn.execute(
-                    text("UPDATE site_configurations SET is_default_provisioning = (LOWER(site_key) = :target OR LOWER(display_name) = :target)"),
-                    {"target": clean_name}
-                )
-                conn.commit()
-    except Exception:
-        pass
 
 
 def get_global_active_site() -> str | None:
-    _init_persisted_active_site()
-    return _GLOBAL_ACTIVE_SITE_OVERRIDE
+    """No global override exists anymore — the default site is always
+    whatever ACTIVE_SITE resolves to in .env. Kept as a function (rather
+    than inlining `None` at call sites) so get_session_site()'s fallback
+    reads clearly, and so a future admin-facing override has one place to
+    plug into if ever added deliberately."""
+    return None
 
 
 def set_session_site(session_id: str, site_name: str):
-    """Set the active site for a specific session."""
+    """Set the active site for a specific session only.
+
+    Deliberately does NOT touch the global/persisted default site. It used
+    to call set_global_active_site() here, which meant switching the site
+    for *one* session (or scoping *one* background provisioning call to a
+    site, via the synthetic tokens in site_provisioning.py) silently
+    reassigned the default provisioning site for the entire app — for every
+    other user and request, persisted to site_configurations in the DB —
+    and never got reverted. That is the root cause of vessels/folders
+    ending up provisioned against the wrong site. The global default is
+    now fixed at startup from ACTIVE_SITE (see Settings/_init_persisted_active_site);
+    changing it requires updating .env and restarting.
+    """
     clean_name = site_name.strip().lower()
     _SESSION_SITE_OVERRIDES[session_id] = clean_name
-    set_global_active_site(clean_name)
 
 
 def get_session_site(session_id: str | None) -> str | None:

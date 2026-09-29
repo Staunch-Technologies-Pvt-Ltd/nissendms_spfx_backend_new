@@ -32,8 +32,14 @@ class Vessel(Base):
     is_provisioned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Target SharePoint site keys/IDs provisioned for this vessel (multi-site support)
     provisioned_site_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
+    # User-selected SharePoint location for newly created vessels.
+    provisioned_site_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vessel_folder_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # Set when a vessel is restored from Recycle Bin and re-activated in DB.
     restored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Settings → Vessel Settings → Folder Structure Mode (services/folder_structure.py):
+    # empty_pool | full_template | adopt_existing | adopt_create. NULL = empty_pool.
+    folder_structure_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     folders: Mapped[list["Folder"]] = relationship(
@@ -186,8 +192,62 @@ class DeletedVessel(Base):
     vessel_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     original_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    site_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    site_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     deleted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     deleted_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+
+
+class DeletionLog(Base):
+    """Single source of truth for the 'who/what/where/when/why' of every
+    deletion (vessel, folder, or file), across all SharePoint sites this app
+    covers.
+
+    Populated two ways:
+    - source="app": written synchronously right after a successful delete —
+      either by RealBackend's own delete_vessel/delete_folder/delete_file
+      execution path, or (for the common case of a file/folder deleted
+      client-side straight against Graph from the SPFx web part) via the
+      POST /api/recycle-bin/log-deletion endpoint the frontend calls right
+      after the Graph delete succeeds.
+    - source="native_spo": backfilled by the reconcile_native_deletions
+      scheduler job for anything that shows up in SharePoint's own recycle
+      bin with no matching row here (e.g. deleted directly in SharePoint's
+      native UI, outside this app entirely). deleted_by_* is populated on a
+      best-effort basis from the SharePoint REST recycle bin API, which is
+      not always resolvable, so it may be NULL for these rows.
+
+    Both the enhanced Recycle Bin (Deleted By / Reason columns) and the live
+    deletion popup (top-header alert bell) read from this one table.
+    """
+
+    __tablename__ = "deletion_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drive_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    item_name: Mapped[str] = mapped_column(String(400))
+    # vessel / folder / file — what kind of node was deleted.
+    item_type: Mapped[str] = mapped_column(String(20), index=True)
+    # vessel / normal_folder / file — which Recycle Bin tab this belongs in,
+    # decided once at capture time via services.classify.classify_deletion()
+    # so it never depends on who's viewing or which path heuristic runs client-side.
+    classification: Mapped[str] = mapped_column(String(20), index=True)
+    original_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    vessel_name: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    category: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sub_category: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    site_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    site_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    deleted_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
+    deleted_by_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # app | native_spo — how this row was captured (see class docstring).
+    source: Mapped[str] = mapped_column(String(20), default="app")
+    deleted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    # Popup-dismissal bookkeeping for the alert bell, mirroring FolderAlert.
+    read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class UserProfile(Base):
@@ -223,8 +283,14 @@ class UserProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     photo_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
     date_of_joining: Mapped[date | None] = mapped_column(Date, nullable=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="User", server_default="User")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    permissions_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     folder_permissions: Mapped[list["FolderPermission"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    site_permissions: Mapped[list["UserSitePermission"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
     activity_logs: Mapped[list["ActivityLog"]] = relationship(
@@ -262,6 +328,25 @@ class FolderPermission(Base):
     permission_level: Mapped[str] = mapped_column(String(20))  # edit / view / approve
 
     user: Mapped["UserProfile"] = relationship(back_populates="folder_permissions")
+
+
+class UserSitePermission(Base):
+    __tablename__ = "user_site_permissions"
+    __table_args__ = (UniqueConstraint("user_email", "site_key", name="uq_user_site_permission"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_email: Mapped[str] = mapped_column(
+        String(320), ForeignKey("user_profiles.email", ondelete="CASCADE"), index=True
+    )
+    site_key: Mapped[str] = mapped_column(String(100), index=True)
+    can_view: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_upload: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    can_tag_on_upload: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    granted_by_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=datetime.utcnow)
+
+    user: Mapped["UserProfile"] = relationship(back_populates="site_permissions")
 
 
 class ActivityLog(Base):
@@ -683,8 +768,82 @@ class SiteConfiguration(Base):
     is_available_for_provisioning: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default_provisioning: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Permanently excludes this site_key from the Site Management list, even
+    # though it may be rediscovered every request from an .env config block
+    # (LOCAL_*/DEV_*/PROD_*). Unlike is_hidden, a removed site is not shown
+    # for "unhide" — there is intentionally no UI path back; a schema fix or
+    # direct DB edit is required to restore it.
+    is_removed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by_email: Mapped[str] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class AppSetting(Base):
+    """Small key/value store for app-wide admin settings, e.g. the default
+    Folder Structure Mode applied to newly created vessels."""
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class TagConfigItem(Base):
+    """Settings → Tag Configuration: one tag value at one level, per client.
+
+    Levels (optional-level hierarchy, parent must be a higher level):
+    domain > main_folder > group > category > sub_category.
+    Vessel Name is NOT stored here — it comes only from the Term Store.
+    site_key "__template__" holds the default template for new clients;
+    a client's own rows are created copy-on-write on its first change.
+    See services/tag_config.py.
+    """
+    __tablename__ = "tag_config_items"
+    __table_args__ = (
+        UniqueConstraint("site_key", "level", "parent_id", "name_key", name="uq_tag_config_sibling_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_key: Mapped[str] = mapped_column(String(100), index=True)
+    level: Mapped[str] = mapped_column(String(20), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    # lower/trimmed name — enforces "unique within the same parent".
+    name_key: Mapped[str] = mapped_column(String(128))
+    display_name: Mapped[str] = mapped_column(String(128))
+    folder_name: Mapped[str] = mapped_column(String(128))
+    code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tag_config_items.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(10), default="Active", index=True)  # Active/Inactive/Archived
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(10), default="Custom")  # Default/Custom/Imported
+    replaced_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Extra names that still resolve to this item (legacy spellings, old names after a rename).
+    aliases_json: Mapped[str] = mapped_column(Text, default="[]")
+    # Behaviour flags, e.g. {"path_mode": "vessel"} on domains.
+    attributes_json: Mapped[str] = mapped_column(Text, default="{}")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    modified_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    modified_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class TagConfigSnapshot(Base):
+    """Full copy of one client's tag configuration taken before every
+    Replace / Import / Reset / Restore, so the change can be rolled back."""
+    __tablename__ = "tag_config_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_key: Mapped[str] = mapped_column(String(100), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    changed_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    mode: Mapped[str] = mapped_column(String(10))  # Add/Replace/Import/Reset/Restore
+    level: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    snapshot_json: Mapped[str] = mapped_column(Text)

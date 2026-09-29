@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import quote, urlparse
 from typing import Any
 
 from ..config import settings, Settings, set_session_site, clear_session_site, get_active_drive_id
@@ -17,6 +18,175 @@ from ..db.base import SessionLocal
 from ..db import models
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_folder_path(path: str | None) -> str:
+    return "/".join(part.strip() for part in (path or "").replace("\\", "/").split("/") if part.strip())
+
+
+def _site_config_for_reference(reference: str) -> tuple[str, Settings]:
+    """Resolve either a configured site key or a tenant Graph site ID."""
+    key = (reference or "").strip().lower()
+    try:
+        return key, Settings.load_site_config(key)
+    except (KeyError, ValueError):
+        for candidate_key, info in Settings.discover_available_sites().items():
+            try:
+                config = Settings.load_site_config(candidate_key)
+            except (KeyError, ValueError):
+                continue
+            if str(getattr(config, "sp_site_id", "") or "").lower() == key or str(info.get("site_id", "")).lower() == key:
+                return candidate_key.lower(), config
+    raise ValueError(f"Unknown SharePoint site: {reference}")
+
+
+async def list_site_folders(site_key: str, path: str = "") -> dict[str, Any]:
+    """List immediate folders in a configured site's default document drive."""
+    if not (site_key or "").strip():
+        raise ValueError("site_key is required")
+    try:
+        key, config = _site_config_for_reference(site_key)
+        client = graph(site_name=key, site_config=config)
+        drive_id = config.drive_id
+
+        # Configuration can retain a drive ID from a previous library/site
+        # provisioning. Resolve the current document library before browsing,
+        # especially for Nissenkaiun External where the library was recreated.
+        site_id = getattr(config, "sp_site_id", "") or getattr(config, "site_id", "") or ""
+        if not site_id and getattr(config, "sharepoint_site_url", ""):
+            site_url = urlparse(str(config.sharepoint_site_url))
+            if site_url.hostname:
+                site_ref = f"{site_url.hostname}:{site_url.path.rstrip('/')}"
+                try:
+                    site_meta = await client.get(f"/sites/{quote(site_ref, safe='')}")
+                    site_id = site_meta.get("id", "")
+                except Exception as site_error:
+                    logger.warning("Could not resolve SharePoint site ID for %s: %s", key, site_error)
+        if site_id:
+            try:
+                drives = await client.get(f"/sites/{quote(site_id, safe='')}/drives?$select=id,name,driveType")
+                document_drives = [
+                    item for item in drives.get("value", [])
+                    if item.get("id") and (
+                        item.get("driveType") == "documentLibrary"
+                        or str(item.get("name", "")).strip().lower() in {"documents", "shared documents"}
+                    )
+                ]
+                preferred = next(
+                    (item for item in document_drives
+                     if str(item.get("name", "")).strip().lower() in {"documents", "shared documents"}),
+                    None,
+                )
+                configured = next((item for item in document_drives if item.get("id") == drive_id), None)
+                if preferred is not None:
+                    drive_id = preferred["id"]
+                elif configured is None and document_drives:
+                    drive_id = document_drives[0]["id"]
+            except Exception as drive_error:
+                logger.warning("Could not refresh document drive for site %s: %s", key, drive_error)
+    except ValueError:
+        key = site_key.strip()
+        client = graph()
+        drives = await client.get(f"/sites/{quote(key, safe='')}/drives?$select=id,name,driveType")
+        drive = next((item for item in drives.get("value", []) if item.get("driveType") == "documentLibrary" or item.get("name", "").lower() == "documents"), None)
+        drive_id = drive.get("id") if drive else None
+    if not drive_id:
+        raise ValueError(f"No document library is configured for site '{key}'")
+    clean_path = _clean_folder_path(path)
+    if clean_path:
+        item = await client.get(f"/drives/{drive_id}/root:/{quote(clean_path, safe='/')}?$select=id,name,folder,parentReference")
+        parent_id = item["id"]
+    else:
+        root = await client.get(f"/drives/{drive_id}/root?$select=id,name,folder")
+        parent_id = root["id"]
+    children = await client.get(
+        f"/drives/{drive_id}/items/{parent_id}/children"
+        "?$top=200&$select=id,name,folder,parentReference"
+    )
+    folders = [
+        {
+            "id": child["id"],
+            "name": child["name"],
+            "path": f"{clean_path}/{child['name']}".strip("/"),
+        }
+        for child in children.get("value", [])
+        if child.get("id") and child.get("folder") is not None
+    ]
+    return {"site_key": key, "drive_id": drive_id, "path": clean_path, "folders": folders}
+
+
+async def create_vessel_at_path(
+    site_key: str,
+    parent_path: str,
+    vessel_name: str,
+    subfolders: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create or reuse a vessel folder and custom child folders in one site."""
+    try:
+        key, config = _site_config_for_reference(site_key)
+        client = graph(site_name=key, site_config=config)
+        drive_id = config.drive_id
+    except ValueError:
+        key = site_key.strip()
+        client = graph()
+        drives = await client.get(f"/sites/{quote(key, safe='')}/drives?$select=id,name,driveType")
+        drive = next((item for item in drives.get("value", []) if item.get("driveType") == "documentLibrary" or item.get("name", "").lower() == "documents"), None)
+        drive_id = drive.get("id") if drive else None
+    if not drive_id:
+        raise ValueError(f"No document library is configured for site '{key}'")
+
+    async def ensure_child(current_id: str, name: str) -> dict[str, Any]:
+        safe_name = " ".join((name or "").strip().split())
+        if not safe_name or any(ch in safe_name for ch in '~"#%&*:<>?/\\{|}'):
+            raise ValueError(f"Invalid SharePoint folder name: {name!r}")
+        listing = await client.get(f"/drives/{drive_id}/items/{current_id}/children?$top=200&$select=id,name,folder")
+        existing = next((x for x in listing.get("value", []) if x.get("folder") is not None and x.get("name", "").casefold() == safe_name.casefold()), None)
+        if existing:
+            return existing
+        return await client.post(
+            f"/drives/{drive_id}/items/{current_id}/children",
+            json={"name": safe_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+        )
+
+    async def ensure_path(parent_relative: str) -> str:
+        clean_parent = _clean_folder_path(parent_relative)
+        if not clean_parent:
+            root = await client.get(f"/drives/{drive_id}/root?$select=id,name,folder")
+            return root["id"]
+
+        current_id = (await client.get(f"/drives/{drive_id}/root?$select=id,name,folder"))["id"]
+        for segment in clean_parent.split("/"):
+            current_id = (await ensure_child(current_id, segment))["id"]
+        return current_id
+
+    parent = _clean_folder_path(parent_path)
+    parent_id = await ensure_path(parent)
+    vessel_folder = await ensure_child(parent_id, vessel_name)
+    created_subfolders: list[str] = []
+    for raw_name in subfolders or []:
+        path_parts = [
+            " ".join(part.strip().split())
+            for part in (raw_name or "").replace("\\", "/").split("/")
+            if part.strip()
+        ]
+        if not path_parts:
+            raise ValueError(f"Invalid SharePoint folder name: {raw_name!r}")
+
+        current_id = vessel_folder["id"]
+        created_parts: list[str] = []
+        for part in path_parts:
+            child = await ensure_child(current_id, part)
+            current_id = child["id"]
+            created_parts.append(child["name"])
+        created_subfolders.append("/".join(created_parts))
+    full_path = "/".join(part for part in (parent, vessel_folder["name"]) if part)
+    return {
+        "site_key": key,
+        "drive_id": drive_id,
+        "vessel_folder_id": vessel_folder["id"],
+        "vessel_folder_path": full_path,
+        "subfolders": created_subfolders,
+    }
 
 
 def sanitize_name(name: str) -> str:
@@ -167,7 +337,8 @@ async def _provision_subtree_for_drive(
                 cached_map: dict[str, str] = {
                     row.path: row.drive_item_id
                     for row in db.query(models.Folder).filter(
-                        models.Folder.path.in_(all_paths)
+                        models.Folder.path.in_(all_paths),
+                        models.Folder.site_id == drive_id,
                     ).all()
                 }
             item_id_map.update(cached_map)
@@ -198,12 +369,12 @@ async def _provision_subtree_for_drive(
             if is_active_site and rows:
                 with SessionLocal() as db:
                     for path, name, kind, item_id, is_md in rows:
-                        row = db.query(models.Folder).filter_by(path=path).one_or_none()
+                        row = db.query(models.Folder).filter_by(path=path, site_id=drive_id).one_or_none()
                         if row is None:
                             row = models.Folder(
                                 path=path, name=name, kind=kind,
                                 drive_item_id=item_id, month_driven=is_md,
-                                vessel_id=vessel_id,
+                                vessel_id=vessel_id, site_id=drive_id,
                             )
                             db.add(row)
                         else:
@@ -231,15 +402,22 @@ async def provision_vessel_to_drive(
     site_key: str,
     is_active_site: bool = False,
 ) -> dict[str, Any]:
-    """Idempotently provisions the entire DMS folder hierarchy for a vessel on a specific drive.
+    """Idempotently provisions a vessel's folder on a specific drive.
 
-    Creates:
-      1. Main department folders: Technical & Crewing, Commercial & Chartering, Insurance
-      2. Vessel root folder under each main folder
-      3. Full template subtrees under each vessel root
-      4. FLAT_MAIN_FOLDERS (e.g. "Kaizen - Knowledge Bank") at the drive root with their
-         FLAT_TEMPLATE sub-trees — these are global/shared and not vessel-specific, but are
-         ensured on every provisioning call so the folder always exists on every site.
+    Part C (2026-09-21): this no longer creates the MAIN_FOLDERS/department
+    subtree at all. A vessel is a single flat root folder at the drive
+    root, with no automatic internal structure — no main-department
+    nesting, no SHIP_TEMPLATE subtree. Any subfolder structure a vessel
+    needs is created manually afterward (Phase 3's folder creation flow),
+    not auto-built here. This is what this function does now:
+
+      1. Ensure one root folder named `vessel_name` directly at the
+         drive's root.
+      2. Cache that folder's Folder row (site-scoped) when provisioning
+         the site currently being written to.
+
+    No root folders (e.g. "Kaizen - Knowledge Bank" or the department
+    folders) are auto-created anywhere; ensure_base_structure() is a no-op.
 
     Returns:
       {"site": site_key, "success": True, "error": None} or {"site": site_key, "success": False, "error": str}
@@ -249,86 +427,25 @@ async def provision_vessel_to_drive(
     set_session_site(provision_context, site_key)
     try:
         root_id = await gd.get_root_item_id(drive_id)
-        mains_to_provision = [
-            m for m in template.MAIN_FOLDERS
-            if m not in template.FLAT_MAIN_FOLDERS
-        ]
 
-        for main in mains_to_provision:
-            # 1. Ensure main folder
-            main_folder = await gd.ensure_folder(drive_id, root_id, main)
-            main_id = main_folder["id"]
+        vessel_folder = await gd.ensure_folder(drive_id, root_id, vessel_name)
+        vessel_folder_id = vessel_folder["id"]
 
-            if is_active_site:
-                with SessionLocal() as db:
-                    main_row = db.query(models.Folder).filter_by(path=main).one_or_none()
-                    if main_row is None:
-                        main_row = models.Folder(
-                            path=main, name=main, kind="main",
-                            drive_item_id=main_id, month_driven=False,
-                        )
-                        db.add(main_row)
-                        db.commit()
-
-            # 2. Ensure ship root folder: {main}/{vessel_name}
-            ship_folder = await gd.ensure_folder(drive_id, main_id, vessel_name)
-            ship_id = ship_folder["id"]
-            ship_root_path = f"{main}/{vessel_name}"
-
-            if is_active_site:
-                with SessionLocal() as db:
-                    ship_row = db.query(models.Folder).filter_by(path=ship_root_path).one_or_none()
-                    if ship_row is None:
-                        ship_row = models.Folder(
-                            path=ship_root_path, name=vessel_name, kind="ship",
-                            drive_item_id=ship_id, month_driven=False,
-                            vessel_id=vessel_id,
-                        )
-                        db.add(ship_row)
-                        db.commit()
-
-            # 3. Ensure subtrees
-            sub_specs = template.SHIP_TEMPLATE.get(main, [])
-            if sub_specs:
-                await _provision_subtree_for_drive(
-                    drive_id, ship_id, ship_root_path, sub_specs,
-                    is_active_site=True, vessel_id=vessel_id,
-                )
-
-        # 4. Ensure FLAT_MAIN_FOLDERS (e.g. "Kaizen - Knowledge Bank") at drive root.
-        #    These are global/shared folders — not vessel-specific — but they must be
-        #    provisioned on every site so the folder exists even if no script ran it before.
-        for flat_main in template.FLAT_MAIN_FOLDERS:
-            try:
-                flat_folder = await gd.ensure_folder(drive_id, root_id, flat_main)
-                flat_id = flat_folder["id"]
-                logger.info("Ensured flat folder '%s' (id=%s) on drive %s", flat_main, flat_id, drive_id)
-
-                if is_active_site:
-                    with SessionLocal() as db:
-                        flat_row = db.query(models.Folder).filter_by(path=flat_main).one_or_none()
-                        if flat_row is None:
-                            flat_row = models.Folder(
-                                path=flat_main, name=flat_main, kind="main",
-                                drive_item_id=flat_id, month_driven=False,
-                                vessel_id=None,  # global — not vessel-specific
-                            )
-                            db.add(flat_row)
-                            db.commit()
-
-                # Provision the flat subtree (e.g. Kaizen sub-folders)
-                flat_specs = template.FLAT_TEMPLATE.get(flat_main, [])
-                if flat_specs:
-                    await _provision_subtree_for_drive(
-                        drive_id, flat_id, flat_main, flat_specs,
-                        is_active_site=is_active_site, vessel_id=None,
+        if is_active_site:
+            with SessionLocal() as db:
+                row = db.query(models.Folder).filter_by(path=vessel_name, site_id=drive_id).one_or_none()
+                if row is None:
+                    row = models.Folder(
+                        path=vessel_name, name=vessel_name, kind="ship",
+                        drive_item_id=vessel_folder_id, month_driven=False,
+                        vessel_id=vessel_id, site_id=drive_id,
                     )
-            except Exception as flat_err:
-                # Non-fatal: log and continue — vessel folders are more important
-                logger.warning(
-                    "Could not ensure flat folder '%s' on drive %s: %s",
-                    flat_main, drive_id, flat_err,
-                )
+                    db.add(row)
+                    db.commit()
+                elif row.drive_item_id != vessel_folder_id or row.vessel_id != vessel_id:
+                    row.drive_item_id = vessel_folder_id
+                    row.vessel_id = vessel_id
+                    db.commit()
 
         return {"site": site_key, "success": True, "error": None}
     except Exception as e:
@@ -387,6 +504,15 @@ async def provision_vessel_multi_site(
         for s_key in sites_to_attempt:
             try:
                 resolved_key, drive_id, disp_name = await resolve_site_drive(s_key, db=db)
+                # NOTE: `is_active_site` here does NOT mean "this is
+                # settings.active_site" (that used to matter when Folder
+                # rows weren't scoped by site_id and only the one active
+                # drive's cache was safe to write). Now that every Folder
+                # write/lookup in provision_vessel_to_drive is scoped by
+                # site_id=drive_id, it's always correct to persist the
+                # folders-table cache for whichever site we're actually
+                # provisioning — so this is intentionally always True, not
+                # `is_active` (kept below for logging/clarity only).
                 is_active = (resolved_key == active_site)
                 tasks.append(provision_vessel_to_drive(
                     vessel_name=vessel_name,

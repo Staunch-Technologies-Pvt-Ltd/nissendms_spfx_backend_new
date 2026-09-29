@@ -1,0 +1,811 @@
+[
+  {
+    "vessel_id": 232,
+    "vessel_name": "mvtest3",
+    "provisioned_site_key": "dev",
+    "provisioned_site_ids": [
+      "dev"
+    ],
+    "vessel_folder_path": "mvtest3",
+    "expected_sites_resolved": {
+      "dev": "b!QA8hXI6Jh0e9VrSce-NnCyVRkjL0R_NBlMiHPEsFO8Ibb7kfR_YkQJtcYD4uxLe3"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 122,
+    "vessel_name": "Bow Fraternity",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3916,
+        "path": "Technical and Crewing  New/Bow Fraternity",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQGPRK4LIL4OVJBLLINCBRUXCNLD",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3960,
+        "path": "Technical/Bow Fraternity",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQBLB26M2KQOAFAZ2W4LS7GXFY4U",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 234,
+    "vessel_name": "mv test2456",
+    "provisioned_site_key": "nissenkaiunexternal",
+    "provisioned_site_ids": [
+      "nissenkaiunexternal"
+    ],
+    "vessel_folder_path": "Technical & Crewing/mv test2456",
+    "expected_sites_resolved": {
+      "nissenkaiunexternal": "b!2kAz1Z94nkOLQA51V1GEwHVmRWuZzfJJjifJW5KVuSUbxMTRmwfrTb76eOd2LAZa"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 235,
+    "vessel_name": "mvtest45678",
+    "provisioned_site_key": "dev",
+    "provisioned_site_ids": [
+      "dev"
+    ],
+    "vessel_folder_path": "mvtest45678",
+    "expected_sites_resolved": {
+      "dev": "b!QA8hXI6Jh0e9VrSce-NnCyVRkjL0R_NBlMiHPEsFO8Ibb7kfR_YkQJtcYD4uxLe3"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 236,
+    "vessel_name": "mvtest456788",
+    "provisioned_site_key": "dev",
+    "provisioned_site_ids": [
+      "dev"
+    ],
+    "vessel_folder_path": "mvtest456788",
+    "expected_sites_resolved": {
+      "dev": "b!QA8hXI6Jh0e9VrSce-NnCyVRkjL0R_NBlMiHPEsFO8Ibb7kfR_YkQJtcYD4uxLe3"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 123,
+    "vessel_name": "Cameroun Express",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3917,
+        "path": "Technical and Crewing  New/Cameroun Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFYNMCBT3CE75BZWDQ43QNZ2PZ5",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3961,
+        "path": "Technical/Cameroun Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQANYADN6QG52BDLOU57M7OKYNGV",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 124,
+    "vessel_name": "Cecilie F",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3918,
+        "path": "Technical and Crewing  New/Cecilie F",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFTHZQ7UX6ZGJGZ7NBTXPORZCKN",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3962,
+        "path": "Technical/Cecilie F",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQD6N3TASIPW25GY3463JQMCL7PU",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 125,
+    "vessel_name": "Cote D Ivoire Express",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 1,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3919,
+        "path": "Technical and Crewing  New/Cote D Ivoire Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQD4FA4YTSJXHVHLJEYF7YGHVHUB",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 127,
+    "vessel_name": "Ghana Express",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3922,
+        "path": "Technical and Crewing  New/Ghana Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQHHIJ5T5RXM4VDI4PXT6QJBPYEY",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3964,
+        "path": "Technical/Ghana Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFZ7OTH6BVDAFA2I5SGOPXCSWZL",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 126,
+    "vessel_name": "Dutches Emerald",
+    "provisioned_site_key": null,
+    "provisioned_site_ids": [
+      "dev"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "dev": "b!QA8hXI6Jh0e9VrSce-NnCyVRkjL0R_NBlMiHPEsFO8Ibb7kfR_YkQJtcYD4uxLe3"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 128,
+    "vessel_name": "Lignum Grid",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3923,
+        "path": "Technical and Crewing  New/Lignum Grid",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQF4IBXSEWL4WJBKZDLPTI3ANJPS",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3965,
+        "path": "Technical/Lignum Grid",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQDFJP4VAP2P4BAI4PH6SN2AWL2B",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 129,
+    "vessel_name": "Lignum Mesh",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3924,
+        "path": "Technical and Crewing  New/Lignum Mesh",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFX676DGGH475GKNEAIRHLRQ2WT",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3966,
+        "path": "Technical/Lignum Mesh",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQA4U4LRTLYOYVAY4UEB7UVB2RYR",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 130,
+    "vessel_name": "Lignum Web",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3925,
+        "path": "Technical and Crewing  New/Lignum Web",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQHMM2E6LIGU6JB2FTOBELDAUXSO",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3967,
+        "path": "Technical/Lignum Web",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQC4L5L4Q6Z2FJDJYJV4UZ3CNCJF",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 132,
+    "vessel_name": "Maersk Ferrato",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3926,
+        "path": "Technical and Crewing  New/Maersk Ferrato",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQEFX3UY4AAJ45CZHD2UH35FN3OX",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3970,
+        "path": "Technical/Maersk Ferrato",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFR5GCILSNH7ZDJR3UDA3KSAJQK",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 133,
+    "vessel_name": "Maersk Finisterre",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3927,
+        "path": "Technical and Crewing  New/Maersk Finisterre",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQHPX5V42EFXQZEI5LHD7ND2S3UB",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3971,
+        "path": "Technical/Maersk Finisterre",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQABABL7HY6AU5FIWQQXAPFOFWAS",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 134,
+    "vessel_name": "Maersk Frio",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3928,
+        "path": "Technical and Crewing  New/Maersk Frio",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQEY7ERFRFAKS5C3RL5UNOO7PJKE",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3972,
+        "path": "Technical/Maersk Frio",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFZ3FGZLQHCLJHJK6EA5S3DUCWW",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 135,
+    "vessel_name": "Norse Evolution",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3929,
+        "path": "Technical and Crewing  New/Norse Evolution",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQCYNHBTPSUX3RGKJESLH5UJKPZE",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3973,
+        "path": "Technical/Norse Evolution",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQCSWK6J3EPA6BDLD2J6AMVHOFG4",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 136,
+    "vessel_name": "Norse Ijmuiden",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3930,
+        "path": "Technical and Crewing  New/Norse Ijmuiden",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQAUCACL65T7TFH2USIZP6ZSCAUH",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3974,
+        "path": "Technical/Norse Ijmuiden",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFBOFUCJMHRVRHJ6EDQSC33A57F",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 156,
+    "vessel_name": "Bow Fighter",
+    "provisioned_site_key": null,
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 157,
+    "vessel_name": "Belle Lune",
+    "provisioned_site_key": null,
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "no_cached_folder_rows",
+    "mismatched_folders": []
+  },
+  {
+    "vessel_id": 137,
+    "vessel_name": "Norse New Haven",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3931,
+        "path": "Technical and Crewing  New/Norse New Haven",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQAW7FOARJD4O5DY2QWWR47COP4K",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3975,
+        "path": "Technical/Norse New Haven",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQBTDIBIIUCJCFF3LYDCOTZRUER7",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 138,
+    "vessel_name": "Peissy",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3932,
+        "path": "Technical and Crewing  New/Peissy",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFVE4GIJQPM7JAIEBTPXUXFBFNC",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3976,
+        "path": "Technical/Peissy",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQBLVHU22P6CNNAJL4RJB5RCVCQT",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 139,
+    "vessel_name": "Potiniere",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3933,
+        "path": "Technical and Crewing  New/Potiniere",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQG4V37LPJSXJVCKLTF4CUAVHRWD",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3977,
+        "path": "Technical/Potiniere",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQELMP3XVIWEXVCLLUEFDL25KQ3D",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 140,
+    "vessel_name": "Senegal Express",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3934,
+        "path": "Technical and Crewing  New/Senegal Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQBXP6RNEVRPERF3EJLWN4N322DS",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3978,
+        "path": "Technical/Senegal Express",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQD3ZY3UICHACVGZ2PJ7ZG56VEN4",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 141,
+    "vessel_name": "Snow Flake",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3935,
+        "path": "Technical and Crewing  New/Snow Flake",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQDFNMLE76WR3VFIIYRXBMBHRMT2",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3979,
+        "path": "Technical/Snow Flake",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQE5VVA6RZYHZNCKKOFIYIRAVWB7",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 142,
+    "vessel_name": "Snow Flower",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 2,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3936,
+        "path": "Technical and Crewing  New/Snow Flower",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQFZ6X3AX2X4NZHLED7DKCWXMB2Q",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      },
+      {
+        "folder_id": 3980,
+        "path": "Technical/Snow Flower",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQBZQNDX6M3LVFDJYLGVGHKN2COD",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 143,
+    "vessel_name": "Maersk EI Banco",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 1,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3968,
+        "path": "Technical/Maersk EI Banco",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQDR2GBVHCJ34FF3PED4SOAFAZI7",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  },
+  {
+    "vessel_id": 145,
+    "vessel_name": "Maersk EI Palomar",
+    "provisioned_site_key": "local",
+    "provisioned_site_ids": [
+      "local"
+    ],
+    "vessel_folder_path": null,
+    "expected_sites_resolved": {
+      "local": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6"
+    },
+    "issue": "unlinked_folder_rows_found",
+    "mismatched_folder_count": 0,
+    "mismatched_folders": [],
+    "mismatched_folders_truncated": false,
+    "unlinked_name_matches_count": 1,
+    "unlinked_name_matches": [
+      {
+        "folder_id": 3969,
+        "path": "Technical/Maersk EI Palomar",
+        "kind": "folder",
+        "drive_item_id": "01YT4WOQAFRGX2ZTMIL5F3SMPZA7LZAUEJ",
+        "recorded_site_id": "b!WuaIhr-a_0a8LGKk82VFgKv5vXNWCPRCvnuPs47m0syp-036YAAqTJgqFa1KFmH6",
+        "linked_via": "NOT LINKED (matched by path only)"
+      }
+    ]
+  }
+]

@@ -63,8 +63,8 @@ async def _resolve_drive_folder_id(
         current_id = str(match['id'])
     return current_id
 
-def invalidate_folder_caches(folder_id: str = None):
-    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE, _FOLDER_RECURSIVE_COUNTS_CACHE, _FOLDER_PARENT_MAP, _FOLDER_CHILDREN_TAGS_CACHE
+def invalidate_folder_caches(folder_id: str = None, drive_id: str = None):
+    global _FLAT_TREE_CACHE, _FOLDER_CHILDREN_CACHE, _LIVE_SPO_FILES_CACHE, _FOLDER_RECURSIVE_COUNTS_CACHE, _FOLDER_PARENT_MAP, _FOLDER_CHILDREN_TAGS_CACHE, _RECURSIVE_TREE_CACHE
     _FLAT_TREE_CACHE = {"data": None, "timestamp": 0, "drive_id": None}
     _LIVE_SPO_FILES_CACHE = {"data": {}, "timestamp": 0, "drive_id": None}
     if folder_id:
@@ -87,6 +87,20 @@ def invalidate_folder_caches(folder_id: str = None):
         _FOLDER_CHILDREN_CACHE.clear()
         _FOLDER_RECURSIVE_COUNTS_CACHE.clear()
         _FOLDER_CHILDREN_TAGS_CACHE.clear()
+
+    # site_folder_recursive_tree() below caches the whole-drive recursive
+    # walk that backs the Documents module's live folder tree (and its
+    # Group/Category folder search) for CACHE_TTL_RECURSIVE_TREE — 10
+    # minutes — keyed by drive_id and completely separate from the caches
+    # above. Without this, a folder created elsewhere (e.g. vessel
+    # creation, which doesn't go through the manual create-folder endpoint
+    # that normally triggers this function) stayed invisible in Documents
+    # for up to 10 minutes even after everything above was cleared.
+    if drive_id:
+        for key in [k for k in _RECURSIVE_TREE_CACHE if k.startswith(f"{drive_id}:")]:
+            _RECURSIVE_TREE_CACHE.pop(key, None)
+    elif not folder_id:
+        _RECURSIVE_TREE_CACHE.clear()
 
 # -*- coding: utf-8 -*-
 """FastAPI entry point for the Vessel DMS.
@@ -116,10 +130,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .config import settings
+from .config import settings, site_alias_matches
 from .db import models as db_models
 from .graph import drive as gd
 from .graph.client import GraphError, graph
+from .graph.guard import protected_read_endpoint
 from .graph.http import verify as graph_tls_verify
 from .services import backend_mode, get_backend
 from .services.errors import BadRequest, Conflict, NotFound, InternalServerError
@@ -355,11 +370,28 @@ def _norm_dept(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _tag_view():
+    """Settings → Tag Configuration for the request's site (cached)."""
+    from .services import tag_config
+    return tag_config.get_view()
+
+
+def _default_department() -> str:
+    """Fallback domain when none can be derived (was hard-coded
+    "Technical & Crewing"): first Active domain of the configuration."""
+    return _tag_view().default_domain()
+
+
+def _match_department(segment: str | None) -> bool:
+    """True when a path segment is a configured Domain or one of its aliases."""
+    return _tag_view().match_domain(segment) is not None
+
+
 def _extract_department_from_path(path: str | None) -> str | None:
     """Infer DMS main department from a breadcrumb/path string."""
     if not path:
         return None
-    known = [m for m in template.ALL_MAIN_FOLDERS if isinstance(m, str)]
+    known = _tag_view().domain_names(active_only=False)
     parts = [p.strip() for p in str(path).replace('>', '/').split('/') if p.strip()]
     for part in parts:
         for dept in known:
@@ -375,7 +407,7 @@ def _force_path_department(resolved_path: str, department: str | None) -> str:
     dept = (department or "").strip()
     if not dept:
         return resolved_path
-    known = [m for m in template.ALL_MAIN_FOLDERS if isinstance(m, str)]
+    known = _tag_view().domain_names(active_only=False)
     parts = [p.strip() for p in resolved_path.split('/') if p.strip()]
     if not parts:
         return dept
@@ -495,16 +527,17 @@ def _safe_tag_value(value: Any) -> str:
 
 
 def _taxonomy_maps() -> tuple[set[str], set[str], dict[str, set[str]], set[str]]:
-    from .ocr.drawing_category import DRAWING_TAXONOMY, MANUAL_TAXONOMY
-
-    drawing_categories = {k.lower() for k in DRAWING_TAXONOMY.keys()}
-    manual_categories = {k.lower() for k in MANUAL_TAXONOMY.keys()} | {"to be classified"}
+    """Group/Category/Sub Category vocabulary from Tag Configuration
+    (incl. inactive items, so tags already on documents still validate)."""
+    view = _tag_view()
+    cats_by_group = view.categories_by_group()
+    drawing_categories = set(cats_by_group.get(view.group_for_value("drawings"), set()))
+    manual_categories = set(cats_by_group.get(view.group_for_value("manuals"), set())) | {"to be classified"}
 
     allowed_sub_by_category: dict[str, set[str]] = {}
-    for cat_name, leaves in DRAWING_TAXONOMY.items():
-        allowed_sub_by_category[cat_name.lower()] = {leaf.lower() for leaf in leaves.keys()}
-    for cat_name, leaves in MANUAL_TAXONOMY.items():
-        allowed_sub_by_category[cat_name.lower()] = {leaf.lower() for leaf in leaves.keys()}
+    for cat in view.items("category"):
+        subs = {c["name"].lower() for c in view.descendants(cat, "sub_category")}
+        allowed_sub_by_category.setdefault(cat["name"].lower(), set()).update(subs)
     allowed_sub_by_category.setdefault("to be classified", {"to be classified"})
 
     all_subcategories: set[str] = set()
@@ -520,25 +553,17 @@ def _normalize_metadata_group(raw_group: str, category: str = "") -> str:
 
     # 'To be Classified' is intentionally ambiguous; preserve explicit OCR group
     # when available, otherwise default to Manuals downstream.
+    view = _tag_view()
+    group_keys = view.group_value_keys()
     if c == "to be classified":
-        if g in {"drawing", "drawings"}:
-            return "Drawings"
-        if g in {"manual", "manuals"}:
-            return "Manuals"
-        return ""
+        return view.group_for_value(g) if g in group_keys else ""
 
-    drawing_categories, manual_categories, _, _ = _taxonomy_maps()
-    # Category taxonomy is authoritative when present.
-    if c in drawing_categories:
-        return "Drawings"
-    if c in manual_categories:
-        return "Manuals"
+    # Category taxonomy is authoritative when present (group sort order).
+    for grp, cats in view.categories_by_group().items():
+        if c in cats:
+            return grp
 
-    if g in {"drawing", "drawings"}:
-        return "Drawings"
-    if g in {"manual", "manuals"}:
-        return "Manuals"
-    return ""
+    return view.group_for_value(g) if g in group_keys else ""
 
 
 def _build_sharepoint_metadata_payload(
@@ -630,7 +655,7 @@ def _metadata_issue_reasons(
     sub_category: str,
 ) -> list[str]:
     reasons: list[str] = []
-    main_folders = {m.lower() for m in template.ALL_MAIN_FOLDERS}
+    main_folders = {m.lower() for m in _tag_view().domain_names(active_only=False)}
     drawing_categories, manual_categories, allowed_sub_by_category, all_subcategories = _taxonomy_maps()
 
     g = (group or "").strip().lower()
@@ -641,7 +666,7 @@ def _metadata_issue_reasons(
 
     if g in main_folders:
         reasons.append("group_is_department")
-    if g and g not in {"drawing", "drawings", "manual", "manuals"}:
+    if g and g not in _tag_view().group_value_keys():
         reasons.append("group_not_taxonomy")
     if v and c and v == c:
         reasons.append("category_equals_vessel")
@@ -775,6 +800,9 @@ class VesselIn(BaseModel):
     hull_number: str | None = None
     vessel_type: str | None = None
     provisioned_site_ids: list[str] | None = None
+    site_key: str | None = None
+    parent_folder_path: str | None = None
+    subfolders: list[str] = []
 
 
 
@@ -787,8 +815,31 @@ class VesselUpdateIn(BaseModel):
     provisioned_site_ids: list[str] | None = None
 
 
-class RejectIn(BaseModel):
-    reason: str | None = None
+class VesselSyncIn(BaseModel):
+    site_key: str | None = None
+
+
+class ConfirmDiscoveredVesselIn(BaseModel):
+    name: str
+    imo: str
+    hull_number: str | None = None
+    site_key: str
+    original_path: str
+
+
+class RoleUpdateIn(BaseModel):
+    role: str
+
+
+class SitePermissionIn(BaseModel):
+    site_key: str
+    can_view: bool = True
+    can_upload: bool = False
+    can_tag_on_upload: bool = False
+
+
+class SitePermissionsUpdateIn(BaseModel):
+    permissions: list[SitePermissionIn]
 
 
 def _is_admin_email(email: str | None) -> bool:
@@ -856,7 +907,7 @@ def _ensure_database_exists(db_url: str) -> None:
 
 @app.on_event("startup")
 async def _startup():
-    from .scheduler import precreate_next_month, start_scheduler
+    from .scheduler import start_scheduler
     import logging as _log
 
     _logger = _log.getLogger(__name__)
@@ -956,6 +1007,17 @@ async def _startup():
             )
             print(">>> STARTUP: root logger re-forced to INFO after Alembic fileConfig", flush=True)
             _logger.info("Alembic migrations completed successfully.")
+            # Tag Configuration defaults (idempotent; "__template__" scope
+            # only, never touches a client's own configuration).
+            try:
+                from .db.base import SessionLocal as _TcSession
+                from .services.tag_config import seed_template as _tc_seed
+                with _TcSession() as _tc_db:
+                    _tc_inserted = _tc_seed(_tc_db)
+                if _tc_inserted:
+                    _logger.info("Tag configuration: seeded %d default items", _tc_inserted)
+            except Exception as _tc_exc:
+                _logger.warning("Tag configuration seed skipped/failed: %s", _tc_exc)
         except Exception as exc:
             print(f">>> STARTUP: alembic block FAILED: {exc}", flush=True)
             _logger.warning("Alembic automatic migration failed: %s", exc)
@@ -1009,6 +1071,14 @@ async def _startup():
                             _logger.warning(
                                 "DB schema drift repaired: added missing vessels.provisioned_site_ids column"
                             )
+                        if "provisioned_site_key" not in vessel_cols:
+                            conn.execute(
+                                text("ALTER TABLE vessels ADD COLUMN IF NOT EXISTS provisioned_site_key VARCHAR(100) NULL")
+                            )
+                        if "vessel_folder_path" not in vessel_cols:
+                            conn.execute(
+                                text("ALTER TABLE vessels ADD COLUMN IF NOT EXISTS vessel_folder_path VARCHAR(1024) NULL")
+                            )
                         # Backfill existing provisioned vessels with active site
                         try:
                             active_site_name = settings.active_site or "dev"
@@ -1056,6 +1126,30 @@ async def _startup():
                             _logger.warning(
                                 "DB schema drift repaired: added missing site_configurations.is_hidden"
                             )
+                        if "is_removed" not in site_cols:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE site_configurations "
+                                    "ADD COLUMN IF NOT EXISTS is_removed BOOLEAN "
+                                    "NOT NULL DEFAULT FALSE"
+                                )
+                            )
+                            _logger.warning(
+                                "DB schema drift repaired: added missing site_configurations.is_removed"
+                            )
+
+                    if "deleted_vessels" in set(inspector.get_table_names()):
+                        dv_cols = {c["name"] for c in inspector.get_columns("deleted_vessels")}
+                        if "site_name" not in dv_cols:
+                            conn.execute(
+                                text("ALTER TABLE deleted_vessels ADD COLUMN IF NOT EXISTS site_name VARCHAR(256) NULL")
+                            )
+                            _logger.warning("DB schema drift repaired: added missing deleted_vessels.site_name")
+                        if "site_key" not in dv_cols:
+                            conn.execute(
+                                text("ALTER TABLE deleted_vessels ADD COLUMN IF NOT EXISTS site_key VARCHAR(100) NULL")
+                            )
+                            _logger.warning("DB schema drift repaired: added missing deleted_vessels.site_key")
 
                 _logger.info("Database safety-net create_all completed.")
                 database_ready = True
@@ -1063,27 +1157,8 @@ async def _startup():
             _logger.warning("Database safety net table creation failed: %s", exc)
 
     app.state.scheduler = start_scheduler() if database_ready else None
-    if settings.graph_configured and database_ready:
-        # Defer the potentially long Graph catch-up so health and auth endpoints
-        # can respond immediately after the API starts.
-        async def _deferred_precreate() -> None:
-            try:
-                await asyncio.sleep(10)
-                await precreate_next_month()
-            except GraphError as e:
-                msg = str(e).lower()
-                if e.status == 403 and "access denied" in msg:
-                    _logger.warning(
-                        "Deferred precreate_next_month skipped: Graph access denied. "
-                        "Verify app permissions and site/library grants. Error: %s",
-                        e,
-                    )
-                    return
-                _logger.exception("Deferred precreate_next_month failed")
-            except Exception:
-                _logger.exception("Deferred precreate_next_month failed")
-
-        asyncio.create_task(_deferred_precreate())
+    # NOTE: the deferred startup precreate_next_month() call was removed —
+    # the app no longer auto-creates month/category folder structures.
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -1525,6 +1600,10 @@ async def auth_login(request: Request, payload: LoginIn):
                         row.manager_email = manager_email
 
                 row.tenant_id = payload.tenant_id or None
+                if _is_admin_email(email):
+                    row.role = "Admin"
+                elif not row.role:
+                    row.role = "User"
                 row.last_login = now
 
                 db.flush()  # ensure ID assigned before seeding related rows
@@ -1884,9 +1963,51 @@ async def patch_profile(email: str, payload: ProfileUpdateIn, _session: object =
     return await get_profile(email)
 
 
+async def _fetch_tenant_users() -> list[dict] | None:
+    """Live user directory from the connected Microsoft 365 tenant
+    (Microsoft Graph GET /users), paginated. Returns None (never an empty
+    list) when Graph isn't configured or the call fails, so the caller can
+    fall back to locally-seeded profile data instead of wiping the page."""
+    if not settings.graph_configured:
+        return None
+    try:
+        g = graph()
+        out: list[dict] = []
+        url = (
+            "/users?$select=id,displayName,mail,userPrincipalName,accountEnabled,jobTitle,department"
+            "&$top=999"
+        )
+        while url:
+            page = await g.get(url)
+            for u in (page.get("value") or []) if isinstance(page, dict) else []:
+                email = (u.get("mail") or u.get("userPrincipalName") or "").strip().lower()
+                # Guest accounts carry a UPN like alias_domain.com#EXT#@tenant...
+                # with no real mailbox of their own — skip those.
+                if not email or "#ext#" in email:
+                    continue
+                out.append({
+                    "email": email,
+                    "displayName": (u.get("displayName") or "").strip(),
+                    "accountEnabled": bool(u.get("accountEnabled", True)),
+                    "jobTitle": u.get("jobTitle"),
+                    "department": u.get("department"),
+                })
+            url = page.get("@odata.nextLink") if isinstance(page, dict) else None
+        return out
+    except Exception as exc:
+        logger.warning("Could not fetch tenant users from Microsoft Graph: %s", exc)
+        return None
+
+
 @app.get("/api/users")
 async def list_users(_session: object = Depends(require_session)):
-    """Return User Management records from persisted profile/session data."""
+    """User Management records, sourced from the connected Microsoft 365
+    tenant (Microsoft Graph /users) — real display names, emails and
+    active/disabled status — overlaid with this app's own role and
+    per-site permission assignments (user_profiles / user_sessions), which
+    have no tenant equivalent. Falls back to the locally-seeded profile
+    list only when Graph isn't configured or the directory call fails, so
+    User Management never goes blank."""
 
     def _display_name_for(email: str, profile: Any | None = None) -> str:
         if profile is not None:
@@ -1910,25 +2031,42 @@ async def list_users(_session: object = Depends(require_session)):
 
     def _role_for(email: str, profile: Any | None = None) -> str:
         if _is_admin_email(email):
-            return "Administrator"
-        levels = {
-            (getattr(p, "permission_level", "") or "").strip().lower()
-            for p in (getattr(profile, "folder_permissions", []) or [])
-        }
-        if "approve" in levels:
-            return "Reviewer"
-        if "edit" in levels:
-            return "Manager"
-        return "User"
+            return "Admin"
+        return (getattr(profile, "role", None) or "User").strip().title()
+
+    def _permissions_for(profile: Any | None) -> list[dict]:
+        if profile is None:
+            return []
+        return [
+            {
+                "site_key": p.site_key,
+                "can_view": bool(p.can_view),
+                "can_upload": bool(p.can_upload),
+                "can_tag_on_upload": bool(p.can_tag_on_upload),
+            }
+            for p in (getattr(profile, "site_permissions", None) or [])
+        ]
+
+    # Tenant is the source of truth for *who exists* and their real name /
+    # enabled state (point 3): fetched once up front so both the
+    # DB-configured and DB-less branches below can overlay it the same way.
+    tenant_users = await _fetch_tenant_users()
 
     if settings.db_configured:
         try:
             from .db.base import SessionLocal
             from .db import models as db_models
+            from .services.authorization import require_admin_session
 
             with SessionLocal() as db:
+                require_admin_session(db, _session)
                 profiles = db.query(db_models.UserProfile).order_by(db_models.UserProfile.display_name.asc()).all()
                 sessions = db.query(db_models.UserSession).order_by(db_models.UserSession.last_activity.desc()).all()
+                profile_by_email: dict[str, Any] = {}
+                for row in profiles:
+                    email = (row.email or "").strip().lower()
+                    if email:
+                        profile_by_email[email] = row
 
                 latest_seen_by_email: dict[str, datetime] = {}
                 active_by_email: set[str] = set()
@@ -1941,40 +2079,96 @@ async def list_users(_session: object = Depends(require_session)):
                     if (sess.status or "").strip().lower() == "active":
                         active_by_email.add(email)
 
-                out: list[dict[str, str]] = []
+                out: list[dict[str, Any]] = []
                 seen_emails: set[str] = set()
 
-                for row in profiles:
-                    email = (row.email or "").strip().lower()
-                    if not email or email in seen_emails:
-                        continue
-                    seen_emails.add(email)
-                    last_seen = latest_seen_by_email.get(email) or row.last_login
-                    out.append({
-                        "id": str(row.id or email),
-                        "name": _display_name_for(email, row),
-                        "email": email,
-                        "role": _role_for(email, row),
-                        "status": "Active" if email in active_by_email else "Inactive",
-                        "lastLogin": _fmt_last_login(last_seen),
-                    })
+                if tenant_users is not None:
+                    for tu in tenant_users:
+                        email = tu["email"]
+                        if not email or email in seen_emails:
+                            continue
+                        seen_emails.add(email)
+                        profile = profile_by_email.get(email)
+                        last_seen = latest_seen_by_email.get(email) or getattr(profile, "last_login", None)
+                        name = (
+                            (getattr(profile, "display_name", None) if profile else None)
+                            or tu.get("displayName")
+                            or _display_name_for(email)
+                        )
+                        # Active means "currently signed in" when we have a
+                        # session for them; otherwise fall back to the
+                        # tenant's own enabled/disabled account state so a
+                        # deactivated Entra account doesn't read as Active
+                        # just because it's never logged into this app.
+                        is_active = email in active_by_email or (
+                            email not in latest_seen_by_email and tu.get("accountEnabled", True)
+                        )
+                        out.append({
+                            "id": str(profile.id) if profile else email,
+                            "name": name,
+                            "email": email,
+                            "role": _role_for(email, profile),
+                            "status": "Active" if is_active else "Inactive",
+                            "lastLogin": _fmt_last_login(last_seen),
+                            "permissions": _permissions_for(profile),
+                        })
 
-                for email, last_seen in latest_seen_by_email.items():
-                    if email in seen_emails:
-                        continue
-                    out.append({
-                        "id": email,
-                        "name": _display_name_for(email),
-                        "email": email,
-                        "role": _role_for(email),
-                        "status": "Active" if email in active_by_email else "Inactive",
-                        "lastLogin": _fmt_last_login(last_seen),
-                    })
+                # The tenant directory is authoritative for who exists.
+                # Only fall back to local-only DB rows (profiles/sessions
+                # with no matching tenant account -- test/guest/former-
+                # employee leftovers) when the tenant call itself couldn't
+                # run, so User Management never silently goes blank if
+                # Graph is unreachable. When the tenant call succeeded,
+                # a local row absent from it is stale, not a real user,
+                # and must not be shown.
+                if tenant_users is None:
+                    for row in profiles:
+                        email = (row.email or "").strip().lower()
+                        if not email or email in seen_emails:
+                            continue
+                        seen_emails.add(email)
+                        last_seen = latest_seen_by_email.get(email) or row.last_login
+                        out.append({
+                            "id": str(row.id or email),
+                            "name": _display_name_for(email, row),
+                            "email": email,
+                            "role": _role_for(email, row),
+                            "status": "Active" if email in active_by_email else "Inactive",
+                            "lastLogin": _fmt_last_login(last_seen),
+                            "permissions": _permissions_for(row),
+                        })
+
+                    for email, last_seen in latest_seen_by_email.items():
+                        if email in seen_emails:
+                            continue
+                        out.append({
+                            "id": email,
+                            "name": _display_name_for(email),
+                            "email": email,
+                            "role": _role_for(email),
+                            "status": "Active" if email in active_by_email else "Inactive",
+                            "lastLogin": _fmt_last_login(last_seen),
+                        })
 
                 out.sort(key=lambda item: ((item.get("name") or "").lower(), (item.get("email") or "").lower()))
                 return out
         except Exception as exc:
             raise HTTPException(500, f"Could not retrieve users: {exc}")
+
+    if tenant_users is not None:
+        out = [
+            {
+                "id": tu["email"],
+                "name": tu.get("displayName") or _display_name_for(tu["email"]),
+                "email": tu["email"],
+                "role": _role_for(tu["email"]),
+                "status": "Active" if tu.get("accountEnabled", True) else "Inactive",
+                "lastLogin": "Never",
+            }
+            for tu in tenant_users
+        ]
+        out.sort(key=lambda item: ((item.get("name") or "").lower(), (item.get("email") or "").lower()))
+        return out
 
     out: list[dict[str, str]] = []
     for email, profile in _profile_cache.items():
@@ -1999,6 +2193,99 @@ async def list_users(_session: object = Depends(require_session)):
 
     out.sort(key=lambda item: ((item.get("name") or "").lower(), (item.get("email") or "").lower()))
     return out
+
+
+@app.get("/api/me/permissions")
+async def get_my_permissions(session: object = Depends(require_session)):
+    """Return the effective role and site permissions for the authenticated user."""
+    from .services.authorization import effective_role, normalize_email, serialize_site_permission
+    from .db.base import SessionLocal
+
+    email = normalize_email(getattr(session, "email", None))
+    if not settings.db_configured:
+        return {"email": email, "role": "Admin" if _is_admin_email(email) else "User", "permissions": []}
+    with SessionLocal() as db:
+        profile = db.query(db_models.UserProfile).filter_by(email=email).one_or_none()
+        return {
+            "email": email,
+            "role": effective_role(profile, email),
+            "is_active": bool(profile.is_active) if profile else True,
+            "permissions": [serialize_site_permission(p) for p in (profile.site_permissions if profile else [])],
+        }
+
+
+@app.patch("/api/admin/users/{email}/role")
+async def update_user_role(
+    email: str,
+    payload: RoleUpdateIn,
+    session: object = Depends(require_session),
+):
+    """Set a user's durable application role."""
+    from .db.base import SessionLocal
+    from .services.authorization import require_admin_session, normalize_email
+
+    role = payload.role.strip().title()
+    if role not in {"Admin", "User"}:
+        raise HTTPException(400, "Role must be Admin or User")
+    target_email = normalize_email(email)
+    with SessionLocal() as db:
+        actor = require_admin_session(db, session)
+        profile = db.query(db_models.UserProfile).filter_by(email=target_email).one_or_none()
+        if profile is None:
+            raise HTTPException(404, "User profile not found")
+        profile.role = role
+        profile.permissions_updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.add(db_models.ActivityLog(user_email=target_email, action="role_updated", detail=f"Role set to {role} by {actor.email}"))
+        db.commit()
+        return {"email": target_email, "role": profile.role}
+
+
+@app.get("/api/admin/users/{email}/permissions")
+async def get_user_permissions(email: str, session: object = Depends(require_session)):
+    from .db.base import SessionLocal
+    from .services.authorization import require_admin_session, normalize_email, serialize_site_permission
+
+    target_email = normalize_email(email)
+    with SessionLocal() as db:
+        require_admin_session(db, session)
+        profile = db.query(db_models.UserProfile).filter_by(email=target_email).one_or_none()
+        if profile is None:
+            raise HTTPException(404, "User profile not found")
+        return {"email": target_email, "role": profile.role, "permissions": [serialize_site_permission(p) for p in profile.site_permissions]}
+
+
+@app.put("/api/admin/users/{email}/permissions")
+async def update_user_permissions(
+    email: str,
+    payload: SitePermissionsUpdateIn,
+    session: object = Depends(require_session),
+):
+    from .db.base import SessionLocal
+    from .services.authorization import require_admin_session, normalize_email
+
+    target_email = normalize_email(email)
+    with SessionLocal() as db:
+        actor = require_admin_session(db, session)
+        profile = db.query(db_models.UserProfile).filter_by(email=target_email).one_or_none()
+        if profile is None:
+            raise HTTPException(404, "User profile not found")
+        db.query(db_models.UserSitePermission).filter_by(user_email=target_email).delete(synchronize_session=False)
+        for item in payload.permissions:
+            site_key = item.site_key.strip().lower()
+            if not site_key:
+                continue
+            db.add(db_models.UserSitePermission(
+                user_email=target_email,
+                site_key=site_key,
+                can_view=item.can_view,
+                can_upload=item.can_upload and item.can_view,
+                can_tag_on_upload=item.can_tag_on_upload and item.can_upload and item.can_view,
+                granted_by_email=actor.email,
+            ))
+        profile.permissions_updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.add(db_models.ActivityLog(user_email=target_email, action="site_permissions_updated", detail=f"Permissions updated by {actor.email}"))
+        db.commit()
+        return await get_user_permissions(target_email, session)
 
 
 # ---------------------------------------------------------------------------
@@ -2105,23 +2392,8 @@ def get_document_aliases(_session: object = Depends(require_session)):
     """Return canonical department and vessel alias mappings for intelligent classification."""
     from .ocr.drawing_category import VESSEL_ALIASES
     
-    department_aliases = {
-        "Technical & Crewing": [
-            "technical and crewing new", "technical and crewing  new", "technical & crewing",
-            "technical & crewing new", "technical", "crewing", "technical and crewing",
-            "technical & crewing", "technical/crewing"
-        ],
-        "Commercial & Chartering": [
-            "commercial and chartering", "commercial & chartering", "commercial", "chartering",
-            "commercial & operations", "operations"
-        ],
-        "Insurance": [
-            "insurance", "claims", "insurance & claims"
-        ],
-        "Kaizen - Knowledge Bank": [
-            "kaizen", "knowledge bank", "kaizen - knowledge bank", "kaizen-knowledge bank"
-        ],
-    }
+    # Domains + aliases now come from Settings → Tag Configuration (Active only).
+    department_aliases = _tag_view().domain_alias_map()
 
     vessel_aliases = {k: list(v) for k, v in VESSEL_ALIASES.items()}
 
@@ -2271,24 +2543,30 @@ async def get_document_sites(
             config = Settings.load_site_config(key)
         except ValueError:
             continue
+        d_name = info.get("sp_site_name") or config.sp_site_name or key
         sites.append({
             "site_key": key,
-            "sp_site_name": info.get("sp_site_name") or config.sp_site_name,
+            "sp_site_name": d_name,
+            "display_name": d_name,
             "site_id": key,
             "drive_id": config.drive_id,
             "web_url": config.sharepoint_site_url,
         })
 
     # Enrich with DB site_configurations (prefer DB-stored site_id and display_name)
+    hidden_keys = set()
     if engine:
         try:
             existing = {s["site_key"] for s in sites}
             with engine.connect() as conn:
                 rows = conn.execute(
-                    text("SELECT site_key, display_name, site_name, site_id, drive_id FROM site_configurations ORDER BY display_name")
+                    text("SELECT site_key, display_name, site_name, site_id, drive_id, COALESCE(is_hidden, FALSE) AS is_hidden FROM site_configurations ORDER BY display_name")
                 ).mappings().all()
+                hidden_keys = {str(r["site_key"]).strip().lower() for r in rows if r["is_hidden"]}
                 for r in rows:
                     k = r["site_key"]
+                    if not k or str(k).strip().lower() in hidden_keys:
+                        continue
                     d_name = r["display_name"] or r["site_name"] or k
                     if k in existing:
                         # Update site_id from DB (DB has real SharePoint site_id)
@@ -2296,12 +2574,14 @@ async def get_document_sites(
                             if s["site_key"] == k:
                                 s["site_id"] = r["site_id"] or k
                                 s["sp_site_name"] = d_name
+                                s["display_name"] = d_name
                                 break
                     elif r["drive_id"]:
                         from .config import compute_sp_site_url
                         sites.append({
                             "site_key": k,
                             "sp_site_name": d_name,
+                            "display_name": d_name,
                             "site_id": r["site_id"] or k,
                             "drive_id": r["drive_id"],
                             "web_url": compute_sp_site_url(k, r.get("site_name") or d_name),
@@ -2310,16 +2590,33 @@ async def get_document_sites(
         except Exception:
             pass
 
+    # Exclude any sites marked as hidden
+    sites = [s for s in sites if str(s["site_key"]).strip().lower() not in hidden_keys]
+
     # Configured site URLs are not always present in environment settings.
     # Resolve them from Graph so links for secondary target sites use their
     # actual SharePoint site path instead of the host web part's site URL.
+    from .config import compute_sp_site_url, _env_site_urls
+    env_site_urls = _env_site_urls()
     for site in sites:
-        from .config import compute_sp_site_url
-        curr_url = site.get("web_url", "")
-        if not curr_url or (curr_url == "https://nissenkaiunsingapore.sharepoint.com" and any(x in (site.get("site_key", "") + site.get("sp_site_name", "")).lower() for x in ("nks", "docman", "external"))):
-            site["web_url"] = compute_sp_site_url(site.get("site_key", ""), site.get("sp_site_name", ""))
+        # URL resolution is config-driven (see compute_sp_site_url): the
+        # site's own <KEY>_SHAREPOINT_SITE_URL, a same-drive
+        # site_configurations row, or /sites/<site_name> — no site names or
+        # tenant host hardcoded here.
+        site_key_lower = str(site.get("site_key", "")).strip().lower()
+        if not site.get("web_url"):
+            site["web_url"] = compute_sp_site_url(
+                site.get("site_key", ""), site.get("sp_site_name", ""), drive_id=site.get("drive_id", "") or "",
+            )
 
-        if site.get("site_id") and "," in site["site_id"] and "/sites/" not in (site.get("web_url") or "") and not any(x in site.get("site_key", "").lower() for x in ("dev", "root", "communication")):
+        # Still no site path and no explicit .env URL for this site: ask
+        # Graph for the real webUrl. A site whose .env URL is configured is
+        # authoritative (e.g. a tenant-root Communication site) and skipped.
+        if (
+            site.get("site_id") and "," in site["site_id"]
+            and "/sites/" not in (site.get("web_url") or "")
+            and site_key_lower not in env_site_urls
+        ):
             try:
                 site_info = await graph().get(
                     f"/sites/{quote(site['site_id'], safe='')}?$select=webUrl"
@@ -2421,7 +2718,9 @@ async def get_admin_site_configuration(
                 "name": key,
                 "display_name": site_info["sp_site_name"],
                 "configured": True,
+                "is_registered": False,
                 "is_hidden": False,
+                "is_removed": False,
             }
 
     # Enrich from DB — adds site_id, real drive_id, correct display_name, and is_hidden flag
@@ -2433,7 +2732,8 @@ async def get_admin_site_configuration(
                 rows = conn.execute(
                     text(
                         "SELECT site_key, display_name, site_name, site_id, drive_id, "
-                        "COALESCE(is_hidden, FALSE) AS is_hidden "
+                        "COALESCE(is_hidden, FALSE) AS is_hidden, "
+                        "COALESCE(is_removed, FALSE) AS is_removed "
                         "FROM site_configurations ORDER BY display_name"
                     )
                 ).mappings().all()
@@ -2444,18 +2744,24 @@ async def get_admin_site_configuration(
                         "name": k,
                         "display_name": d_name,
                         "configured": True,
+                        "is_registered": True,
                         "site_id": r["site_id"],
                         "drive_id": r["drive_id"],
                         "is_hidden": bool(r["is_hidden"]),
+                        "is_removed": bool(r["is_removed"]),
                     }
                     configured_sites_map[k] = entry
         except Exception:
             pass
 
+    # Removed sites are permanently excluded from Site Management, regardless
+    # of include_hidden — unlike hiding, there is no "show removed" view.
+    visible_sites = [s for s in configured_sites_map.values() if not s.get("is_removed")]
+
     if not include_hidden:
-        configured_sites = [s for s in configured_sites_map.values() if not s.get("is_hidden")]
+        configured_sites = [s for s in visible_sites if not s.get("is_hidden")]
     else:
-        configured_sites = list(configured_sites_map.values())
+        configured_sites = visible_sites
 
     return {
         "current_site": current_site,
@@ -2483,6 +2789,36 @@ class SaveSiteConfigurationRequest(BaseModel):
     site_name: str = Field(..., min_length=1, max_length=256)
     site_id: str = Field(..., min_length=1, max_length=512)
     drive_id: str = Field(..., min_length=1, max_length=512)
+
+
+def _log_site_management_change(
+    *,
+    admin_email: str,
+    site_key: str,
+    site_name: str,
+    action: str,
+) -> None:
+    """Write a visibility/registration action to the existing site audit log."""
+    from .db.base import SessionLocal
+    from .db import models as m
+
+    db = SessionLocal()
+    try:
+        db.add(m.SiteConfigurationChange(
+            changed_by_email=admin_email,
+            changed_by_name=admin_email,
+            previous_site=site_key,
+            new_site=site_key,
+            previous_site_name=site_name,
+            new_site_name=site_name,
+            status="success",
+            reason=action,
+        ))
+        db.commit()
+    except Exception as log_error:
+        logger.warning("Failed to log site management action %s for %s: %s", action, site_key, log_error)
+    finally:
+        db.close()
 
 
 def _registered_site_config(site_name: str):
@@ -2520,6 +2856,7 @@ async def save_admin_site_configuration(
     admin_email = _require_admin(x_user_email)
     from .db.base import SessionLocal
     from .db.models import SiteConfiguration
+    from .config import _SITE_CONFIGS_CACHE
     if not settings.db_configured:
         raise HTTPException(status_code=503, detail="A database is required to save site configurations.")
     site_key = request.site_key.strip().lower()
@@ -2534,15 +2871,126 @@ async def save_admin_site_configuration(
             record.site_id = request.site_id.strip()
             record.drive_id = request.drive_id.strip()
             record.created_by_email = admin_email
+            record.is_hidden = False
+            record.is_removed = False
         else:
             record = SiteConfiguration(
                 site_key=site_key, display_name=request.display_name.strip(),
                 site_name=request.site_name.strip(), site_id=request.site_id.strip(),
                 drive_id=request.drive_id.strip(), created_by_email=admin_email,
+                is_hidden=False, is_removed=False,
             )
             db.add(record)
         db.commit()
+        _SITE_CONFIGS_CACHE.pop(site_key, None)
+        # Without this, a newly registered (or re-saved) site keeps missing
+        # from the Home dashboard's "SharePoint Sites" table and totals for
+        # up to CACHE_TTL_DASHBOARD_STATS seconds — the dashboard's per-site
+        # scan is cached and only the delete/hide endpoints used to bust it.
+        from .services.real_backend import invalidate_dashboard_stats_cache
+        invalidate_dashboard_stats_cache()
         return {"success": True, "site": {"name": site_key, "display_name": record.display_name, "site_id": record.site_id, "drive_id": record.drive_id}}
+    finally:
+        db.close()
+
+
+@app.delete("/api/admin/site-configurations/{site_key}")
+async def remove_admin_site_configuration(
+    site_key: str,
+    x_user_email: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Permanently remove a site from the Site Management list without deleting
+    SharePoint data.
+
+    Sites added via "Add New Site" (pure DB registrations, not backed by an
+    .env config block) are hard-deleted, exactly as before.
+
+    Sites discovered from an .env config block (LOCAL_*/DEV_*/PROD_*, e.g. the
+    "local" dev site) can never be hard-deleted — `Settings.discover_available_sites()`
+    rediscovers them from .env on every request, so a deleted row would just
+    reappear, visible and unhidden, on the next page load. For those, this
+    endpoint instead marks the row `is_removed=True` (and `is_hidden=True`, so
+    it also drops out of the Sites/Documents/Vessel Management pickers). A
+    removed site is filtered out of Site Management unconditionally — unlike
+    Hide, there's no "show removed" view to undo this from the UI.
+    """
+    admin_email = _require_admin(x_user_email)
+    from .config import get_session_site, _SITE_CONFIGS_CACHE, Settings
+    from .db.base import SessionLocal
+    from .db.models import SiteConfiguration
+
+    key = site_key.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="site_key is required")
+    active_site = (get_session_site(x_session_id) or settings.active_site or "").strip().lower()
+    if key == active_site:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot remove the currently active site. Switch to a different site first.",
+        )
+    if not settings.db_configured:
+        raise HTTPException(status_code=503, detail="A database is required to remove site configurations.")
+
+    env_discovered = key in Settings.discover_available_sites()
+
+    db = SessionLocal()
+    try:
+        record = db.query(SiteConfiguration).filter(SiteConfiguration.site_key == key).first()
+
+        if not record and not env_discovered:
+            raise HTTPException(status_code=404, detail=f"Site '{key}' is not registered.")
+
+        if not env_discovered:
+            # Pure DB registration (e.g. "Add New Site") — nothing will
+            # rediscover it, so a hard delete is a real, permanent removal.
+            display_name = record.display_name or record.site_name or key
+            db.delete(record)
+            db.commit()
+        else:
+            # Backed by an .env block — keep the row so the exclusion sticks,
+            # but mark it removed (and hidden, so other modules drop it too).
+            if record:
+                display_name = record.display_name or record.site_name or key
+                record.is_removed = True
+                record.is_hidden = True
+            else:
+                conf = None
+                try:
+                    conf = Settings.load_site_config(key)
+                except Exception:
+                    pass
+                display_name = (conf.sp_site_name if conf else None) or key
+                record = SiteConfiguration(
+                    site_key=key,
+                    display_name=display_name,
+                    site_name=display_name,
+                    site_id=getattr(conf, "sp_site_id", "") or key,
+                    drive_id=(conf.drive_id if conf else "") or "",
+                    is_available_for_provisioning=True,
+                    is_default_provisioning=False,
+                    is_hidden=True,
+                    is_removed=True,
+                    created_by_email=admin_email,
+                )
+                db.add(record)
+            db.commit()
+
+        _SITE_CONFIGS_CACHE.pop(key, None)
+        # The Home dashboard caches its per-site scan for up to
+        # CACHE_TTL_DASHBOARD_STATS seconds (real_backend._DASHBOARD_*_CACHE);
+        # without this, a just-removed site would keep showing in the
+        # "SharePoint Sites" table and totals until that cache expired.
+        from .services.real_backend import invalidate_dashboard_stats_cache
+        invalidate_dashboard_stats_cache()
+        _log_site_management_change(
+            admin_email=admin_email,
+            site_key=key,
+            site_name=display_name,
+            action="removed",
+        )
+        return {"success": True, "site_key": key, "message": f"Site '{key}' removed from registered sites."}
     finally:
         db.close()
 
@@ -2611,6 +3059,14 @@ async def set_site_visibility(
                 db.add(record)
                 db.commit()
                 _SITE_CONFIGS_CACHE.pop(key, None)
+                from .services.real_backend import invalidate_dashboard_stats_cache
+                invalidate_dashboard_stats_cache()
+                _log_site_management_change(
+                    admin_email=admin_email,
+                    site_key=key,
+                    site_name=record.display_name or record.site_name or key,
+                    action="hidden" if payload.is_hidden else "unhidden",
+                )
                 return {
                     "success": True,
                     "site_key": key,
@@ -2627,12 +3083,20 @@ async def set_site_visibility(
                 {"v": payload.is_hidden, "k": key},
             )
             db.commit()
+            from .services.real_backend import invalidate_dashboard_stats_cache
+            invalidate_dashboard_stats_cache()
         except Exception as upd_err:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Failed to update visibility: {upd_err}") from upd_err
 
         # Invalidate config cache so the next load picks up the new flag
         _SITE_CONFIGS_CACHE.pop(key, None)
+        _log_site_management_change(
+            admin_email=admin_email,
+            site_key=key,
+            site_name=record.display_name or record.site_name or key,
+            action="hidden" if payload.is_hidden else "unhidden",
+        )
 
         return {
             "success": True,
@@ -2904,10 +3368,84 @@ async def _get_site_item_with_tags(drive_id: str, item: dict[str, Any], detected
 
 @app.get("/api/sites")
 async def discover_sites(
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=1000),
+    all_tenant: bool = Query(default=False),
+    include_hidden: bool = Query(default=False),
     _session: object = Depends(require_session),
 ):
-    """List a bounded first page of tenant sites without blocking on full pagination."""
+    """List configured SharePoint integration sites (default) or tenant-wide sites when all_tenant=True."""
+    is_all_tenant = (all_tenant is True) or (isinstance(all_tenant, str) and all_tenant.lower() in ("true", "1"))
+    inc_hidden = (include_hidden is True) or (isinstance(include_hidden, str) and include_hidden.lower() in ("true", "1"))
+    if not is_all_tenant:
+        from .config import Settings, compute_sp_site_url
+        from .db.base import engine
+        from sqlalchemy import text
+
+        configured_map = {}
+        for key, info in Settings.discover_available_sites().items():
+            if not info.get("configured"):
+                continue
+            try:
+                conf = Settings.load_site_config(key)
+            except ValueError:
+                continue
+            site_key = key.lower()
+            disp_name = info.get("sp_site_name") or conf.sp_site_name or key
+            configured_map[site_key] = {
+                "id": site_key,
+                "site_key": site_key,
+                "name": disp_name,
+                "display_name": disp_name,
+                "web_url": conf.sharepoint_site_url or "",
+                "drive_id": conf.drive_id or "",
+                "is_hidden": False,
+                "is_default": (site_key == (settings.active_site or "").lower()),
+            }
+
+        if engine:
+            try:
+                with engine.connect() as conn:
+                    rows = conn.execute(
+                        text("SELECT site_key, display_name, site_name, site_id, drive_id, COALESCE(is_hidden, FALSE) AS is_hidden, COALESCE(is_default_provisioning, FALSE) AS is_default FROM site_configurations ORDER BY display_name")
+                    ).mappings().all()
+                    for r in rows:
+                        k = (r["site_key"] or "").strip().lower()
+                        if not k:
+                            continue
+                        d_name = r["display_name"] or r["site_name"] or k
+                        s_id = r["site_id"] or k
+                        w_url = compute_sp_site_url(k, r.get("site_name") or d_name)
+                        configured_map[k] = {
+                            "id": k,
+                            "site_key": k,
+                            "site_id": s_id,
+                            "name": d_name,
+                            "display_name": d_name,
+                            "web_url": w_url,
+                            "drive_id": r["drive_id"] or "",
+                            "is_hidden": bool(r["is_hidden"]),
+                            "is_default": bool(r["is_default"]) or (k == (settings.active_site or "").lower()),
+                        }
+            except Exception:
+                pass
+
+        from .graph import guard as _site_guard
+
+        if not _site_guard.is_production():
+            configured_map = {
+                k: s for k, s in configured_map.items()
+                if not _site_guard.is_protected(
+                    k, s.get("site_key"), s.get("name"), s.get("display_name"),
+                    s.get("web_url"), s.get("drive_id"), s.get("site_id"),
+                )
+            }
+
+        if not inc_hidden:
+            sites = [s for s in configured_map.values() if not s.get("is_hidden")]
+        else:
+            sites = list(configured_map.values())
+        return {"sites": sites, "cached": False, "limited": False}
+
     cached = _DISCOVERED_SITES_CACHE.get(settings.active_site)
     now = time.time()
     if cached and now - cached[0] < _DISCOVERED_SITES_CACHE_TTL:
@@ -2930,26 +3468,113 @@ async def discover_sites(
                     if len(sites) >= limit:
                         break
             next_url = None if len(sites) >= limit else page.get("@odata.nextLink")
+        from .graph import guard as _site_guard
+
+        if not _site_guard.is_production():
+            sites = [
+                s for s in sites
+                if not _site_guard.is_protected(s.get("name"), s.get("display_name"), s.get("web_url"), s.get("id"))
+            ]
         _DISCOVERED_SITES_CACHE[settings.active_site] = (now, sites)
         return {"sites": sites, "cached": False, "limited": True, "limit": limit}
     except GraphError as exc:
         raise HTTPException(status_code=502, detail=f"SharePoint site discovery failed: {exc}") from exc
 
 
+# SharePoint auto-provisions several "system" document libraries on every site
+# (Site Assets, Style Library, Form Templates, Preservation Hold Library, etc.)
+# that show up in the Graph `/sites/{id}/drives` response exactly like a real
+# content library, but are never where a user's own files live. A site with
+# publishing features, versioning, or retention policies enabled can easily
+# return 4-6 drives this way. `discover_site_drives` used to return every one
+# of them with no way to tell them apart, which is what made the Sites
+# module's "Libraries in <site> (N)" list confusing on those sites — see the
+# reported "some sites have 4-6 document libraries" question. We now flag
+# each drive as `is_system` (by name) and include a best-effort `item_count`
+# (the drive root's immediate child count) so the frontend can default to
+# hiding system libraries and show which real libraries are actually empty.
+_SYSTEM_LIBRARY_NAMES = {
+    "site assets", "style library", "form templates",
+    "preservation hold library", "site pages", "wiki pages library",
+    "customized reports", "reporting templates", "converted forms",
+    # Modern/communication-site extras — provisioned the moment SPFx
+    # solutions or the app catalog touch the site; also never where a
+    # user's own documents live.
+    "client side assets", "apps for sharepoint", "site collection documents",
+    "site collection images", "master page gallery", "theme gallery",
+    "web part gallery", "solution gallery", "list template gallery",
+    "images",
+}
+
+
+def _is_system_library(name: str) -> bool:
+    return (name or "").strip().lower() in _SYSTEM_LIBRARY_NAMES
+
+
 @app.get("/api/sites/{site_id}/drives")
+@protected_read_endpoint
 async def discover_site_drives(site_id: str, _session: object = Depends(require_session)):
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission, resolve_site_key
+        with SessionLocal() as db:
+            require_site_permission(db, _session, resolve_site_key(db, site_id), "can_view")
+    real_site_id = site_id
+    fallback_drive = None
+    from .db.base import engine
+    from sqlalchemy import text
+    if engine:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT site_id, drive_id, display_name FROM site_configurations WHERE LOWER(site_key) = :k OR LOWER(site_id) = :k LIMIT 1"),
+                    {"k": site_id.lower()}
+                ).mappings().first()
+                if row:
+                    if row["site_id"] and "," in row["site_id"]:
+                        real_site_id = row["site_id"]
+                    if row["drive_id"]:
+                        fallback_drive = {
+                            "id": row["drive_id"], "name": "Documents", "web_url": "",
+                            "drive_type": "documentLibrary", "is_system": False, "item_count": None,
+                        }
+        except Exception:
+            pass
     try:
-        page = await graph().get(f"/sites/{quote(site_id, safe='')}/drives")
-        return {"drives": [
-            {"id": d["id"], "name": d.get("name") or d["id"],
-             "web_url": d.get("webUrl", ""), "drive_type": d.get("driveType", "")}
-            for d in page.get("value", []) if d.get("id")
-        ]}
-    except GraphError as exc:
-        raise HTTPException(status_code=502, detail=f"SharePoint library discovery failed: {exc}") from exc
+        # $expand=root($select=folder) piggybacks the root folder's childCount
+        # facet onto the same request — no extra Graph round-trip per drive.
+        page = await graph().get(
+            f"/sites/{quote(real_site_id, safe='')}/drives"
+            "?$select=id,name,webUrl,driveType&$expand=root($select=folder)"
+        )
+        drives = []
+        for d in page.get("value", []):
+            if not d.get("id"):
+                continue
+            name = d.get("name") or d["id"]
+            root_folder = ((d.get("root") or {}).get("folder")) or {}
+            drives.append({
+                "id": d["id"],
+                "name": name,
+                "web_url": d.get("webUrl", ""),
+                "drive_type": d.get("driveType", ""),
+                "is_system": _is_system_library(name),
+                # childCount is immediate children only (folders + files), not a
+                # recursive file count, but it's enough to distinguish "empty"
+                # from "has something in it" without walking every library.
+                "item_count": root_folder.get("childCount"),
+            })
+        if drives:
+            return {"drives": drives}
+    except Exception:
+        pass
+    if fallback_drive:
+        return {"drives": [fallback_drive]}
+    return {"drives": []}
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id:path}/children")
+@protected_read_endpoint
 async def site_folder_children(
     site_id: str,
     drive_id: str,
@@ -2957,9 +3582,22 @@ async def site_folder_children(
     x_graph_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    del site_id
-    parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission, resolve_site_key
+        with SessionLocal() as db:
+            require_site_permission(db, _session, resolve_site_key(db, site_id), "can_view")
+    # `_resolve_drive_folder_id` used to be called *before* the try/except
+    # below, so a Graph error while resolving the folder reference (e.g. a
+    # 403 on `/drives/{drive_id}/root` — wrong/stale drive_id, a revoked
+    # grant, or a moved/permission-broken item) propagated completely
+    # uncaught: FastAPI's default handler turns that into a bare 500 with no
+    # JSON body, which is why the browser only ever showed "Internal Server
+    # Error" / "SERVER_ERROR_500" with nothing to act on. Moved inside the
+    # same try so every Graph failure on this endpoint returns a real status
+    # + message instead of vanishing into an opaque 500.
     try:
+        parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
         items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         from .ocr.drawing_category import _extract_vessel_from_folder_path
         parent_path = ""
@@ -2982,7 +3620,7 @@ async def site_folder_children(
         path_parts = [p.strip() for p in parent_path.replace("\\", "/").split("/") if p.strip()]
         detected_dept = ""
         for p in path_parts:
-            if p.lower() in ("technical & crewing", "technical", "technical and crewing", "technical and crewing new", "commercial & chartering", "insurance", "kaizen - knowledge bank", "knowledge bank"):
+            if _match_department(p):
                 detected_dept = p
                 break
         detected_group = ""
@@ -3120,8 +3758,79 @@ async def site_folder_children(
             "summary_counts": summary_counts,
             "items": decorated_items,
         }
+    except HTTPException:
+        # _resolve_drive_folder_id's own 404 ("SharePoint folder not found")
+        # — already a proper HTTPException, don't re-wrap it.
+        raise
+    except GraphError as exc:
+        # A 429 here carries how long the Graph quota cooldown lasts
+        # (GraphClient.request sets exc.retry_after — see graph/client.py).
+        # Passing it through as a real Retry-After header lets the frontend
+        # back off for that long instead of the user hammering "Retry" and
+        # generating more load on an app that's already fully throttled.
+        headers = None
+        if exc.status == 429:
+            headers = {"Retry-After": str(int(exc.retry_after) if exc.retry_after else 60)}
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers=headers) from exc
+    except Exception as exc:
+        # Anything else (a bad drive_id, an unexpected Graph response shape,
+        # etc.) used to fall through to FastAPI's default handler — a bare
+        # 500 with no body, indistinguishable in the browser from a network
+        # blip. Surface the real exception type + message instead.
+        _logger.exception(
+            "site_folder_children failed for site=%s drive=%s folder=%s",
+            site_id, drive_id, folder_id,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+class CreateSiteFolderIn(BaseModel):
+    name: str
+    user_email: str | None = None
+
+
+@app.post("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id:path}/create-folder")
+async def create_site_folder(
+    site_id: str,
+    drive_id: str,
+    folder_id: str,
+    payload: CreateSiteFolderIn,
+    x_graph_access_token: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Create a named sub-folder directly under an arbitrary Graph folder
+    reference (id, name, or slash-delimited path) — used by the Documents
+    module's "New Folder" toolbar action for the plain SharePoint folder
+    tree (Sites / Shared Documents / Documents), where there is no
+    DB-backed folder_id to hang off of like POST /api/folders/{id}/subfolder
+    (see create_subfolder below)."""
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Folder name is required.")
+    if settings.db_configured:
+        from .services.authorization import require_site_permission, resolve_site_key
+        from .db.base import SessionLocal
+        with SessionLocal() as db:
+            require_site_permission(db, _session, resolve_site_key(db, site_id), "can_upload")
+    try:
+        parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
+        item = await gd.ensure_folder(drive_id, parent_id, name)
+    except HTTPException:
+        raise
     except GraphError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "create_site_folder failed for site=%s drive=%s folder=%s name=%s",
+            site_id, drive_id, folder_id, name,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    email = (payload.user_email or x_user_email or "").strip().lower()
+    _log_activity(email, "create_folder", f"Created folder: {name}")
+    invalidate_folder_caches(parent_id)
+    return {**item, "web_url": item.get("webUrl") or "", "status": "completed"}
 
 
 _RECURSIVE_TREE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -3130,15 +3839,28 @@ CACHE_TTL_RECURSIVE_TREE = 600.0  # 10 minutes cache for instant tree loading
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/recursive")
+@protected_read_endpoint
 async def site_folder_recursive_tree(
     site_id: str,
     drive_id: str,
     folder_id: str,
     request: Request,
+    include_tags: bool = True,
+    max_items: int = 2000,
     x_graph_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    cache_key = f"{drive_id}:{folder_id}"
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission, resolve_site_key
+        with SessionLocal() as db:
+            require_site_permission(db, _session, resolve_site_key(db, site_id), "can_view")
+    # include_tags=false skips the per-file listItem/fields $batch lookups
+    # (the slow part) for callers that only need names/paths, e.g. the
+    # Documents Group/Category folder search. max_items is clamped so a
+    # caller can't request an unbounded walk.
+    max_items = max(100, min(int(max_items or 2000), 10000))
+    cache_key = f"{drive_id}:{folder_id}:{int(include_tags)}:{max_items}"
     active = _RECURSIVE_TREE_INFLIGHT.get(cache_key)
     if active is not None:
         return await asyncio.shield(active)
@@ -3148,6 +3870,8 @@ async def site_folder_recursive_tree(
         folder_id=folder_id,
         request=request,
         x_graph_access_token=x_graph_access_token,
+        include_tags=include_tags,
+        max_items=max_items,
     ))
     _RECURSIVE_TREE_INFLIGHT[cache_key] = task
     try:
@@ -3162,13 +3886,15 @@ async def _build_site_folder_recursive_tree(
     folder_id: str,
     request: Request,
     x_graph_access_token: str | None,
+    include_tags: bool = True,
+    max_items: int = 2000,
 ) -> dict[str, Any]:
     """Return every live folder and file below a drive item.
 
     Documents uses this as its read-only live overlay; template rows remain
     separate so empty provisionable folders are still visible.
     """
-    cache_key = f"{drive_id}:{folder_id}"
+    cache_key = f"{drive_id}:{folder_id}:{int(include_tags)}:{max_items}"
     now_ts = time.time()
     cached = _RECURSIVE_TREE_CACHE.get(cache_key)
     if cached and (now_ts - cached[0]) < CACHE_TTL_RECURSIVE_TREE:
@@ -3177,14 +3903,36 @@ async def _build_site_folder_recursive_tree(
     root_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
     folders: list[dict[str, Any]] = []
     visited: set[str] = set()
+    walk_truncated_by_error = False
+
+    # Bounded to a handful in flight at once — an unbounded gather() here fires
+    # one Graph list_children call per sibling folder simultaneously, so a wide
+    # folder (e.g. "Ghana Express" with many vessel/category subfolders) could
+    # launch dozens of concurrent Graph calls, trip Graph's 429 throttling, and
+    # surface as an unhandled GraphError -> 500 on this endpoint (see the
+    # identical fix applied to site_subfolder_counts below). Capping
+    # concurrency avoids the throttling in the first place.
+    _walk_sem = asyncio.Semaphore(4)
 
     async def walk(parent_id: str, parent_path: str, depth: int) -> None:
+        nonlocal walk_truncated_by_error
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client disconnected")
-        if depth > 8 or len(folders) >= 2000 or parent_id in visited:
+        if depth > 8 or len(folders) >= max_items or parent_id in visited:
             return
         visited.add(parent_id)
-        children = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
+        try:
+            async with _walk_sem:
+                children = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
+        except GraphError:
+            # A single throttled/failed branch shouldn't fail the whole tree —
+            # log it, mark the result truncated, and keep whatever else was
+            # already collected instead of bubbling up to a 500.
+            logging.getLogger(__name__).exception(
+                "Recursive folder walk failed for drive=%s parent=%s", drive_id, parent_id,
+            )
+            walk_truncated_by_error = True
+            return
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client disconnected")
         next_nodes = []
@@ -3210,7 +3958,7 @@ async def _build_site_folder_recursive_tree(
     await walk(root_id, "", 0)
 
     # Fast concurrent tag enrichment via Graph $batch for files
-    file_items = [it for it in folders if not it.get("is_folder") and it.get("id")]
+    file_items = [it for it in folders if not it.get("is_folder") and it.get("id")] if include_tags else []
     BATCH_SIZE = 20
     fields_by_id: dict[str, dict] = {}
     if file_items:
@@ -3249,12 +3997,17 @@ async def _build_site_folder_recursive_tree(
         else:
             it["tags"] = {}
 
-    result = {"root_id": root_id, "folders": folders, "truncated": len(folders) >= 10000}
+    result = {
+        "root_id": root_id,
+        "folders": folders,
+        "truncated": len(folders) >= max_items or walk_truncated_by_error,
+    }
     _RECURSIVE_TREE_CACHE[cache_key] = (now_ts, result)
     return result
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/subfolder-counts")
+@protected_read_endpoint
 async def site_subfolder_counts(
     site_id: str,
     drive_id: str,
@@ -3270,14 +4023,27 @@ async def site_subfolder_counts(
         direct_files = len([i for i in items if not i.get("folder")])
         direct_folders = len(folder_items)
 
-        # Concurrently compute counts for all direct child folders with max_depth=2
-        results = await asyncio.gather(*(
-            get_folder_recursive_counts(
-                drive_id, fi["id"], parent_id=parent_id,
-                access_token=x_graph_access_token, max_depth=2,
-            )
-            for fi in folder_items
-        ))
+        # Concurrently compute counts for all direct child folders with max_depth=2.
+        # Bounded to a handful in flight at once — an unbounded gather() here fires
+        # one recursive (depth-2) Graph walk per direct subfolder simultaneously,
+        # so a folder with 20+ subfolders launched 20+ walks at once, each making
+        # several Graph calls of its own. That's what was queuing up the "children"
+        # requests seen in the Network tab (browsers cap ~6 concurrent connections
+        # per host) and tripping Graph's 429 throttling, which in turn made a
+        # revalidating folder view (see SitesPage.tsx client cache) silently keep
+        # showing stale data — including items already deleted upstream — because
+        # the background refresh kept failing. Capping concurrency here fixes the
+        # slow-to-load symptom directly and lets stale views recover reliably.
+        _counts_sem = asyncio.Semaphore(4)
+
+        async def _bounded_counts(fi):
+            async with _counts_sem:
+                return await get_folder_recursive_counts(
+                    drive_id, fi["id"], parent_id=parent_id,
+                    access_token=x_graph_access_token, max_depth=2,
+                )
+
+        results = await asyncio.gather(*(_bounded_counts(fi) for fi in folder_items))
 
         counts_by_id = {fi["id"]: res for fi, res in zip(folder_items, results)}
         total_folders = direct_folders + sum(r["total_subfolders"] for r in results)
@@ -3297,7 +4063,62 @@ async def site_subfolder_counts(
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
+@app.get("/api/sites/{site_id}/drives/{drive_id}/find-folder")
+@protected_read_endpoint
+async def find_site_folder(
+    site_id: str,
+    drive_id: str,
+    name: str,
+    _session: object = Depends(require_session),
+):
+    """Resolve a folder by name anywhere in this drive via Microsoft Graph
+    search — used by the Sites/List-view vessel filter
+    (DocumentsPage.tsx's navigateToSiteVesselFolder) when a vessel's
+    folder hasn't already been walked into the client-side folder cache.
+
+    That client cache only knows about folders reached by a *bounded*
+    recursive walk from wherever the user last browsed
+    (VesselEmail.tsx's _prefetchSiteSubtree, capped at 40 folders/3
+    concurrent), so a vessel whose folder sits outside that walk was
+    silently invisible to the vessel dropdown: selecting it just filtered
+    the already-loaded (irrelevant) rows down to zero and showed "No
+    documents found", even though the vessel plainly has files elsewhere
+    in the site. Graph's own search index covers the whole drive
+    regardless of local walk depth, so this finds it in one call instead
+    of asking the client to keep walking hoping to stumble onto it.
+
+    Returns the first folder whose name matches `name` (case-insensitive,
+    surrounding whitespace ignored) — a vessel's own top-level folder is
+    always named for the vessel, so an exact match (not a fuzzy/partial
+    one, which risks landing on an unrelated deeper folder that merely
+    mentions the vessel) is the right and sufficient rule here — or 404
+    if none does.
+    """
+    del site_id
+    target = name.strip().lower()
+    if not target:
+        raise HTTPException(status_code=400, detail="name is required")
+    try:
+        matches = await gd.search_items(drive_id, name)
+    except GraphError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    for item in matches:
+        if not item.get("folder") or not item.get("id"):
+            continue
+        if (item.get("name") or "").strip().lower() != target:
+            continue
+        ref = (item.get("parentReference") or {}).get("path", "")
+        rel = ref.split("root:", 1)[1].lstrip("/") if "root:" in ref else ""
+        return {
+            "id": item["id"],
+            "name": item["name"],
+            "path": f"{rel}/{item['name']}" if rel else item["name"],
+        }
+    raise HTTPException(status_code=404, detail=f"No folder named {name!r} found in this drive")
+
+
 @app.get("/api/sites/{site_id}/drives/{drive_id}/items/{item_id}")
+@protected_read_endpoint
 async def site_item(site_id: str, drive_id: str, item_id: str, _session: object = Depends(require_session)):
     del site_id
     try:
@@ -3307,6 +4128,7 @@ async def site_item(site_id: str, drive_id: str, item_id: str, _session: object 
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/items/{item_id}/content")
+@protected_read_endpoint
 async def site_item_content(site_id: str, drive_id: str, item_id: str, _session: object = Depends(require_session)):
     del site_id
     try:
@@ -3380,11 +4202,11 @@ def _derive_path_tags(
     path_dept = ""
 
     for p in path_parts:
-        if p.lower() in ("technical & crewing", "technical", "commercial & chartering", "insurance", "kaizen - knowledge bank", "knowledge bank"):
+        if _match_department(p):
             path_dept = p
             break
     if not path_dept:
-        path_dept = "Technical & Crewing"
+        path_dept = _default_department()
 
     if not path_vessel:
         path_vessel = _extract_vessel_from_folder_path(parent_path) or ""
@@ -3520,7 +4342,7 @@ def _derive_path_tags(
         path_group = "Manuals"
 
     return {
-        "department": path_dept or "Technical & Crewing",
+        "department": path_dept or _default_department(),
         "vessel": path_vessel,
         "group": path_group,
         "category": path_cat,
@@ -4101,11 +4923,12 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
         detected_vessel = (tiered.get("vessel") or {}).get("value") or classification.get("vessel_name") or ""
         # Reject if OCR detected a folder/library/department name as vessel (e.g. "Drawings and Manuals August")
         if detected_vessel:
-            _NON_VESSEL_PREFIXES = (
-                "drawings and manuals", "drawings & manuals", "drawing and manual",
-                "technical", "commercial", "insurance", "knowledge bank", "kaizen",
-                "type of vessel", "shared documents", "documents",
-            )
+            _NON_VESSEL_PREFIXES = tuple(dict.fromkeys(
+                ["drawings and manuals", "drawings & manuals", "drawing and manual",
+                 "type of vessel", "shared documents", "documents"]
+                + [a for names in _tag_view().domain_alias_map().values() for a in names]
+                + ["technical", "commercial", "insurance", "knowledge bank", "kaizen"]
+            ))
             _low_v = detected_vessel.lower().strip()
             if any(_low_v.startswith(p) for p in _NON_VESSEL_PREFIXES):
                 detected_vessel = ""
@@ -4115,7 +4938,7 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
         matched_cat_name = best_db_cat.name if best_db_cat else None
         detected_category = (tiered.get("category") or {}).get("value") or classification.get("category") or (matched_cat_name if matched_cat_name not in ("Drawing", "Manual") else fallback_category) or fallback_category
         detected_sub_category = (tiered.get("sub_category") or {}).get("value") or classification.get("sub_category") or classification.get("leaf") or "To be Classified"
-        detected_dept = (tiered.get("department") or {}).get("value") or classification.get("department") or "Technical & Crewing"
+        detected_dept = (tiered.get("department") or {}).get("value") or classification.get("department") or _default_department()
 
         ocr_suggestion = {
             "department": {
@@ -4144,7 +4967,7 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
         path_sub = ""
         path_dept = ""
         for p in path_parts:
-            if p.lower() in ("technical & crewing", "technical", "commercial & chartering", "insurance", "kaizen - knowledge bank", "knowledge bank"):
+            if _match_department(p):
                 path_dept = p
                 break
 
@@ -4288,7 +5111,7 @@ async def _site_scan_file(drive_id: str, item_id: str, access_token: str | None 
 
 
         path_values = {
-            "department": path_dept or "Technical & Crewing",
+            "department": path_dept or _default_department(),
             "vessel": path_vessel,
             "group": path_group,
             "category": path_cat,
@@ -4751,6 +5574,24 @@ async def confirm_site_tags(
     return {"results": results, "confirmed": sum(1 for result in results if result["ok"])}
 
 
+@app.get("/api/sites/{site_id}/term-store-debug")
+async def get_site_term_store_debug(
+    site_id: str,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Admin diagnostic: which Term Store group/set is being read as this
+    site's vessel term set, and every term currently in it — read-only, no
+    writes. Use this to tell apart 'wrong set matched' from 'right set, but
+    it already has a stray/incorrect term in it' when a folder name that
+    isn't a real vessel (e.g. a utility folder like an invoice tracker)
+    shows up as a 'Found in SharePoint' vessel in Vessel Management.
+    """
+    _require_admin(x_user_email)
+    from .graph.drive import debug_term_store_selection
+    return await debug_term_store_selection(site_id)
+
+
 @app.get("/api/sites/{site_id}/term-store-vessels")
 async def get_site_term_store_vessels(site_id: str, _session: object = Depends(require_session)):
     """Return vessel names from the SharePoint Term Store for use in tag dropdowns."""
@@ -4770,6 +5611,7 @@ async def get_site_term_store_vessels(site_id: str, _session: object = Depends(r
     return {"vessels": combined, "site_id": site_id}
 
 
+@app.post("/api/admin/set-default-site")
 @app.post("/api/admin/switch-site")
 async def admin_switch_site(
     request: AdminSwitchSiteRequest,
@@ -4932,6 +5774,7 @@ async def get_admin_site_changes(
                     "new_site": c.new_site,
                     "previous_site_name": c.previous_site_name,
                     "new_site_name": c.new_site_name,
+                    "action": c.reason if c.reason in {"hidden", "unhidden", "removed"} else None,
                     "previous_db_name": c.previous_db_name,
                     "new_db_name": c.new_db_name,
                     "status": c.status,
@@ -5286,7 +6129,7 @@ async def debug_sharepoint_metadata_remediate(
                 source_path=source_path,
             )
 
-            department = _extract_department_from_path(source_path) or _safe_tag_value(tiered.get("department")) or current_department or "Technical & Crewing"
+            department = _extract_department_from_path(source_path) or _safe_tag_value(tiered.get("department")) or current_department or _default_department()
             detected_vessel = _safe_tag_value(tiered.get("vessel"))
             vessel = detected_vessel or current_vessel
             vessel_mismatch = bool(
@@ -5361,8 +6204,94 @@ async def debug_sharepoint_metadata_remediate(
 
 
 @app.get("/api/vessels")
-async def list_vessels(_session: object = Depends(require_session)):
-    return await get_backend().list_vessels()
+async def list_vessels(
+    site_key: str | None = Query(default=None),
+    _session: object = Depends(require_session),
+):
+    return await get_backend().list_vessels(site_key=site_key)
+
+
+@app.get("/api/reports/vessels-excel")
+async def export_vessels_excel(_session: object = Depends(require_session)):
+    """Phase 4 — full vessel + folder summary export, as .xlsx.
+
+    Deliberately independent of any Documents/List View filters: this is a
+    complete snapshot straight from the DB (no live SharePoint calls), with
+    one row per vessel on the 'Vessels' sheet and one row per Folder record
+    tied to a vessel on the 'Folders' sheet (i.e. the actual SharePoint tree
+    that exists today for each vessel — flat root, ad-hoc subfolders, or the
+    legacy department/category tree, whichever applies).
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    with SessionLocal() as db:
+        vessels = db.query(models.Vessel).order_by(models.Vessel.name.asc()).all()
+        folders = (
+            db.query(models.Folder)
+            .filter(models.Folder.vessel_id.isnot(None))
+            .order_by(models.Folder.vessel_id.asc(), models.Folder.path.asc())
+            .all()
+        )
+        vessel_by_id = {v.id: v for v in vessels}
+        folder_counts: dict[int, int] = {}
+        for f in folders:
+            folder_counts[f.vessel_id] = folder_counts.get(f.vessel_id, 0) + 1
+
+    def _fmt(dt) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F6F6B", end_color="1F6F6B", fill_type="solid")
+
+    ws1 = wb.active
+    ws1.title = "Vessels"
+    ws1.append([
+        "Vessel Name", "IMO", "Vessel Type", "Shipyard", "Hull Number",
+        "SharePoint Site", "Vessel Folder Path", "Provisioned", "Folder Count", "Created At",
+    ])
+    for v in vessels:
+        ws1.append([
+            v.name, v.imo or "", v.vessel_type or "", v.shipyard or "", v.hull_number or "",
+            v.provisioned_site_key or "", v.vessel_folder_path or "",
+            "Yes" if v.is_provisioned else "No",
+            folder_counts.get(v.id, 0),
+            _fmt(v.created_at),
+        ])
+
+    ws2 = wb.create_sheet("Folders")
+    ws2.append(["Vessel Name", "IMO", "Folder Path", "Folder Kind", "Month Driven", "SharePoint Site", "Created At"])
+    for f in folders:
+        v = vessel_by_id.get(f.vessel_id)
+        ws2.append([
+            v.name if v else "",
+            (v.imo if v else "") or "",
+            f.path, f.kind, "Yes" if f.month_driven else "No",
+            f.site_id or "",
+            _fmt(f.created_at),
+        ])
+
+    for ws in (ws1, ws2):
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        for i, col in enumerate(ws.columns, start=1):
+            max_len = max((len(str(c.value)) for c in col if c.value is not None), default=10)
+            ws.column_dimensions[get_column_letter(i)].width = min(max(max_len + 2, 12), 50)
+        ws.freeze_panes = "A2"
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"vessel-dms-report-{datetime.utcnow().strftime('%Y%m%d-%H%M')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 _LIVE_SPO_FILES_FETCHING = False
@@ -5534,7 +6463,10 @@ async def list_vessels_flat_tree(
                 active_site_keys.add(str(record.site_key).lower())
         eligible_vessel_ids = [
             vessel.id for vessel in db.query(Vessel).all()
-            if any(str(site).lower() in active_site_keys for site in (vessel.provisioned_site_ids or []))
+            if any(
+                any(site_alias_matches(str(site).strip(), site_key) for site_key in active_site_keys)
+                for site in (vessel.provisioned_site_ids or [])
+            )
         ]
         # Build approved file map: uploadFolderId -> list of (filename, fileId)
         approved_files: dict[str, list[dict]] = {}
@@ -5554,23 +6486,18 @@ async def list_vessels_flat_tree(
                 approved_files[fid] = []
             approved_files[fid].append({"name": ar.filename, "id": ar.target_id or str(ar.id)})
 
-        q = (
-            db.query(Folder, Vessel)
-            .join(Vessel, Folder.vessel_id == Vessel.id)
-            .filter(
-                Folder.kind.in_(["leaf", "month_driven", "drawing_classifier"]),
-                Folder.drive_item_id.isnot(None),
-                Folder.vessel_id.isnot(None),
-                Vessel.id.in_(eligible_vessel_ids),
-            )
-        )
+        target_vessel_ids = eligible_vessel_ids
         if vessel_name:
-            q = q.filter(Vessel.name.ilike(vessel_name.strip()))
+            target_vessel_ids = [
+                vessel_id for (vessel_id,) in db.query(Vessel.id)
+                .filter(Vessel.id.in_(eligible_vessel_ids), Vessel.name.ilike(vessel_name.strip()))
+                .all()
+            ]
         elif vessel_window:
             # Apply paging before loading leaf folders. This keeps the initial
             # Documents view fast and supports loading later vessels in small
             # batches on demand.
-            recent_ids = [
+            target_vessel_ids = [
                 vessel_id for (vessel_id,) in db.query(Vessel.id)
                 .filter(Vessel.id.in_(eligible_vessel_ids))
                 .order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc())
@@ -5578,8 +6505,52 @@ async def list_vessels_flat_tree(
                 .limit(vessel_window)
                 .all()
             ]
-            q = q.filter(Vessel.id.in_(recent_ids))
-        results = q.order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc(), Folder.path.asc()).all()
+
+        # Fetch every folder row for the target vessels once. Previously this
+        # only selected kind IN (leaf, month_driven, drawing_classifier) --
+        # rows shaped by the OLD department-nested template. A flat (Part C)
+        # vessel's own root is kind="ship" and anything manually created
+        # under it (create_subfolder's generic case) is kind="folder", so
+        # neither ever matched and a flat vessel returned zero rows here --
+        # invisible in the Documents / List View. Fetch everything for these
+        # vessels instead and decide per-row below.
+        all_vessel_folders = (
+            db.query(Folder, Vessel)
+            .join(Vessel, Folder.vessel_id == Vessel.id)
+            .filter(
+                Folder.drive_item_id.isnot(None),
+                Folder.vessel_id.isnot(None),
+                Vessel.id.in_(target_vessel_ids),
+            )
+            .order_by(Vessel.created_at.desc().nulls_last(), Vessel.id.desc(), Folder.path.asc())
+            .all()
+        )
+
+        UPLOADABLE_KINDS = {"leaf", "month_driven", "drawing_classifier", "folder"}
+        folders_by_vessel: dict[int, list] = {}
+        for folder_row, vessel_row in all_vessel_folders:
+            folders_by_vessel.setdefault(vessel_row.id, []).append(folder_row)
+
+        results = []
+        for folder_row, vessel_row in all_vessel_folders:
+            if folder_row.kind in UPLOADABLE_KINDS:
+                results.append((folder_row, vessel_row))
+            elif folder_row.kind == "ship":
+                # A flat vessel root is its own browsable/uploadable row only
+                # when nothing has been created under it yet -- once a
+                # subfolder exists, that subfolder's row covers it and the
+                # root would just be a redundant duplicate entry. (Legacy
+                # department-nested "ship" containers always have leaf/
+                # month_driven descendants already, so this never fires for
+                # them.)
+                has_descendant = any(
+                    other.id != folder_row.id
+                    and other.kind in UPLOADABLE_KINDS
+                    and (other.path or "").startswith(f"{folder_row.path}/")
+                    for other in folders_by_vessel.get(vessel_row.id, [])
+                )
+                if not has_descendant:
+                    results.append((folder_row, vessel_row))
 
         # The folder table can contain IDs and paths from an older SharePoint
         # structure or drive. When Graph is available, use the live drive as
@@ -5738,6 +6709,19 @@ async def list_vessels_flat_tree(
             category = clean(parts[4]) if len(parts) > 4 else group
             sub_category = clean(parts[-1]) if len(parts) > 5 else category
             breadcrumb_parts = [vessel_name, group, *[clean(p) for p in parts[4:]]]
+        elif parts and parts[0].lower() == vessel_name.lower():
+            # Flat (Part C) vessel: path is just "{VesselName}" (the root
+            # itself, included above only when nothing else exists under it)
+            # or "{VesselName}/{sub}/..." (a folder created under it). There
+            # is no department here, so "group" is labeled plainly rather
+            # than naming one of the old MAIN_FOLDERS, and the vessel name
+            # isn't duplicated in the breadcrumb the way the branches above
+            # do (those prefix vesselName separately because their own
+            # parts[0] is a department, not the vessel).
+            group = "Vessel Documents"
+            category = clean(parts[1]) if len(parts) > 1 else vessel_name
+            sub_category = clean(parts[-1]) if len(parts) > 2 else category
+            breadcrumb_parts = [vessel_name, *[clean(p) for p in parts[1:]]]
         else:
             group = clean(parts[0]) if parts else ""
             category = clean(parts[-1]) if parts else clean(f.name)
@@ -5803,6 +6787,11 @@ async def create_vessel(
     if vtype and vtype not in VESSEL_TYPES:
         raise HTTPException(400, "Invalid vessel type")
     email = (x_user_email or "").strip().lower()
+    if payload.site_key and settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission
+        with SessionLocal() as db:
+            require_site_permission(db, _session, payload.site_key, "can_upload")
     display_name = email.split("@")[0] if email else None
     try:
         result = await get_backend().create_vessel(
@@ -5813,7 +6802,12 @@ async def create_vessel(
             vessel_type=vtype,
             requesting_email=email,
             requesting_name=display_name,
-            provisioned_site_ids=payload.provisioned_site_ids,
+            # A site selected in the create form is authoritative. Do not let
+            # stale client metadata expand a single-site create.
+            provisioned_site_ids=([payload.site_key] if payload.site_key else payload.provisioned_site_ids),
+            site_key=payload.site_key,
+            parent_folder_path=payload.parent_folder_path,
+            subfolders=payload.subfolders,
         )
         if result.get("status") == "pending":
             return JSONResponse(status_code=202, content={
@@ -5831,6 +6825,22 @@ async def create_vessel(
         _raise(e)
     except BadRequest as e:
         _raise(e)
+    except GraphError as e:
+        logger.exception(
+            "Vessel SharePoint provisioning failed: name=%r site_key=%r parent_folder_path=%r",
+            payload.name,
+            payload.site_key,
+            payload.parent_folder_path,
+        )
+        _raise(e)
+    except Exception as e:
+        logger.exception(
+            "Unexpected vessel creation failure: name=%r site_key=%r parent_folder_path=%r",
+            payload.name,
+            payload.site_key,
+            payload.parent_folder_path,
+        )
+        raise HTTPException(500, "Vessel creation failed. Check the backend log for details.") from e
 
 
 @app.patch("/api/vessels/{vessel_id}")
@@ -5898,6 +6908,7 @@ async def update_vessel(
 async def delete_vessel(
     vessel_id: str,
     vessel_name: str | None = Query(None),
+    reason: str | None = Query(None),
     x_user_email: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
@@ -5909,6 +6920,7 @@ async def delete_vessel(
             vessel_id,
             requesting_email=user_email,
             requesting_name=display_name,
+            reason=reason,
         )
         if result.get("status") == "pending":
             return JSONResponse(status_code=202, content={
@@ -6004,6 +7016,22 @@ async def get_site_provisioning_sites(
     with SessionLocal() as db:
         sites = get_all_configured_sites(db, include_hidden=include_hidden)
         return {"sites": sites, "active_site": settings.active_site}
+
+
+@app.get("/api/admin/sites/{site_key}/folders")
+async def get_admin_site_folders(
+    site_key: str,
+    path: str = Query(default=""),
+    _session: object = Depends(require_session),
+):
+    """Browse immediate folders in a selected site's default document library."""
+    from .services.site_provisioning import list_site_folders
+    try:
+        return await list_site_folders(site_key, path)
+    except GraphError as exc:
+        raise HTTPException(status_code=502, detail=f"SharePoint folder browsing failed: {exc}") from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class UpdateSiteProvisioningItem(BaseModel):
@@ -6117,6 +7145,67 @@ async def repair_vessel_links():
     return await get_backend().repair_vessel_links()
 
 
+@app.post("/api/vessels/sync-from-sharepoint")
+async def sync_vessels_from_sharepoint(
+    payload: VesselSyncIn | None = None,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Admin-triggered (or scheduled) vessel auto-discovery: cross-match
+    every connected SharePoint site's root folders against the DB vessel
+    registry and the Term Store vessel term set. Flags genuinely new
+    folders (in neither) as FolderAnomaly rows for review via the existing
+    Alerts / classify-dialog flow, and proactively creates Term Store
+    entries for DB vessels missing one. Never creates or moves a
+    SharePoint folder. See services/vessel_sync.py.
+    """
+    admin_email = _require_admin(x_user_email)
+    be = get_backend()
+    if not hasattr(be, "sync_vessels_from_sharepoint"):
+        raise HTTPException(501, "Vessel sync requires the live backend (Graph + PostgreSQL configured)")
+    site_key = (payload.site_key if payload else None)
+    summary = await be.sync_vessels_from_sharepoint(site_key=site_key, actor_email=admin_email)
+    # Vessel sync doesn't change the site list, so only mark the dashboard
+    # cache stale. invalidate_dashboard_stats_cache() here (called on every
+    # Home load via the frontend's auto-sync) was discarding every in-flight
+    # dashboard scan and re-persisting old per-site errors indefinitely.
+    from .services.real_backend import mark_dashboard_stats_stale
+    mark_dashboard_stats_stale()
+    return summary
+
+
+@app.post("/api/vessels/confirm-discovered", status_code=201)
+async def confirm_discovered_vessel(
+    payload: ConfirmDiscoveredVesselIn,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Promote a SharePoint-discovered vessel (a 'source: sharepoint' row
+    from GET /api/vessels, or a resolved 'root_vessel_unmatched' alert)
+    into a real Vessel record with IMO/Hull Number — without provisioning
+    a second folder, since original_path already exists in SharePoint.
+    """
+    email = (x_user_email or "").strip().lower()
+    display_name = email.split("@")[0] if email else None
+    be = get_backend()
+    if not hasattr(be, "confirm_discovered_vessel"):
+        raise HTTPException(501, "Not available with the current backend")
+    try:
+        result = await be.confirm_discovered_vessel(
+            payload.name, payload.imo, payload.hull_number,
+            payload.site_key, payload.original_path,
+            requesting_email=email, requesting_name=display_name,
+        )
+        if email:
+            _log_activity(email, "confirm_discovered_vessel", result.get("message"))
+        invalidate_folder_caches()
+        return result
+    except Conflict as e:
+        return JSONResponse(status_code=409, content={"message": str(e)})
+    except BadRequest as e:
+        _raise(e)
+
+
 @app.post("/api/admin/migrate-drawing-folder")
 async def migrate_drawing_folder():
     """One-time migration: for every vessel, collapse the 'Drawing' wrapper
@@ -6223,13 +7312,181 @@ async def stats(_session: object = Depends(require_session)):
 @app.get("/api/dashboard/stats")
 async def dashboard_stats(
     force_refresh: bool = Query(default=False),
+    site_key: str | None = Query(default=None),
     _session: object = Depends(require_session),
 ):
-    """Fast aggregated statistics for the Home/Dashboard module."""
+    """Fast aggregated statistics for the Home/Dashboard module.
+
+    site_key scopes total_documents, total_vessels, and recent_documents to
+    one SharePoint site — same convention as GET /api/vessels?site_key=...
+    Omit it (or pass "all") for the merged, all-sites view.
+    """
     be = get_backend()
     if hasattr(be, "get_dashboard_stats"):
-        return await be.get_dashboard_stats(force_refresh=force_refresh)
+        return await be.get_dashboard_stats(force_refresh=force_refresh, site_key=site_key)
     return await be.stats()
+
+
+_DASHBOARD_DOC_SORTS = {
+    "newest": (lambda d: d.get("modifiedEpoch") or 0, True),
+    "oldest": (lambda d: d.get("modifiedEpoch") or 0, False),
+    "created_newest": (lambda d: d.get("createdEpoch") or 0, True),
+    "name_az": (lambda d: (d.get("name") or "").lower(), False),
+    "name_za": (lambda d: (d.get("name") or "").lower(), True),
+    "size_desc": (lambda d: d.get("sizeBytes") or 0, True),
+    "size_asc": (lambda d: d.get("sizeBytes") or 0, False),
+}
+
+
+def _dashboard_doc_matches_text(
+    doc: dict,
+    q: str,
+    known_vessels: set[str] | None = None,
+) -> bool:
+    """Every whitespace-separated token must appear somewhere in the file's
+    name, folder path, vessel, site or people (partial, case-insensitive)."""
+    hay = " \u0001 ".join(str(doc.get(k) or "") for k in (
+        "name", "subFolderPath", "vessel", "siteName", "type", "modifiedBy", "createdBy",
+    )).lower()
+    clauses = [clause.strip() for clause in re.split(r"[+,;]+", q.lower()) if clause.strip()]
+    if len(clauses) <= 1:
+        tokens = [tok for tok in re.split(r"\s+", q.lower()) if tok]
+        return all(tok in hay for tok in tokens)
+
+    vessel_names = {str(name).strip().lower() for name in (known_vessels or set()) if str(name).strip()}
+    vessel_clauses = [
+        clause for clause in clauses
+        if any(clause == vessel or clause in vessel for vessel in vessel_names)
+    ]
+    other_clauses = [clause for clause in clauses if clause not in vessel_clauses]
+    if vessel_clauses:
+        current_vessel = str(doc.get("vessel") or "").lower()
+        if not any(clause in current_vessel for clause in vessel_clauses):
+            return False
+        return all(clause in hay for clause in other_clauses)
+
+    return all(clause in hay for clause in clauses)
+
+
+@app.get("/api/dashboard/documents")
+async def dashboard_documents(
+    site_key: str | None = Query(default=None),
+    q: str | None = Query(default=None, description="Partial text: name, folder path, vessel, site, people"),
+    vessel: str | None = Query(default=None),
+    file_type: str | None = Query(default=None, description="pdf|word|excel|powerpoint|image|drawing|email|archive|text|other"),
+    person: str | None = Query(default=None, description="Created or last modified by (display name)"),
+    date_field: str = Query(default="modified", pattern="^(modified|created)$"),
+    from_ms: int | None = Query(default=None, description="Inclusive lower bound, epoch ms (client computes day/month ranges in its own time zone)"),
+    to_ms: int | None = Query(default=None, description="Exclusive upper bound, epoch ms"),
+    tz_offset_min: int = Query(default=0, description="JS Date.getTimezoneOffset() of the client, for month facets"),
+    sort: str = Query(default="newest"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=5, le=200),
+    force_refresh: bool = Query(default=False),
+    _session: object = Depends(require_session),
+):
+    """Paged, filtered document list for the Home page (read-only).
+
+    Reads the same cached per-site scan as /api/dashboard/stats, so paging
+    and changing filters doesn't re-query SharePoint. Returns the requested
+    page plus facets (months with counts, vessels, file types, people)
+    computed over the site-scoped list *before* the other filters, so the
+    filter dropdowns always offer every available value.
+    """
+    be = get_backend()
+    scan_pending = False
+    if hasattr(be, "get_dashboard_documents"):
+        result = await be.get_dashboard_documents(force_refresh=force_refresh, site_key=site_key)
+        if isinstance(result, dict):
+            # Current RealBackend shape: {"docs": [...], "pending": bool}.
+            # "pending" means this site_key hasn't completed its first scan
+            # yet, so `docs` is a cold-start placeholder, not a real "zero
+            # documents" answer — surfaced below as scan_pending so the
+            # frontend's global search can retry instead of caching an
+            # empty result forever (see get_dashboard_documents's docstring).
+            docs = list(result.get("docs") or [])
+            scan_pending = bool(result.get("pending"))
+        else:
+            # Back-compat: a backend implementation that still returns the
+            # plain list[dict] shape has no pending info to give.
+            docs = list(result or [])
+    else:
+        stats_payload = await be.stats()
+        docs = list(stats_payload.get("documents") or stats_payload.get("recent_documents") or [])
+
+    known_vessels = {str(d.get("vessel") or "").strip().lower() for d in docs if d.get("vessel")}
+
+    epoch_key = "createdEpoch" if date_field == "created" else "modifiedEpoch"
+    tz_shift = timedelta(minutes=-tz_offset_min)  # getTimezoneOffset is UTC - local
+
+    month_counts: dict[str, int] = {}
+    vessel_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    people: set[str] = set()
+    for d in docs:
+        ep = d.get(epoch_key) or d.get("modifiedEpoch")
+        if ep:
+            local = datetime.fromtimestamp(ep / 1000, tz=timezone.utc) + tz_shift
+            key = local.strftime("%Y-%m")
+            month_counts[key] = month_counts.get(key, 0) + 1
+        v = d.get("vessel") or "Not Listed"
+        vessel_counts[v] = vessel_counts.get(v, 0) + 1
+        t = d.get("fileType") or "other"
+        type_counts[t] = type_counts.get(t, 0) + 1
+        for who in (d.get("modifiedBy"), d.get("createdBy")):
+            if who:
+                people.add(who)
+
+    vessel_low = (vessel or "").strip().lower()
+    type_low = (file_type or "").strip().lower()
+    person_low = (person or "").strip().lower()
+    text = (q or "").strip()
+
+    def keep(d: dict) -> bool:
+        if vessel_low and vessel_low != "all" and (d.get("vessel") or "Not Listed").strip().lower() != vessel_low:
+            return False
+        if type_low and type_low != "all" and (d.get("fileType") or "other") != type_low:
+            return False
+        if person_low and person_low != "all" and person_low not in (
+            (d.get("modifiedBy") or "").lower(), (d.get("createdBy") or "").lower()
+        ):
+            return False
+        ep = d.get(epoch_key) or d.get("modifiedEpoch") or 0
+        if from_ms is not None and ep < from_ms:
+            return False
+        if to_ms is not None and ep >= to_ms:
+            return False
+        if text and not _dashboard_doc_matches_text(d, text, known_vessels):
+            return False
+        return True
+
+    filtered = [d for d in docs if keep(d)]
+    sort_key, reverse = _DASHBOARD_DOC_SORTS.get(sort, _DASHBOARD_DOC_SORTS["newest"])
+    filtered.sort(key=sort_key, reverse=reverse)
+
+    total = len(filtered)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    return {
+        "items": filtered[start:start + page_size],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        # True while this site_key's first dashboard scan is still running
+        # in the background (see get_dashboard_documents) — an empty/short
+        # `items` here is a cold-cache placeholder, not necessarily "no
+        # matches". The frontend uses this to avoid permanently caching a
+        # search term as "no results" for a site it just switched to.
+        "scan_pending": scan_pending,
+        "facets": {
+            "months": [{"month": k, "count": month_counts[k]} for k in sorted(month_counts, reverse=True)],
+            "vessels": [{"name": k, "count": vessel_counts[k]} for k in sorted(vessel_counts, key=lambda x: (x == "Not Listed", x.lower()))],
+            "file_types": [{"type": k, "count": type_counts[k]} for k in sorted(type_counts, key=lambda x: -type_counts[x])],
+            "people": sorted(people, key=str.lower),
+        },
+    }
 
 
 
@@ -6241,6 +7498,7 @@ async def upload_by_path(
     uploader_email: str | None = Form(None),
     uploader_name: str | None = Form(None),
     user_email: str | None = Form(None),
+    site_key: str | None = Form(None),
     x_user_email: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
@@ -6248,6 +7506,12 @@ async def upload_by_path(
     given as a logical path. When resolve_only=true, just returns the resolved
     folder_id without uploading (used by the frontend to resolve path-based IDs)."""
     path = (path or "").lstrip("/").strip()
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission
+        active_site = site_key or settings.active_site
+        with SessionLocal() as db:
+            require_site_permission(db, _session, active_site, "can_upload")
     if resolve_only:
         try:
             folder_id = await get_backend().resolve_path(path)
@@ -6596,7 +7860,7 @@ async def ocr_extract_and_classify(
         suggested_tags["category"] = classification.get("category") or (matched_cat_name if matched_cat_name not in ("Drawing", "Manual") else fallback_category) or fallback_category
         low_confidence_fallback = bool(not best_db_cat and db_conf < 0.40)
         suggested_tags["sub_category"] = "To be Classified" if low_confidence_fallback else (classification.get("sub_category") or "General Arrangement")
-        suggested_tags["department"] = classification.get("department") or "Technical & Crewing"
+        suggested_tags["department"] = classification.get("department") or _default_department()
 
     text_preview = (extracted.strip()[:1000] + "...") if len(extracted.strip()) > 1000 else extracted.strip()
 
@@ -6790,7 +8054,7 @@ async def _process_staging_ocr(
         # so Group/Category/SubCategory are still auto-populated.
         if settings.sp_configured and item.drive_item_id:
             try:
-                department_val = _safe_tag_value(tiered.get("department")) or _extract_department_from_path(item.source_subfolder_path) or "Technical & Crewing"
+                department_val = _safe_tag_value(tiered.get("department")) or _extract_department_from_path(item.source_subfolder_path) or _default_department()
                 # Only write vessel when OCR/tag value is present. Do not fallback
                 # to source path vessel for SharePoint metadata.
                 vessel_val = _safe_tag_value(tiered.get("vessel")) or ""
@@ -6845,6 +8109,7 @@ async def stage_file_for_ocr(
     vessel_name: str | None = Form(None),
     upload_source: str = Form("direct"),
     uploaded_by_email: str | None = Form(None),
+    site_key: str | None = Form(None),
     file: UploadFile = None,
     x_user_email: str | None = Header(default=None),
     x_graph_access_token: str | None = Header(default=None),
@@ -6857,6 +8122,11 @@ async def stage_file_for_ocr(
     import json
 
     email = uploaded_by_email or x_user_email or "unknown@example.com"
+    if settings.db_configured:
+        from .services.authorization import require_site_permission
+        active_site = site_key or settings.active_site
+        with SessionLocal() as db:
+            require_site_permission(db, _session, active_site, "can_tag_on_upload")
     file_bytes = None
     if file is not None:
         file_bytes = await file.read()
@@ -7268,7 +8538,7 @@ async def move_staging_file(
                 logger.warning("Failed to validate tag definitions: %s", e)
 
         # Resolve path template: physical folder ends at Category level (Sub-Category is metadata tag only)
-        template_str = category.dms_path_template if category and category.dms_path_template else "Technical & Crewing/{vessel}/Drawings and Manuals/{group}/{category}"
+        template_str = category.dms_path_template if category and category.dms_path_template else f"{_default_department()}/{{vessel}}/Drawings and Manuals/{{group}}/{{category}}"
         # Strip any legacy trailing {sub_category} or {subcategory} segment from folder path template
         template_str = re.sub(r"/\{sub_?category\}", "", template_str, flags=re.IGNORECASE)
 
@@ -7276,7 +8546,7 @@ async def move_staging_file(
         known_vessels = _get_vessels_for_ocr(db)
         source_vessel = _extract_vessel_from_path(item.source_subfolder_path, known_vessels)
         category_department = (category.department if category and getattr(category, "department", None) else None)
-        inferred_department = source_department or category_department or suggested_tags.get("department") or "Technical & Crewing"
+        inferred_department = source_department or category_department or suggested_tags.get("department") or _default_department()
 
         extracted_vessel = str(
             suggested_tags.get("vessel")
@@ -7393,7 +8663,7 @@ async def move_staging_file(
                     subcategory_for_sharepoint = "To be Classified"
 
                 column_payload = _build_sharepoint_metadata_payload(
-                    department=department_raw or inferred_department or "Technical & Crewing",
+                    department=department_raw or inferred_department or _default_department(),
                     vessel=vessel_for_sharepoint,
                     group=group_for_sharepoint,
                     category=category_for_sharepoint,
@@ -7414,7 +8684,7 @@ async def move_staging_file(
                         item.drive_item_id,
                         item.status,
                         vessel_for_sharepoint,
-                        department_raw or inferred_department or "Technical & Crewing",
+                        department_raw or inferred_department or _default_department(),
                         group_for_sharepoint,
                         category_for_sharepoint,
                         subcategory_for_sharepoint,
@@ -7479,304 +8749,6 @@ async def dismiss_staging_file(
         item.status = "dismissed"
         db.commit()
         return {"ok": True, "id": item.id, "message": "Item dismissed from staging queue"}
-
-
-@app.post("/api/ocr/route-and-upload")
-async def ocr_route_and_upload(
-    path: str = Form(...),
-    file: UploadFile = None,
-    vessel_name: str | None = Form(None),
-    group: str | None = Form(None),
-    category: str | None = Form(None),
-    sub_category: str | None = Form(None),
-    uploader_email: str | None = Form(None),
-    uploader_name: str | None = Form(None),
-    user_email: str | None = Form(None),
-    x_user_email: str | None = Header(default=None),
-    _session: object = Depends(require_session),
-):
-    """Upload and auto-route an OCR-classified document to its exact SharePoint destination folder."""
-    if file is None:
-        raise HTTPException(400, "File is required")
-
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "Uploaded file is empty")
-
-    target_path = (path or "").lstrip("/").strip()
-    email = uploader_email or user_email or x_user_email or "unknown@example.com"
-    name = uploader_name or email.split("@")[0]
-
-    try:
-        folder_id = await _resolve_or_create_sharepoint_path(target_path)
-        result = await get_backend().upload(
-            folder_id, file.filename, data, file.content_type, email, name
-        )
-        dest = result.get("destination") if isinstance(result, dict) else None
-        log_detail = f"OCR Upload: {file.filename} -> {target_path}"
-        if dest:
-            log_detail += f"|{dest}"
-        _log_activity(email, "ocr_file_upload", log_detail)
-        invalidate_folder_caches(folder_id)
-        return {
-            "ok": True,
-            "filename": file.filename,
-            "target_path": target_path,
-            "folder_id": folder_id,
-            "upload_result": result,
-            "tags": {
-                "VesselName": vessel_name,
-                "Group": group,
-                "Category": category,
-                "SubCategory": sub_category,
-            },
-        }
-    except (NotFound, BadRequest, Conflict) as e:
-        _raise(e)
-    except GraphError as e:
-        if e.status == 429:
-            raise HTTPException(429, "SharePoint is temporarily throttling requests. Please retry shortly.")
-        raise HTTPException(e.status, f"SharePoint upload failed: {str(e)}")
-    except Exception as e:
-        logger.exception("OCR route-and-upload failure: path=%s file=%s error=%s", target_path, file.filename if file else None, e)
-        raise HTTPException(status_code=500, detail=f"Failed to route document to {target_path}: {str(e)}")
-
-
-@app.post("/api/ocr/classify-existing-file")
-async def ocr_classify_existing_file(
-    item_id: str = Form(...),
-    filename: str | None = Form(None),
-    _session: object = Depends(require_session),
-):
-    """Run OCR extraction and AI classification on an existing file stored in SharePoint."""
-    from .ocr.extract import extract_text
-    from .ocr.drawing_category import classify_document_content, classify_against_db_categories, DRAWING_TAXONOMY, MANUAL_TAXONOMY, classify_all_fields_tiered
-    import json
-
-    data: bytes = b""
-    fname = filename or "document.pdf"
-    ctype = "application/pdf"
-
-    try:
-        if settings.sp_configured:
-            content, mime, actual_name = await gd.download_file(settings.sp_drive_id, item_id)
-            data = content
-            fname = filename or actual_name
-            ctype = mime or ctype
-    except Exception as exc:
-        logger.warning("Failed to download existing file %s for OCR: %s", item_id, exc)
-
-    extracted = ""
-    if data:
-        try:
-            extracted = extract_text(data, fname, ctype)
-        except Exception as exc:
-            logger.warning("OCR text extraction fallback for existing %s: %s", fname, exc)
-
-    # Fetch registered vessel names and DB categories
-    vessel_names: list[Any] = []
-    db_categories = []
-    if settings.db_configured:
-        try:
-            from .db.base import SessionLocal
-            from .db import models as db_models
-            with SessionLocal() as db:
-                vessel_names = _get_vessels_for_ocr(db)
-                db_categories = db.query(db_models.DocumentCategory).filter(db_models.DocumentCategory.is_active == True).all()
-        except Exception:
-            pass
-    if not vessel_names:
-        try:
-            v_list = await get_backend().list_vessels()
-            vessel_names = [v["name"] for v in v_list if isinstance(v, dict) and "name" in v]
-        except Exception:
-            vessel_names = []
-
-    classification = classify_document_content(extracted, filename=fname, known_vessels=vessel_names)
-    tiered = classify_all_fields_tiered(extracted, filename=fname, known_vessels=vessel_names)
-    best_db_cat, db_conf, db_matches = classify_against_db_categories(extracted, filename=fname, db_categories=db_categories)
-
-    matched_cat_id = None
-    matched_cat_name = None
-    tag_fields = []
-    suggested_tags: dict[str, Any] = {}
-
-    if best_db_cat and db_conf >= classification["confidence"]:
-        matched_cat_id = best_db_cat.id
-        matched_cat_name = best_db_cat.name
-        confidence = db_conf
-        matched_keywords = list(set(classification["matched_keywords"] + db_matches))
-        if best_db_cat.tag_fields_json:
-            try:
-                tag_fields = json.loads(best_db_cat.tag_fields_json)
-            except Exception:
-                tag_fields = []
-    else:
-        confidence = classification["confidence"]
-        matched_keywords = classification["matched_keywords"]
-        built_in_cat_name = "Drawing" if classification["sub_category_1"] == "Drawing" else "Manual"
-        matched_db = next((c for c in db_categories if c.name.lower() == built_in_cat_name.lower()), None)
-        if matched_db:
-            matched_cat_id = matched_db.id
-            matched_cat_name = matched_db.name
-            if matched_db.tag_fields_json:
-                try:
-                    tag_fields = json.loads(matched_db.tag_fields_json)
-                except Exception:
-                    tag_fields = []
-
-    if confidence >= 0.40:
-        detected_vessel = (tiered.get("vessel") or {}).get("value") or classification.get("vessel_name") or ""
-        detected_group = (tiered.get("group") or {}).get("value") or classification.get("group") or "Drawing"
-        fallback_category = "To be Classified" if detected_group == "Manual" else "Basic"
-        detected_category = (tiered.get("category") or {}).get("value") or classification.get("category") or ""
-        detected_sub_category = (tiered.get("sub_category") or {}).get("value") or classification.get("sub_category") or classification.get("leaf") or ""
-        low_confidence_fallback = bool(not best_db_cat and db_conf < 0.40)
-
-        suggested_tags["vessel"] = detected_vessel
-        suggested_tags["group"] = detected_group
-        suggested_tags["category"] = detected_category or (matched_cat_name if matched_cat_name not in ("Drawing", "Manual") else fallback_category) or fallback_category
-        suggested_tags["sub_category"] = "To be Classified" if low_confidence_fallback else (detected_sub_category or "To be Classified")
-        suggested_tags["department"] = (tiered.get("department") or {}).get("value") or classification.get("department") or "Technical & Crewing"
-        if classification.get("leaf"):
-            suggested_tags["leaf"] = classification["leaf"]
-
-    text_preview = (extracted.strip()[:1000] + "...") if len(extracted.strip()) > 1000 else extracted.strip()
-
-    return {
-        "item_id": item_id,
-        "filename": fname,
-        "file_size": len(data),
-        "content_type": ctype,
-        "text_preview": text_preview,
-        "text_length": len(extracted),
-        "detected_vessel": classification["vessel_name"],
-        "detected_group": classification["group"],
-        "detected_category": classification["category"],
-        "detected_sub_category_1": classification["sub_category_1"],
-        "detected_sub_category_2": classification["sub_category_2"],
-        "detected_leaf": classification["leaf"],
-        "suggested_path": classification["suggested_path"],
-        "confidence": confidence,
-        "matched_keywords": matched_keywords,
-        "matched_category_id": matched_cat_id,
-        "matched_category_name": matched_cat_name,
-        "tag_fields": tag_fields,
-        "suggested_tags": suggested_tags,
-        "available_vessels": sorted(vessel_names),
-        "available_departments": template.ALL_MAIN_FOLDERS,
-        "drawing_taxonomy": {cat: list(leaves.keys()) for cat, leaves in DRAWING_TAXONOMY.items()},
-        "manual_taxonomy": {cat: list(leaves.keys()) for cat, leaves in MANUAL_TAXONOMY.items()},
-    }
-
-
-@app.post("/api/ocr/move-and-tag-existing")
-async def ocr_move_and_tag_existing(
-    item_id: str = Form(...),
-    target_path: str = Form(...),
-    vessel_name: str | None = Form(None),
-    group: str | None = Form(None),
-    category: str | None = Form(None),
-    sub_category: str | None = Form(None),
-    department: str | None = Form(None),
-    user_email: str | None = Form(None),
-    x_user_email: str | None = Header(default=None),
-    x_graph_access_token: str | None = Header(default=None),
-    x_sp_access_token: str | None = Header(default=None),
-    _session: object = Depends(require_session),
-):
-    """Relocate an existing SharePoint document to its OCR-classified canonical destination folder."""
-    target_path = (target_path or "").lstrip("/").strip()
-    email = user_email or x_user_email or "unknown@example.com"
-
-    try:
-        target_folder_id = await _resolve_or_create_sharepoint_path(target_path)
-        move_result = None
-        source_folder_id = None
-        metadata_patch_result: dict[str, Any] = {"ok": False, "attempted": False, "reason": "sp_not_configured"}
-        if settings.sp_configured:
-            try:
-                src_item = await gd.get_item(settings.sp_drive_id, item_id, access_token=x_graph_access_token)
-                source_folder_id = (src_item.get("parentReference") or {}).get("id")
-            except Exception:
-                pass
-            move_result = await gd.move_item(
-                settings.sp_drive_id,
-                item_id,
-                target_folder_id,
-                access_token=x_graph_access_token,
-            )
-
-            # Persist OCR-derived metadata (not only vessel) after moving the file.
-            category_for_sharepoint = (category or "").strip() or "To be Classified"
-            subcategory_for_sharepoint = (sub_category or "").strip() or "To be Classified"
-            group_for_sharepoint = _normalize_metadata_group((group or "").strip(), category_for_sharepoint)
-
-            if category_for_sharepoint.lower() == "to be classified":
-                # Preserve OCR-derived group when present; fallback only if missing.
-                if not group_for_sharepoint:
-                    group_for_sharepoint = "Manuals"
-                if not subcategory_for_sharepoint:
-                    subcategory_for_sharepoint = "To be Classified"
-
-            if not group_for_sharepoint:
-                group_for_sharepoint = _normalize_metadata_group("", category_for_sharepoint) or "Manuals"
-
-            department_for_sharepoint = (department or "").strip() or _extract_department_from_path(target_path) or "Technical & Crewing"
-            vessel_for_sharepoint = (vessel_name or "").strip()
-
-            column_payload = _build_sharepoint_metadata_payload(
-                department=department_for_sharepoint,
-                vessel=vessel_for_sharepoint,
-                group=group_for_sharepoint,
-                category=category_for_sharepoint,
-                sub_category=subcategory_for_sharepoint,
-            )
-
-            try:
-                metadata_patch_result = await gd.update_file_columns(
-                    settings.sp_drive_id,
-                    item_id,
-                    column_payload,
-                    access_token=x_graph_access_token,
-                    sp_access_token=x_sp_access_token,
-                )
-            except Exception as col_err:
-                logger.warning("Non-fatal: could not patch SharePoint metadata columns for existing item %s: %s", item_id, col_err)
-                metadata_patch_result = {
-                    "ok": False,
-                    "attempted": True,
-                    "error": str(col_err),
-                }
-
-        _log_activity(email, "ocr_file_move", f"Moved file {item_id} -> {target_path}")
-        if source_folder_id:
-            invalidate_folder_caches(source_folder_id)
-        invalidate_folder_caches(target_folder_id)
-        return {
-            "ok": True,
-            "item_id": item_id,
-            "target_path": target_path,
-            "target_folder_id": target_folder_id,
-            "move_result": move_result,
-            "metadata_patch": metadata_patch_result,
-            "tags": {
-                "VesselName": vessel_name,
-                "Group": group,
-                "Category": category,
-                "SubCategory": sub_category,
-                "Department": department,
-            },
-        }
-    except (NotFound, BadRequest, Conflict) as e:
-        _raise(e)
-    except GraphError as e:
-        if e.status == 429:
-            raise HTTPException(429, "SharePoint is temporarily throttling requests. Please retry shortly.")
-        raise HTTPException(e.status, f"SharePoint file relocation failed: {str(e)}")
-    except Exception as e:
-        logger.exception("OCR move-and-tag-existing failure: item=%s target=%s error=%s", item_id, target_path, e)
-        raise HTTPException(status_code=500, detail=f"Failed to relocate file: {str(e)}")
 
 
 @app.get("/api/folders/upload-by-path")
@@ -7846,14 +8818,21 @@ async def upload(
     uploader_email: str | None = Form(None),
     uploader_name: str | None = Form(None),
     user_email: str | None = Form(None),
+    site_key: str | None = Form(None),
     x_user_email: str | None = Header(default=None),
     x_graph_access_token: str | None = Header(default=None),
     x_sp_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
-    """Stages the file and creates a pending approval request — it is no
-    longer saved into the folder directly. See docs on the approval workflow
-    in services/stub_backend.py / services/real_backend.py."""
+    """Uploads the file directly into the folder and logs it as a completed
+    activity. (Approvals were removed — this docstring previously described
+    a pending-approval staging step that no longer exists.)"""
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission
+        active_site = site_key or settings.active_site
+        with SessionLocal() as db:
+            require_site_permission(db, _session, active_site, "can_upload")
     data = await file.read()
     email = uploader_email or user_email or x_user_email or "unknown@example.com"
     name = uploader_name or email.split("@")[0]
@@ -7888,14 +8867,13 @@ class CreateSubfolderIn(BaseModel):
 
 
 @app.delete("/api/folders/{folder_id}")
-async def delete_folder(folder_id: str, user_email: str | None = Query(None), folder_name: str | None = Query(None), x_user_email: str | None = Header(default=None), _session: object = Depends(require_session)):
-    """Delete a folder and all its contents (or stage a pending approval for
-    non-admin users)."""
+async def delete_folder(folder_id: str, user_email: str | None = Query(None), folder_name: str | None = Query(None), reason: str | None = Query(None), x_user_email: str | None = Header(default=None), _session: object = Depends(require_session)):
+    """Delete a folder and all its contents immediately."""
     email = (user_email or x_user_email or "").strip().lower()
     display_name = email.split("@")[0] if email else None
     try:
         result = await get_backend().delete_folder(
-            folder_id, requesting_email=email, requesting_name=display_name
+            folder_id, requesting_email=email, requesting_name=display_name, reason=reason,
         )
     except (NotFound, BadRequest) as e:
         _raise(e)
@@ -7914,8 +8892,10 @@ async def delete_folder(folder_id: str, user_email: str | None = Query(None), fo
 
 @app.post("/api/folders/{folder_id}/subfolder")
 async def create_subfolder(folder_id: str, payload: CreateSubfolderIn, x_user_email: str | None = Header(default=None), _session: object = Depends(require_session)):
-    """Manually create a named sub-folder inside a month_driven folder (or
-    stage a pending approval for non-admin users)."""
+    """Manually create a named sub-folder, immediately: inside a
+    month_driven folder (legacy behavior — auto-provisions category
+    children), or at any depth inside any folder that belongs to a vessel
+    (see RealBackend.create_subfolder)."""
     email = (payload.user_email or x_user_email or "").strip().lower()
     display_name = email.split("@")[0] if email else None
     try:
@@ -8135,6 +9115,80 @@ async def restore_item(
     return {"status": "completed", "message": result.get("message")}
 
 
+@app.post("/api/archive/{item_id}/recycle")
+async def move_archived_item_to_recycle_bin(
+    item_id: str, type: str = Query("folder"), user_email: str | None = Query(None),
+    reason: str | None = Query(None),
+    x_user_email: str | None = Header(default=None), _session: object = Depends(require_session),
+):
+    """Archive page's 'Move to Recycle Bin' action — distinct from Restore:
+    deletes the underlying SharePoint item (same delete_file/delete_folder
+    path, and the same admin-approval gating, as a normal Documents
+    delete) and clears its archived flag, since it's now tracked by the
+    Recycle Bin's own deletion log instead."""
+    email = (user_email or x_user_email or "").strip().lower()
+    display_name = email.split("@")[0] if email else None
+    try:
+        result = await get_backend().move_archived_to_recycle_bin(
+            item_id, type, requesting_email=email, requesting_name=display_name, reason=reason,
+        )
+    except (NotFound, BadRequest) as e:
+        _raise(e)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to move archived item to Recycle Bin: {e}")
+    if result.get("status") == "pending":
+        return JSONResponse(status_code=202, content={
+            "status": "pending", "action_type": "archive_to_recycle_bin",
+            "approval_id": result.get("approval_id"), "message": result.get("message"),
+        })
+    _log_activity(email, "archive_to_recycle_bin", f"Moved archived item to Recycle Bin: {item_id}")
+    return {"status": "completed", "message": result.get("message")}
+
+
+class LogDeletionIn(BaseModel):
+    item_type: str  # "vessel" | "folder" | "file"
+    drive_item_id: str | None = None
+    name: str
+    original_path: str | None = None
+    site_name: str | None = None
+    site_key: str | None = None
+    reason: str | None = None
+
+
+@app.post("/api/recycle-bin/log-deletion")
+async def log_deletion(
+    payload: LogDeletionIn,
+    x_user_email: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Records a deletion that already happened client-side — the common
+    path, where the SPFx web part deletes a folder/file directly against
+    Graph (so it lands in SharePoint's own Recycle Bin instantly) rather
+    than through this backend's own delete_folder/delete_file. The frontend
+    calls this right after that Graph delete succeeds so 'Deleted By' and
+    the optional deletion reason are captured immediately, instead of
+    waiting on the native-SPO reconciliation poll. Writes to the same
+    deletion_log table (services.real_backend._record_deletion) that both
+    the Recycle Bin and the live deletion popup read from."""
+    email = (x_user_email or "").strip().lower()
+    display_name = email.split("@")[0] if email else None
+    try:
+        result = await get_backend().log_deletion(
+            item_type=payload.item_type,
+            drive_item_id=payload.drive_item_id,
+            name=payload.name,
+            original_path=payload.original_path,
+            site_name=payload.site_name,
+            site_key=payload.site_key,
+            requesting_email=email,
+            requesting_name=display_name,
+            reason=payload.reason,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to log deletion: {e}")
+    return result
+
+
 @app.get("/api/recycle-bin/ids")
 async def get_deleted_ids(_session: object = Depends(require_session)):
     try:
@@ -8206,140 +9260,6 @@ async def permanent_delete_item(
 
 
 # ---------------------------------------------------------------------------
-# Approval workflow (admin only)
-# ---------------------------------------------------------------------------
-
-@app.get("/api/my-approvals")
-async def list_my_approvals(
-    status: str | None = None, x_user_email: str | None = Header(default=None), _session: object = Depends(require_session)
-):
-    if not x_user_email:
-        raise HTTPException(400, "X-User-Email header required")
-    email = x_user_email.strip().lower()
-    approvals = await get_backend().list_approvals(status)
-    return [a for a in approvals if a.get("uploaded_by_email", "").strip().lower() == email]
-
-
-@app.get("/api/approvals")
-async def list_approvals(status: str | None = None, q: str | None = None, admin: str = Depends(_require_admin), _session: object = Depends(require_session)):
-    return await get_backend().list_approvals(status, q)
-
-
-
-@app.get("/api/approvals/{request_id}")
-async def get_approval(
-    request_id: str,
-    x_user_email: str | None = Header(default=None)
-):
-    email = (x_user_email or "").strip().lower()
-    if not email:
-        raise HTTPException(400, "X-User-Email header required")
-    approval = await get_backend().get_approval(request_id)
-    if not approval:
-        raise HTTPException(404, "Approval request not found")
-    
-    is_admin = _is_admin_email(email)
-    is_uploader = approval.get("uploaded_by_email", "").strip().lower() == email
-    if not (is_admin or is_uploader):
-        raise HTTPException(403, "Access denied")
-    return approval
-
-
-@app.get("/api/approvals/{request_id}/preview")
-async def approval_preview(
-    request_id: str,
-    x_user_email: str | None = Header(default=None),
-    admin: str | None = None
-):
-    email = (x_user_email or admin or "").strip().lower()
-    if not email:
-        raise HTTPException(400, "X-User-Email header or admin query parameter required")
-    approval = await get_backend().get_approval(request_id)
-    if not approval:
-        raise HTTPException(404, "Approval request not found")
-    
-    is_admin = _is_admin_email(email)
-    is_uploader = approval.get("uploaded_by_email", "").strip().lower() == email
-    if not (is_admin or is_uploader):
-        raise HTTPException(403, "Administrator access required")
-    
-    result = await get_backend().get_approval_file(request_id)
-    if result is None:
-        raise HTTPException(404, "Staged file not found")
-    content, content_type, name = result
-    return Response(
-        content=content,
-        media_type=content_type,
-        headers={"Content-Disposition": f'inline; filename="{name}"'},
-    )
-
-
-@app.post("/api/approvals/{request_id}/approve")
-async def approve_approval(request_id: str, admin: str = Depends(_require_admin), _session: object = Depends(require_session)):
-    try:
-        res = await get_backend().approve_request(request_id, admin)
-        invalidate_folder_caches()
-        return res
-    except (NotFound, BadRequest, Conflict) as e:
-        _raise(e)
-
-
-@app.post("/api/approvals/{request_id}/reject")
-async def reject_approval(
-    request_id: str, payload: RejectIn, admin: str = Depends(_require_admin), _session: object = Depends(require_session)
-):
-    reason = (payload.reason or "").strip()
-    if not reason:
-        raise HTTPException(400, "A rejection reason is required")
-    try:
-        res = await get_backend().reject_request(request_id, admin, reason)
-        invalidate_folder_caches()
-        return res
-    except (NotFound, BadRequest, Conflict) as e:
-        _raise(e)
-
-
-@app.delete("/api/approvals/{request_id}")
-async def delete_approval(
-    request_id: str,
-    admin: str = Depends(_require_admin),
-    _session: object = Depends(require_session),
-):
-    """Permanently delete a single approval record (for cleanup of approved/rejected items)."""
-    from .db.base import SessionLocal
-    from .db import models as _m
-    with SessionLocal() as db:
-        row = db.get(_m.ApprovalRequest, int(request_id)) if request_id.isdigit() else None
-        if row is None:
-            raise HTTPException(404, "Approval record not found")
-        db.delete(row)
-        db.commit()
-    return {"deleted": True, "id": request_id}
-
-
-@app.delete("/api/approvals")
-async def bulk_delete_approvals(
-    status: str | None = None,
-    admin: str = Depends(_require_admin),
-    _session: object = Depends(require_session),
-):
-    """Bulk-delete approval records by status (e.g. approved, rejected, cancelled).
-    Only non-pending rows may be bulk-deleted for safety."""
-    from .db.base import SessionLocal
-    from .db import models as _m
-    allowed_statuses = {"approved", "rejected", "cancelled"}
-    if not status or status.lower() not in allowed_statuses:
-        raise HTTPException(400, f"status must be one of: {', '.join(sorted(allowed_statuses))}")
-    with SessionLocal() as db:
-        deleted = db.query(_m.ApprovalRequest).filter(
-            _m.ApprovalRequest.entry_kind == "approval",
-            _m.ApprovalRequest.status == status.lower(),
-        ).delete(synchronize_session=False)
-        db.commit()
-    return {"deleted": deleted, "status": status}
-
-
-# ---------------------------------------------------------------------------
 # Folder-creation alerts (top-header alert bell)
 # ---------------------------------------------------------------------------
 
@@ -8389,6 +9309,33 @@ async def list_all_alerts(
             "alert_type": "email_alert", "alert_category": "email", "read": False,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         } for row in emails)
+
+        # Live deletion popup + bell: one deletion_log row per deletion,
+        # whether captured through this app's own delete endpoints, the
+        # client-side Graph-delete log-deletion call, or backfilled by the
+        # native-SPO reconciliation poll. Single source of truth shared with
+        # the Recycle Bin's Deleted By / Reason columns.
+        deletions = (
+            db.query(db_models.DeletionLog)
+            .order_by(db_models.DeletionLog.deleted_at.desc())
+            .limit(100)
+            .all()
+        )
+        alerts.extend({
+            "id": f"del_{row.id}", "drive_item_id": row.drive_item_id,
+            "folder_name": row.item_name,
+            "folder_path": row.original_path or row.item_name,
+            "parent_folder_id": None, "vessel_name": row.vessel_name,
+            "department": row.category or "All Departments",
+            "created_by_email": row.deleted_by_email or "",
+            "created_by_name": row.deleted_by_name or row.deleted_by_email or "Unknown user",
+            "alert_type": "vessel_deleted" if row.item_type == "vessel" else "document_deleted",
+            "alert_category": "dms", "read": row.read,
+            "read_at": row.read_at.isoformat() if row.read_at else None,
+            "created_at": row.deleted_at.isoformat() if row.deleted_at else None,
+            "site_name": row.site_name, "reason": row.reason,
+            "recycle_bin_item_id": row.drive_item_id, "classification": row.classification,
+        } for row in deletions)
     return sorted(alerts, key=lambda item: item.get("created_at") or "", reverse=True)
 
 
@@ -8550,6 +9497,42 @@ async def list_session_audit(
 # ── AI BANTO Email Automation routes ──────────────────────────────────────────
 from .email_automation import router as email_router
 app.include_router(email_router)
+
+# ── Folder Structure Mode (Settings → Vessel Settings) ───────────────────────
+from .folder_structure_api import build_router as _build_folder_structure_router
+app.include_router(_build_folder_structure_router(require_session))
+
+# ── Tag Configuration (Settings → Tag Configuration) ──────────────────────────
+from .tag_config_api import build_router as _build_tag_config_router
+app.include_router(_build_tag_config_router(require_session))
+
+# ── Module Management (Settings → Module Management) ─────────────────────────
+from .module_settings_api import build_router as _build_module_settings_router
+app.include_router(_build_module_settings_router(require_session))
+
+# ── Filter Search Management (Settings → Filter Search Management) ───────────
+from .filter_settings_api import build_router as _build_filter_settings_router
+app.include_router(_build_filter_settings_router(require_session))
+
+# ── Color Management (Settings → Color Management) ────────────────────────────
+from .color_settings_api import build_router as _build_color_settings_router
+app.include_router(_build_color_settings_router(require_session))
+
+# ── Settings Management (Settings → Settings Management) ─────────────────────
+from .settings_tab_api import build_router as _build_settings_tab_router
+app.include_router(_build_settings_tab_router(require_session))
+
+# ── Documents Copilot (self-contained: backend/app/copilot/) ─────────────────
+from .copilot.api import build_router as _build_copilot_router
+app.include_router(_build_copilot_router(require_session))
+
+from .graph.guard import ProtectedTargetError as _ProtectedTargetError
+
+
+@app.exception_handler(_ProtectedTargetError)
+async def _protected_target_handler(_request, exc: _ProtectedTargetError):
+    # Hard guard (graph/guard.py): NKSDocMan is never touched outside prod.
+    return JSONResponse(status_code=423, content={"detail": str(exc)})
 
 
 # ── Folder/File Placement Detection Endpoints ─────────────────────────────────

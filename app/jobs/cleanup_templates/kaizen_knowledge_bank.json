@@ -1,0 +1,15 @@
+{
+  "_comment": "Folders the Kaizen scheduler creates (mirrors KAIZEN_STRUCTURE in backend/provision_kaizen_folders.py). Paths are relative to 'root'. Only these folders can ever be deleted by cleanup_empty_leaf_folders; anything else under the root is treated as manually created and left alone. The root itself is never deleted.",
+  "root": "Kaizen - Knowledge Bank",
+  "paths": [
+    "Templates",
+    "Procedures and Work Instructions",
+    "Lessons Learned",
+    "Circulars and Guidance",
+    "Circulars and Guidance/Equipment Maker",
+    "Circulars and Guidance/Class",
+    "Circulars and Guidance/Flag - Port State",
+    "Circulars and Guidance/SIRE-OCIMF-RightShip",
+    "Circulars and Guidance/Shipyard"
+  ]
+}

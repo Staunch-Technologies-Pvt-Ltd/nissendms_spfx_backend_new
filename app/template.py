@@ -54,10 +54,9 @@ MAIN_FOLDERS = [
     "Insurance",
 ]
 
-# Kaizen lives directly at the Documents root alongside main folders
-FLAT_MAIN_FOLDERS = [
-    "Kaizen - Knowledge Bank",
-]
+# Kaizen - Knowledge Bank is intentionally excluded from the auto-provisioned
+# SharePoint hierarchy. It should not be created automatically in the app.
+FLAT_MAIN_FOLDERS = []
 ALL_MAIN_FOLDERS = MAIN_FOLDERS + FLAT_MAIN_FOLDERS
 
 # Legacy root constants kept for backwards-compatibility
@@ -217,25 +216,10 @@ COMMON_TEMPLATE = {
 }
 
 # ---------------------------------------------------------------------------
-# Kaizen - Knowledge Bank — flat, shared, unchanged. Lives directly under
-# COMMON_SHIPS_ROOT/Kaizen - Knowledge Bank/...
-# Kaizen - Knowledge Bank — flat, shared, unchanged. Lives directly under
-# Documents, alongside the Vessels folder.
+# Flat (non-vessel) root folders. Intentionally empty: the app no longer
+# auto-creates "Kaizen - Knowledge Bank" or any other root folder/leaf tree
+# in SharePoint Online. SHIP_TEMPLATE / COMMON_TEMPLATE above are kept only
+# so existing legacy folders can still be classified — nothing provisions
+# them any more.
 # ---------------------------------------------------------------------------
-FLAT_TEMPLATE = {
-    "Kaizen - Knowledge Bank": [
-        leaf("Templates"),
-        leaf("Procedures and Work Instructions"),
-        leaf("Lessons Learned"),
-        folder(
-            "Circulars and Guidance",
-            [
-                leaf("Equipment Maker"),
-                leaf("Class"),
-                leaf("Flag - Port State"),
-                leaf("SIRE-OCIMF-RightShip"),
-                leaf("Shipyard"),
-            ],
-        ),
-    ],
-}
+FLAT_TEMPLATE: dict = {}

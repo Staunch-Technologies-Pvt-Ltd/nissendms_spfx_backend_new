@@ -6,6 +6,7 @@ month-folder scheduler can run repeatedly without creating duplicates.
 """
 import asyncio
 import logging
+import time
 from urllib.parse import quote
 
 _logger = logging.getLogger(__name__)
@@ -52,7 +53,33 @@ async def get_item(
     )
 
 
+# Short-lived cache of raw folder listings, keyed by "{drive_id}:{item_id}".
+# The Documents/Sites browser calls this endpoint once per folder click, and
+# a vessel-filter change or a breadcrumb Back/Forward re-opens folders that
+# were just fetched seconds ago — with no cache at all, every one of those
+# was a fresh Graph round-trip, and a user navigating quickly could burn
+# through SharePoint Embedded's per-app resource-unit quota, tripping the
+# `activityLimitReached`/`quota` throttle (retryAfterSeconds in the hundreds,
+# not the few-second burst throttle GraphClient.request's retry loop is
+# built for). A short TTL absorbs that rapid-repeat-navigation pattern
+# without going stale for long; explicit writes below invalidate their
+# parent's entry so a create/upload is visible immediately rather than
+# waiting out the TTL.
+_LIST_CHILDREN_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_LIST_CHILDREN_CACHE_TTL = 20.0  # seconds
+
+
+def _invalidate_children_cache(drive_id: str, parent_id: str) -> None:
+    _LIST_CHILDREN_CACHE.pop(f"{drive_id}:{parent_id}", None)
+
+
 async def list_children(drive_id: str, item_id: str, access_token: str | None = None) -> list[dict]:
+    cache_key = f"{drive_id}:{item_id}"
+    now = time.monotonic()
+    cached = _LIST_CHILDREN_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _LIST_CHILDREN_CACHE_TTL:
+        return cached[1]
+
     items, url = [], (
         f"/drives/{drive_id}/items/{item_id}/children"
         "?$top=200&$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl,@microsoft.graph.downloadUrl"
@@ -61,6 +88,8 @@ async def list_children(drive_id: str, item_id: str, access_token: str | None = 
         data = await graph().get(url, access_token=access_token)
         items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
+
+    _LIST_CHILDREN_CACHE[cache_key] = (now, items)
     return items
 
 
@@ -226,7 +255,7 @@ async def ensure_folder(drive_id: str, parent_id: str, name: str) -> dict:
     Create-first: one API call when the folder is new (the common case during
     provisioning); only falls back to a direct item lookup if it already exists (409)."""
     try:
-        return await graph().post(
+        created = await graph().post(
             f"/drives/{drive_id}/items/{parent_id}/children",
             json={
                 "name": name,
@@ -234,6 +263,8 @@ async def ensure_folder(drive_id: str, parent_id: str, name: str) -> dict:
                 "@microsoft.graph.conflictBehavior": "fail",
             },
         )
+        _invalidate_children_cache(drive_id, parent_id)
+        return created
     except GraphError as e:
         if e.status == 409:
             # Folder already exists — fetch it directly by path instead of
@@ -256,8 +287,11 @@ async def upload_file(
     drive_id: str, parent_id: str, name: str, content: bytes, content_type: str = "", access_token: str | None = None
 ) -> dict:
     if len(content) <= SIMPLE_UPLOAD_LIMIT:
-        return await _upload_small(drive_id, parent_id, name, content, content_type, access_token=access_token)
-    return await _upload_large(drive_id, parent_id, name, content, access_token=access_token)
+        result = await _upload_small(drive_id, parent_id, name, content, content_type, access_token=access_token)
+    else:
+        result = await _upload_large(drive_id, parent_id, name, content, access_token=access_token)
+    _invalidate_children_cache(drive_id, parent_id)
+    return result
 
 
 async def _upload_small(drive_id, parent_id, name, content, content_type, access_token=None) -> dict:
@@ -519,14 +553,69 @@ async def get_vessel_terms(site_id: str) -> list[str]:
         return []
 
 
+async def debug_term_store_selection(site_id: str) -> dict:
+    """Diagnostic (no writes): which Term Store group/set got picked as the
+    'vessel' set for this site, and every term currently in it.
+
+    Exists because the vessel_set_id match in _get_term_store_info is a
+    heuristic (group/set display name containing "vessel name", or one of
+    two hard-coded production GUIDs) — on a site whose Term Store doesn't
+    have a group literally named that, it can silently match the wrong set,
+    or a correctly-matched set can simply already contain stray/incorrect
+    terms (e.g. from an earlier bad tag write auto-creating one). Both look
+    identical from the app's side: an unexpected name shows up as a
+    "Found in SharePoint" vessel. This endpoint surfaces the raw picture so
+    that can be told apart from an actual code bug.
+    """
+    info = await _get_term_store_info(site_id)
+    groups_seen: list[dict] = []
+    try:
+        groups = await graph().get(f"/sites/{site_id}/termStore/groups")
+        for g in groups.get("value", []):
+            gid = g.get("id")
+            try:
+                sets = await graph().get(f"/sites/{site_id}/termStore/groups/{gid}/sets")
+                set_list = [{"id": s.get("id"), "name": s.get("displayName")} for s in sets.get("value", [])]
+            except Exception as e:
+                set_list = [{"error": str(e)}]
+            groups_seen.append({"id": gid, "name": g.get("displayName"), "sets": set_list})
+    except Exception as e:
+        groups_seen = [{"error": str(e)}]
+
+    return {
+        "site_id": site_id,
+        "vessel_set_id": info.get("vessel_set_id"),
+        "dms_set_id": info.get("dms_set_id"),
+        "vessel_terms": sorted({label for label, _guid in info.get("vessel_terms", [])}, key=str.casefold),
+        "vessel_term_count": len(info.get("vessel_terms", [])),
+        "all_groups_and_sets": groups_seen,
+    }
+
+
+async def ensure_vessel_term(site_id: str, name: str) -> tuple[str, str] | None:
+    """Public wrapper around _resolve_term_guid for the vessel semantic key.
+
+    Looks up a Term Store term for `name` in the site's vessel term set and
+    creates it if missing (same dynamic-create behaviour the upload/tag
+    pipeline already relies on lazily). Returns (official_label, guid), or
+    None if the vessel term set isn't configured for this site or the
+    create call fails. Used by the vessel auto-discovery sync
+    (services/vessel_sync.py) to push a DB-only vessel's name into the Term
+    Store proactively, instead of waiting for the next tagged upload.
+    """
+    return await _resolve_term_guid(site_id, "vessel", name)
+
+
 async def _resolve_term_guid(
     site_id: str,
     semantic_key: str,
     raw_value: str,
     access_token: str | None = None,
+    create_if_missing: bool = True,
 ) -> tuple[str, str] | None:
     """Resolve a term's official label and GUID from the Term Store.
-    If it's a vessel and not present in the term store, dynamically create it."""
+    If it's a vessel and not present in the term store, dynamically create it
+    (unless create_if_missing=False — see the vessel branch below for why)."""
     import re
     if not raw_value or not raw_value.strip():
         return None
@@ -559,8 +648,18 @@ async def _resolve_term_guid(
         if a in terms:
             return terms[a]
 
-    # 3. If vessel and not found in term store, create it dynamically!
-    if semantic_key == "vessel" and info.get("vessel_set_id"):
+    # 3. If vessel and not found in term store, create it dynamically —
+    # but ONLY when the caller opts in (create_if_missing=True, the
+    # default). Upload/tagging call sites now pass create_if_missing=False
+    # for the vessel semantic key: tagging a document must never be able to
+    # silently mint a permanent Term Store vessel entry for whatever folder
+    # name it happens to sit under (this is how "Purchase order and Invoice
+    # Tracker" and "Report" ended up as vessel terms). A new vessel term
+    # should only ever be created through the app's own vessel-creation
+    # paths (ensure_vessel_term, called from confirm_discovered_vessel /
+    # create_vessel / sync_vessels_from_sharepoint), i.e. after a vessel is
+    # actually registered, not as a side effect of tagging an upload.
+    if semantic_key == "vessel" and info.get("vessel_set_id") and create_if_missing:
         vessel_set_id = info["vessel_set_id"]
         try:
             res = await graph().post(
@@ -594,6 +693,69 @@ async def _resolve_term_guid(
             logging.getLogger(__name__).warning("Failed to create DMS term '%s' in set %s: %s", val, dms_set_id, e)
 
 
+async def get_recycle_bin_items_rest(site_url: str, top: int = 200) -> list[dict]:
+    """Best-effort read of a site's SharePoint recycle bin via the classic
+    REST API, which (unlike Graph's driveItem `deleted` facet) exposes who
+    deleted an item: DeletedByEmail / DeletedByName.
+
+    Used only by the native-SPO deletion reconciliation job to backfill
+    'Deleted By' for items deleted directly in SharePoint (outside this
+    app), matched back to a Graph recycle-bin entry by name + folder +
+    timestamp proximity — the two recycle bin identifiers are not the same
+    GUID, so an exact-id join isn't available. Returns [] on any failure;
+    this is enrichment, never a hard dependency.
+    """
+    from .guard import assert_allowed
+    assert_allowed(site_url, operation="sharepoint-rest recycle-bin")
+    from urllib.parse import urlparse
+
+    hostname = urlparse(site_url).netloc
+    if not hostname:
+        return []
+
+    def _acquire_app_token() -> str | None:
+        try:
+            import msal
+            result = msal.ConfidentialClientApplication(
+                client_id=settings.graph_client_id,
+                authority=settings.authority_url,
+                client_credential=settings.graph_client_secret,
+            ).acquire_token_for_client(scopes=[f"https://{hostname}/.default"])
+            return result.get("access_token")
+        except Exception as exc:
+            _logger.debug("get_recycle_bin_items_rest: token acquisition failed: %s", exc)
+            return None
+
+    token = _acquire_app_token()
+    if not token:
+        return []
+
+    url = (
+        f"{site_url.rstrip('/')}/_api/site/RecycleBin"
+        f"?$select=Id,LeafName,DirName,ItemType,DeletedDate,DeletedByEmail,DeletedByName"
+        f"&$orderby=DeletedDate desc&$top={top}"
+    )
+    try:
+        async with httpx.AsyncClient(verify=verify(), timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json;odata=nometadata",
+                },
+            )
+            if resp.status_code != 200:
+                _logger.debug(
+                    "get_recycle_bin_items_rest: %s returned %s", site_url, resp.status_code
+                )
+                return []
+            data = resp.json()
+            return data.get("value", [])
+    except Exception as exc:
+        _logger.debug("get_recycle_bin_items_rest: request failed for %s: %s", site_url, exc)
+        return []
+
+
 async def _update_taxonomy_with_sharepoint_rest(
     drive_id: str,
     item_id: str,
@@ -612,6 +774,8 @@ async def _update_taxonomy_with_sharepoint_rest(
     automatic fallback to an app-only MSAL token if the delegated one returns
     401 (e.g. insufficient permissions for taxonomy writes).
     """
+    from .guard import assert_allowed
+    assert_allowed(drive_id, operation="sharepoint-rest taxonomy-update")
     item_meta = await graph().get(
         f"/drives/{drive_id}/items/{item_id}?$select=sharepointIds",
         access_token=access_token,
@@ -991,7 +1155,14 @@ async def update_file_columns(
                         break
 
                 if note_col_name:
-                    term_info = await _resolve_term_guid(site_id, semantic_key, val, access_token=access_token)
+                    # create_if_missing=False for vessel: tagging an upload must
+                    # never mint a new Term Store vessel entry (see _resolve_term_guid
+                    # docstring). Category/Group keep the existing dynamic-create
+                    # behaviour — this bug is specific to vessel names.
+                    term_info = await _resolve_term_guid(
+                        site_id, semantic_key, val, access_token=access_token,
+                        create_if_missing=(semantic_key != "vessel"),
+                    )
                     if term_info:
                         term_label, term_guid = term_info
                         # This tenant's Graph taxonomy note fields reject the
@@ -1087,8 +1258,12 @@ async def update_file_columns(
                 )
                 site_id = (item_meta.get("sharepointIds") or {}).get("siteId")
                 if site_id:
+                    # create_if_missing=False: same reasoning as the primary
+                    # tagging path above — this legacy fallback must not create
+                    # new vessel terms from an upload's folder name either.
                     term_info = await _resolve_term_guid(
-                        site_id, "vessel", semantic_values["vessel"], access_token=access_token
+                        site_id, "vessel", semantic_values["vessel"],
+                        access_token=access_token, create_if_missing=False,
                     )
             except Exception as exc:
                 _logger.warning("Could not resolve vessel term for fallback field mapping: %s", exc)

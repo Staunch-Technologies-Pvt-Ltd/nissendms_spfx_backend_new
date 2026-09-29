@@ -147,7 +147,8 @@ class StubBackend:
 
     async def create_vessel(
         self, name, imo, shipyard=None, hull_number=None, vessel_type=None,
-        requesting_email=None, requesting_name=None,
+        requesting_email=None, requesting_name=None, provisioned_site_ids=None,
+        site_key=None, parent_folder_path=None, subfolders=None,
     ):
         """Creating a vessel never requires approval — for anyone, admin or
         not. It always executes immediately and is always recorded as a
@@ -341,7 +342,7 @@ class StubBackend:
             "sp_errors": [],
         }
 
-    async def delete_vessel(self, vessel_id: str, requesting_email=None, requesting_name=None):
+    async def delete_vessel(self, vessel_id: str, requesting_email=None, requesting_name=None, reason=None):
         vessel = next((v for v in store.vessels if v["id"] == vessel_id), None)
         if not vessel:
             raise NotFound("Vessel not found")
@@ -432,26 +433,53 @@ class StubBackend:
             raise NotFound("Folder not found")
         return store.children(folder_id)
 
-    async def get_dashboard_stats(self, force_refresh: bool = False) -> dict:
+    async def get_dashboard_stats(self, force_refresh: bool = False, site_key: str | None = None) -> dict:
+        # Stub mode is a single in-memory demo store with no multi-site
+        # concept, so site_key is accepted (for signature parity with the
+        # real backend / dashboard endpoint) but has nothing to filter by.
         total_vessels = len(store.vessels)
         all_docs = []
+        total_folders = 0
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         for node in store.nodes.values():
             if node.get("kind") == "file":
+                name = node["name"]
+                ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
                 all_docs.append({
                     "id": node["id"],
-                    "name": node["name"],
-                    "vessel": "Shared Documents",
+                    "name": name,
+                    "ext": ext,
+                    "fileType": "pdf" if ext == "pdf" else "other",
+                    "vessel": "Not Listed",
                     "type": "Document",
+                    "site": "stub",
+                    "siteName": "Demo store",
                     "modified": "Today",
-                    "modifiedEpoch": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    "modifiedEpoch": now_ms,
+                    "createdEpoch": now_ms,
+                    "modifiedBy": "",
+                    "createdBy": "",
                     "status": "Valid",
                     "fileSize": "—",
+                    "sizeBytes": 0,
                     "subFolderPath": node.get("path", ""),
+                    "webUrl": "",
                 })
+            else:
+                total_folders += 1
+        self._dashboard_docs_cache = all_docs
         pending_approvals = len([a for a in getattr(store, "approvals", []) if isinstance(a, dict) and a.get("status") == "pending"])
         total_docs = len(all_docs)
         return {
             "total_documents": total_docs,
+            "total_files": total_docs,
+            "total_folders": total_folders,
+            "total_sites": 1,
+            "sites": [{
+                "site_key": "stub", "site_name": "Demo store", "drive_id": "", "web_url": "",
+                "files": total_docs, "folders": total_folders, "last_modified_epoch": None, "truncated": False,
+            }],
+            "truncated": False,
             "total_vessels": total_vessels,
             "pending_approvals": pending_approvals,
             "expiring_soon_count": 0,
@@ -469,6 +497,10 @@ class StubBackend:
                 "valid_pct": 100,
             },
         }
+
+    async def get_dashboard_documents(self, force_refresh: bool = False, site_key: str | None = None) -> list[dict]:
+        await self.get_dashboard_stats(force_refresh=force_refresh, site_key=site_key)
+        return list(getattr(self, "_dashboard_docs_cache", []))
 
     async def stats(self):
         dash = await self.get_dashboard_stats()
@@ -666,7 +698,7 @@ class StubBackend:
         return node
 
     async def delete_folder(
-        self, folder_id: str, requesting_email=None, requesting_name=None,
+        self, folder_id: str, requesting_email=None, requesting_name=None, reason=None,
     ):
         node = store.get_node(folder_id)
         folder_name = folder_id
@@ -708,6 +740,12 @@ class StubBackend:
         if store.get_node(folder_id) is None:
             return {"deleted": True}
         return {"deleted": store.delete_folder(folder_id)}
+
+    async def log_deletion(self, **kwargs) -> dict:
+        """Stub mode has no deletion_log table; the frontend's log-deletion
+        call is a no-op here (stub deletions are already tracked in-memory
+        by store.delete_folder / the file/vessel deletion flows above)."""
+        return {"ok": True, "stub": True}
 
     async def get_file(self, file_id):
         return store.get_file(file_id)

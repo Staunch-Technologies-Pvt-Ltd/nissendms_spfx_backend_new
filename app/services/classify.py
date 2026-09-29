@@ -86,15 +86,15 @@ def classify(parts: list[str]) -> dict:
     if not parts:
         return {"kind": "root", "upload": False, "month_driven": False}
 
-    kaizen_name = template.FLAT_MAIN_FOLDERS[0]
-
     # --------------------------------------------------------------
-    # Kaizen - Knowledge Bank sits directly at the Documents root.
+    # Flat root folders (none configured by default — FLAT_MAIN_FOLDERS
+    # is empty, so this block is skipped).
     # --------------------------------------------------------------
-    if parts[0].lower() == kaizen_name.lower():
-        if len(parts) == 1:
-            return {"kind": "main", "upload": False, "month_driven": False}
-        return _descend(template.FLAT_TEMPLATE[kaizen_name], parts[1:])
+    for flat_name in template.FLAT_MAIN_FOLDERS:
+        if parts[0].lower() == flat_name.lower():
+            if len(parts) == 1:
+                return {"kind": "main", "upload": False, "month_driven": False}
+            return _descend(template.FLAT_TEMPLATE.get(flat_name, []), parts[1:])
 
     # --------------------------------------------------------------
     # Main Department Folders at Documents root
@@ -159,3 +159,70 @@ def classify(parts: list[str]) -> dict:
             return _descend(template.COMMON_TEMPLATE[legacy_main], parts[3:])
 
     return {"kind": "folder", "upload": False, "month_driven": False}
+
+
+def classify_deletion(
+    path_parts: list[str], is_folder: bool, vessel_names: "set[str] | None" = None
+) -> dict:
+    """Decide which Recycle Bin tab a deleted node belongs in, and tag it
+    with vessel/category/sub-category context, at deletion-capture time —
+    used by services.real_backend._record_deletion (and the native-SPO
+    reconciliation job) so classification never depends on which client-side
+    path-guessing heuristic happens to run later.
+
+    `path_parts` is the deleted node's full original path split on "/", with
+    the node's own name as the last element (same convention as classify()
+    above). `vessel_names` is the authoritative Term Store vessel list
+    (VESSEL_MASTER_LIST) unioned with any live `Vessel` DB rows — callers
+    build this set once and pass it in so a bulk pass doesn't re-fetch it
+    per item; defaults to VESSEL_MASTER_LIST alone when omitted.
+
+    Returns {"classification": "vessel" | "normal_folder" | "file",
+             "vessel_name": str, "category": str, "sub_category": str}.
+    """
+    if vessel_names is None:
+        from ..ocr.drawing_category import VESSEL_MASTER_LIST
+        vessel_names = {v.lower() for v in VESSEL_MASTER_LIST}
+    else:
+        vessel_names = {v.lower() for v in vessel_names}
+
+    parts = [p for p in (path_parts or []) if p]
+    name = parts[-1] if parts else ""
+    ancestors = parts[:-1]
+
+    # Which ancestor segment (if any) is this node's vessel context?
+    vessel_name = ""
+    vessel_idx = -1
+    for i, seg in enumerate(ancestors):
+        if seg.lower() in vessel_names:
+            vessel_name = seg
+            vessel_idx = i
+            break
+
+    if is_folder and name.lower() in vessel_names:
+        # The deleted node's own name matches a Term Store vessel name —
+        # it's a vessel folder itself, wherever in the tree it sat.
+        return {"classification": "vessel", "vessel_name": name, "category": "", "sub_category": ""}
+
+    category = ancestors[vessel_idx + 1] if vessel_idx >= 0 and len(ancestors) > vessel_idx + 1 else ""
+    sub_category = ancestors[vessel_idx + 2] if vessel_idx >= 0 and len(ancestors) > vessel_idx + 2 else ""
+
+    if not is_folder:
+        return {
+            "classification": "file",
+            "vessel_name": vessel_name,
+            "category": category,
+            "sub_category": sub_category,
+        }
+
+    # A folder that is not itself a vessel name. "Part of a vessel's own
+    # path" means it sits under a recognized vessel ancestor — it's still
+    # tagged with that vessel (mirroring how files are tagged) but there is
+    # no 4th tab for it, so it stays grouped with Normal Folders. A folder
+    # with no vessel ancestor at all is a true general/admin folder.
+    return {
+        "classification": "normal_folder",
+        "vessel_name": vessel_name,
+        "category": category,
+        "sub_category": sub_category,
+    }

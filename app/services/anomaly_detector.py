@@ -212,16 +212,12 @@ def scan_and_record_anomalies(db: Session, tree_items: list[dict]):
                         and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
                     ):
                         anomaly_type = "subfolder_unmatched"
-        else:
-            continue
-                        and sub_path_name not in {"To be Classified", "Other Drawings", "Other Manuals"}
-                    ):
-                        anomaly_type = "subfolder_unmatched"
-
             else:
                 # Unrecognized folder directly under Vessels (not Specific
                 # Vessels or Common for all ships)
                 continue
+        else:
+            continue
 
         if anomaly_type:
             existing = db.query(models.FolderAnomaly).filter_by(drive_item_id=item_id).one_or_none()

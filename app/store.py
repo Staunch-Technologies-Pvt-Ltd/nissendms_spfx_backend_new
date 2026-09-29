@@ -89,13 +89,14 @@ class Store:
             for spec in template.COMMON_TEMPLATE[name]:
                 self._build_subtree(spec, common["id"])
 
-        # Kaizen - Knowledge Bank at Documents root
-        kaizen_name = template.FLAT_MAIN_FOLDERS[0]
-        kaizen = self._make_node(kaizen_name, "main", None)
-        self.roots.append(kaizen["id"])
-        self.main_folders[kaizen_name] = kaizen
-        for spec in template.FLAT_TEMPLATE[kaizen_name]:
-            self._build_subtree(spec, kaizen["id"])
+        # Flat root folders (FLAT_MAIN_FOLDERS is empty by default, so no
+        # Kaizen - Knowledge Bank node is built).
+        for flat_name in template.FLAT_MAIN_FOLDERS:
+            flat = self._make_node(flat_name, "main", None)
+            self.roots.append(flat["id"])
+            self.main_folders[flat_name] = flat
+            for spec in template.FLAT_TEMPLATE.get(flat_name, []):
+                self._build_subtree(spec, flat["id"])
 
         self._seed_sample_archive_and_recycle_bin()
 
@@ -569,13 +570,26 @@ class Store:
         return list(self.deleted_ids)
 
     def search(self, query, vessel_id=None):
-        """Search folders + files by name. When `vessel_id` is given, walk
-        only that vessel's own ship folders (one per main folder) instead of
-        the full tree — other vessels' folders, and the shared "Common for
-        all ships" areas, are never visited."""
+        """Search folders + files by name or path. When `vessel_id` is
+        given, walk only that vessel's own ship folders (one per main
+        folder) instead of the full tree — other vessels' folders, and the
+        shared "Common for all ships" areas, are never visited.
+
+        The stub tree has no separate group/category/vessel columns —
+        those are just path segments (e.g. "Technical & Crewing/MV Horizon/
+        Drawings and Manuals/Electrical") — so matching the full path, not
+        just the leaf name, is what lets a group, category, sub-category or
+        vessel-name term find folders and files nested under it, mirroring
+        RealBackend.search.
+
+        `+`, `,` and `;` separate OR clauses (e.g. "Bow Fighter + Bow
+        Fraternity" finds either vessel), mirroring RealBackend.search and
+        the Documents page's own client-side matcher — see the docstring
+        there for why this matters."""
         ql = query.lower().strip()
         if not ql:
             return []
+        clauses = [c.strip() for c in re.split(r"[+,;]+", ql) if c.strip()] or [ql]
         roots = self.roots
         if vessel_id is not None:
             vessel = next((v for v in self.vessels if v["id"] == vessel_id), None)
@@ -588,16 +602,20 @@ class Store:
                 return
             node = self.nodes[nid]
             t2 = trail + [{"id": nid, "name": node["name"]}]
-            if node["kind"] != "main" and ql in node["name"].lower():
-                results.append(
-                    {
-                        "id": nid,
-                        "name": node["name"],
-                        "kind": node["kind"],
-                        "trail": t2,
-                        "path": self._path_of(nid),
-                    }
-                )
+            if node["kind"] != "main":
+                path = self._path_of(nid)
+                name_low = node["name"].lower()
+                path_low = path.lower()
+                if any(c in name_low or c in path_low for c in clauses):
+                    results.append(
+                        {
+                            "id": nid,
+                            "name": node["name"],
+                            "kind": node["kind"],
+                            "trail": t2,
+                            "path": path,
+                        }
+                    )
             for c in node["children"]:
                 walk(c, t2)
 

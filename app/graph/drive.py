@@ -66,20 +66,19 @@ async def get_item(
 # parent's entry so a create/upload is visible immediately rather than
 # waiting out the TTL.
 _LIST_CHILDREN_CACHE: dict[str, tuple[float, list[dict]]] = {}
-_LIST_CHILDREN_CACHE_TTL = 20.0  # seconds
+_LIST_CHILDREN_CACHE_TTL = 60.0  # seconds (was 20)
+# Stale entries are kept this long and served if Graph is throttling (429),
+# so clicking around keeps working while the app quota recovers.
+_LIST_CHILDREN_STALE_MAX = 3600.0
+# Single-flight: concurrent requests for the same folder share one Graph call.
+_LIST_CHILDREN_INFLIGHT: dict[str, "asyncio.Future"] = {}
 
 
 def _invalidate_children_cache(drive_id: str, parent_id: str) -> None:
     _LIST_CHILDREN_CACHE.pop(f"{drive_id}:{parent_id}", None)
 
 
-async def list_children(drive_id: str, item_id: str, access_token: str | None = None) -> list[dict]:
-    cache_key = f"{drive_id}:{item_id}"
-    now = time.monotonic()
-    cached = _LIST_CHILDREN_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _LIST_CHILDREN_CACHE_TTL:
-        return cached[1]
-
+async def _fetch_children(drive_id: str, item_id: str, access_token: str | None) -> list[dict]:
     items, url = [], (
         f"/drives/{drive_id}/items/{item_id}/children"
         "?$top=200&$select=id,name,folder,file,size,lastModifiedDateTime,parentReference,webUrl,@microsoft.graph.downloadUrl"
@@ -88,9 +87,43 @@ async def list_children(drive_id: str, item_id: str, access_token: str | None = 
         data = await graph().get(url, access_token=access_token)
         items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
-
-    _LIST_CHILDREN_CACHE[cache_key] = (now, items)
     return items
+
+
+async def list_children(drive_id: str, item_id: str, access_token: str | None = None) -> list[dict]:
+    import asyncio
+
+    cache_key = f"{drive_id}:{item_id}"
+    now = time.monotonic()
+    cached = _LIST_CHILDREN_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _LIST_CHILDREN_CACHE_TTL:
+        return cached[1]
+
+    inflight = _LIST_CHILDREN_INFLIGHT.get(cache_key)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+
+    fut = asyncio.get_running_loop().create_future()
+    _LIST_CHILDREN_INFLIGHT[cache_key] = fut
+    try:
+        items = await _fetch_children(drive_id, item_id, access_token)
+        _LIST_CHILDREN_CACHE[cache_key] = (time.monotonic(), items)
+        fut.set_result(items)
+        return items
+    except GraphError as exc:
+        if exc.status == 429 and cached and (now - cached[0]) < _LIST_CHILDREN_STALE_MAX:
+            log.warning("list_children: Graph throttled, serving stale listing for %s", cache_key)
+            fut.set_result(cached[1])
+            return cached[1]
+        fut.set_exception(exc)
+        fut.exception()  # mark retrieved to avoid "never retrieved" warnings
+        raise
+    except BaseException as exc:
+        fut.set_exception(exc)
+        fut.exception()
+        raise
+    finally:
+        _LIST_CHILDREN_INFLIGHT.pop(cache_key, None)
 
 
 async def find_child(drive_id: str, parent_id: str, name: str) -> dict | None:

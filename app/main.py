@@ -4016,8 +4016,8 @@ async def site_subfolder_counts(
     _session: object = Depends(require_session),
 ):
     del site_id
-    parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
     try:
+        parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
         items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         folder_items = [i for i in items if i.get("folder") and i.get("id")]
         direct_files = len([i for i in items if not i.get("folder")])
@@ -4059,8 +4059,20 @@ async def site_subfolder_counts(
                 "total_files": total_files,
             },
         }
+    except HTTPException:
+        raise
     except GraphError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        # Pass Graph's cooldown through so the frontend backs off (same as
+        # site_folder_children) instead of retrying into a throttled tenant.
+        headers = None
+        if exc.status == 429:
+            headers = {"Retry-After": str(int(exc.retry_after) if exc.retry_after else 60)}
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers=headers) from exc
+    except Exception as exc:
+        logger.exception(
+            "site_subfolder_counts failed for drive=%s folder=%s", drive_id, folder_id,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @app.get("/api/sites/{site_id}/drives/{drive_id}/find-folder")

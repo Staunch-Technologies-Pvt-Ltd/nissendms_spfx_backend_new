@@ -10275,6 +10275,12 @@ app.include_router(_build_settings_tab_router(require_session))
 from .copilot.api import build_router as _build_copilot_router
 app.include_router(_build_copilot_router(require_session))
 
+# ── Migration Assistant (self-contained: backend/app/migration_assistant/) ───
+# Merged from the former standalone app: starts/stops with this backend, routes
+# under /api/migration-assistant/*, own tables + own Entra app (see its config.py).
+from .migration_assistant import setup as _setup_migration_assistant
+_setup_migration_assistant(app, require_session)
+
 from .graph.guard import ProtectedTargetError as _ProtectedTargetError
 
 

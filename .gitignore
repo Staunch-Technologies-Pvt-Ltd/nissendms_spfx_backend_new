@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 __pycache__/
 *.pyc
+
+# Migration Assistant (merged module): secrets + local job database
+.env.migration
+migration_assistant.db

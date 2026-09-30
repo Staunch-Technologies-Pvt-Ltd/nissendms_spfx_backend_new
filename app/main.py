@@ -20,6 +20,9 @@ CACHE_TTL_FOLDER_RECURSIVE_COUNTS = 600  # 10 minutes (invalidated on changes)
 import re
 import urllib.parse
 
+# drive_id:item_id -> resolved item id (ids never change; see _resolve_drive_folder_id).
+_RESOLVED_ITEM_IDS: dict[str, str] = {}
+
 async def _resolve_drive_folder_id(
     drive_id: str,
     folder_ref: str,
@@ -39,11 +42,26 @@ async def _resolve_drive_folder_id(
     # throttle, 5xx, timeout, token hiccup) into a bogus 404 for a folder that
     # exists. Only a real 400/404 from Graph means "not an item ID".
     looks_like_item_id = bool(re.fullmatch(r'01[A-Z0-9]{26,}', reference))
+    # No Graph call for an id we already know: every /children, /folder-tree
+    # and /subfolder-counts request used to spend one extra Graph GET here
+    # just to echo the id back — part of what exhausted the app's quota (429).
+    if looks_like_item_id:
+        _idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+        if _idx is not None and reference in (_idx.get("folders") or {}):
+            return reference
+        _known = _RESOLVED_ITEM_IDS.get(f"{drive_id}:{reference}")
+        if _known:
+            return _known
     for attempt in range(2):
         try:
             item = await gd.get_item(drive_id, reference, access_token=access_token)
             if item.get('folder') is not None or item.get('id'):
-                return str(item.get('id') or reference)
+                resolved = str(item.get('id') or reference)
+                if looks_like_item_id:
+                    if len(_RESOLVED_ITEM_IDS) > 50000:
+                        _RESOLVED_ITEM_IDS.clear()
+                    _RESOLVED_ITEM_IDS[f"{drive_id}:{reference}"] = resolved
+                return resolved
             break
         except GraphError as exc:
             if exc.status in (400, 404):
@@ -3621,12 +3639,27 @@ async def site_folder_children(
     # + message instead of vanishing into an opaque 500.
     try:
         parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
-        items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
+        from_index = False
+        try:
+            items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
+        except GraphError as list_exc:
+            # Graph quota exhausted: rebuild the listing from the drive delta
+            # index (names, sizes, dates, links; no tags) instead of failing.
+            if list_exc.status != 429:
+                raise
+            index_items = _children_from_index(drive_id, parent_id)
+            if index_items is None:
+                raise
+            items = index_items
+            from_index = True
         from .ocr.drawing_category import _extract_vessel_from_folder_path
         parent_path = ""
         if items:
             raw_p = (items[0].get("parentReference") or {}).get("path") or ""
             parent_path = raw_p.split("root:", 1)[-1].strip("/")
+        elif from_index:
+            _ridx = _drive_index_ready(drive_id)
+            parent_path = _index_rel_path(_ridx, parent_id, _index_root_id(_ridx, drive_id)) if _ridx else ""
         elif parent_id != "root":
             try:
                 parent_meta = await gd.get_item(drive_id, parent_id, access_token=x_graph_access_token)
@@ -3661,7 +3694,9 @@ async def site_folder_children(
         now_ts = time.time()
         cache_key_tags = f"{drive_id}:{parent_id}"
         cached_decorated = _FOLDER_CHILDREN_TAGS_CACHE.get(cache_key_tags)
-        if cached_decorated and (now_ts - cached_decorated[0]) < CACHE_TTL_CHILDREN_TAGS:
+        # From the index (Graph throttled): any earlier Graph listing of this
+        # folder, even an old one, is better than a tag-less rebuild.
+        if cached_decorated and (from_index or (now_ts - cached_decorated[0]) < CACHE_TTL_CHILDREN_TAGS):
             decorated_items = cached_decorated[1]
         else:
             file_items = [it for it in items if it.get("file") is not None]
@@ -3669,7 +3704,8 @@ async def site_folder_children(
             # Batch-fetch listItem/fields concurrently in chunks of 20 with bounded semaphore
             BATCH_SIZE = 20
             fields_by_id: dict[str, dict] = {}
-            if file_items:
+            enrichment_failed = False
+            if file_items and not from_index:
                 sem = asyncio.Semaphore(5)
 
                 async def _fetch_chunk(chunk):
@@ -3690,11 +3726,14 @@ async def site_folder_children(
                             )
                             return batch_resp.get("responses", [])
                         except Exception:
-                            return []
+                            return None
 
                 chunks = [file_items[i: i + BATCH_SIZE] for i in range(0, len(file_items), BATCH_SIZE)]
                 chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
                 for resp_list in chunk_results:
+                    if resp_list is None:
+                        enrichment_failed = True  # e.g. throttled: don't cache tag-less items for 5 min
+                        continue
                     for resp_item in resp_list:
                         if resp_item.get("status") == 200:
                             fields_by_id[resp_item["id"]] = resp_item.get("body") or {}
@@ -3722,7 +3761,8 @@ async def site_folder_children(
                         "tags": {},
                         "suggested_vessel": "",
                     })
-            _FOLDER_CHILDREN_TAGS_CACHE[cache_key_tags] = (now_ts, decorated_items)
+            if not from_index and not enrichment_failed:
+                _FOLDER_CHILDREN_TAGS_CACHE[cache_key_tags] = (now_ts, decorated_items)
 
         now = time.time()
         # Collect folder items that need background count computation
@@ -3780,6 +3820,7 @@ async def site_folder_children(
             },
             "summary_counts": summary_counts,
             "items": decorated_items,
+            **({"source": "index", "stale": True} if from_index else {}),
         }
     except HTTPException:
         # _resolve_drive_folder_id's own 404 ("SharePoint folder not found")
@@ -4130,6 +4171,8 @@ async def _sync_drive_index(drive_id: str, token: str | None) -> None:
                     it.get("lastModifiedDateTime"),
                     it.get("webUrl") or "",
                 )
+        if data.get("value"):
+            idx["version"] = int(idx.get("version") or 0) + 1  # invalidates _index_folder_stats
         nxt = data.get("@odata.nextLink")
         if nxt:
             idx["resume"] = nxt  # a throttled/failed page resumes here, not from scratch
@@ -4198,6 +4241,154 @@ def _subtree_from_index(
     if level and depth >= max_depth:
         capped = True
     return folders, capped
+
+
+def _index_folder_stats(idx: dict[str, Any]) -> dict[str, Any]:
+    """Per-folder counts for the whole drive from the delta index, cached per
+    index version: kids (parent -> child folder ids), dfiles (parent -> direct
+    file count) and totals (folder -> (direct_sub, direct_files, total_sub,
+    total_files)). One in-memory pass, zero Graph calls."""
+    ver = int(idx.get("version") or 0)
+    cached = idx.get("_stats")
+    if cached is not None and cached.get("version") == ver:
+        return cached
+    folders_map: dict[str, dict[str, Any]] = idx.get("folders") or {}
+    files_map: dict[str, tuple] = idx.get("files") or {}
+    kids: dict[str | None, list[str]] = {}
+    for fid, f in folders_map.items():
+        kids.setdefault(f.get("parent_id"), []).append(fid)
+    dfiles: dict[str | None, int] = {}
+    for tup in files_map.values():
+        p = tup[1]
+        dfiles[p] = dfiles.get(p, 0) + 1
+    order: list[str] = []
+    seen: set[str] = set()
+    stack = [fid for fid, f in folders_map.items() if f.get("parent_id") not in folders_map]
+    while stack:
+        fid = stack.pop()
+        if fid in seen:
+            continue
+        seen.add(fid)
+        order.append(fid)
+        stack.extend(kids.get(fid, ()))
+    totals: dict[str, tuple[int, int, int, int]] = {}
+    for fid in reversed(order):
+        ks = kids.get(fid, ())
+        d_files = dfiles.get(fid, 0)
+        t_sub, t_files = len(ks), d_files
+        for k in ks:
+            t = totals.get(k)
+            if t is not None:
+                t_sub += t[2]
+                t_files += t[3]
+        totals[fid] = (len(ks), d_files, t_sub, t_files)
+    stats = {"version": ver, "kids": kids, "dfiles": dfiles, "totals": totals, "files_by_parent": None}
+    idx["_stats"] = stats
+    return stats
+
+
+def _index_root_id(idx: dict[str, Any], drive_id: str) -> str | None:
+    root_id = idx.get("root_id") or gd._DRIVE_ROOT_ID_CACHE.get(drive_id)
+    if not root_id:
+        tops = [fid for fid, f in (idx.get("folders") or {}).items() if not f.get("parent_id")]
+        if len(tops) == 1:
+            root_id = tops[0]
+    if root_id:
+        idx["root_id"] = root_id
+    return root_id
+
+
+def _index_rel_path(idx: dict[str, Any], fid: str, root_id: str | None) -> str:
+    """'A/B/C' path of a folder below the drive root, from the index."""
+    folders_map = idx.get("folders") or {}
+    names: list[str] = []
+    seen: set[str] = set()
+    cur: str | None = fid
+    while cur and cur != root_id and cur not in seen:
+        seen.add(cur)
+        f = folders_map.get(cur)
+        if f is None or not f.get("parent_id"):
+            break
+        names.append(f.get("name") or "")
+        cur = f.get("parent_id")
+    return "/".join(reversed(names))
+
+
+def _drive_index_ready(drive_id: str) -> dict[str, Any] | None:
+    idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+    if idx is None or not idx.get("complete") or idx.get("files_capped") or "files" not in idx:
+        return None
+    return idx
+
+
+def _children_from_index(drive_id: str, parent_id: str) -> list[dict[str, Any]] | None:
+    """A folder listing rebuilt from the delta index, in Graph's driveItem shape
+    (no download URLs / tags). Used only when Graph is throttling (429), so the
+    folder still opens instead of "Couldn't load this folder"."""
+    idx = _drive_index_ready(drive_id)
+    if idx is None:
+        return None
+    root_id = _index_root_id(idx, drive_id)
+    pid = root_id if (not parent_id or parent_id.lower() == "root") else parent_id
+    if not pid:
+        return None
+    folders_map = idx["folders"]
+    stats = _index_folder_stats(idx)
+    if pid not in folders_map and pid != root_id and pid not in stats["kids"]:
+        return None
+    if stats.get("files_by_parent") is None:
+        fbp: dict[str | None, list[str]] = {}
+        for iid, tup in idx["files"].items():
+            fbp.setdefault(tup[1], []).append(iid)
+        stats["files_by_parent"] = fbp
+    rel = "" if pid == root_id else _index_rel_path(idx, pid, root_id)
+    parent_ref = {"id": pid, "driveId": drive_id, "path": f"/drives/{drive_id}/root:" + (f"/{rel}" if rel else "")}
+    items: list[dict[str, Any]] = []
+    for fid in sorted(stats["kids"].get(pid, []), key=lambda i: (folders_map.get(i, {}).get("name") or "").lower()):
+        t = stats["totals"].get(fid, (0, 0, 0, 0))
+        items.append({
+            "id": fid,
+            "name": folders_map.get(fid, {}).get("name") or "",
+            "folder": {"childCount": t[0] + t[1]},
+            "parentReference": parent_ref,
+            "webUrl": "",
+        })
+    for iid in stats["files_by_parent"].get(pid, []):
+        name, _p, size, modified, web_url = idx["files"][iid]
+        items.append({
+            "id": iid,
+            "name": name,
+            "file": {},
+            "size": size,
+            "lastModifiedDateTime": modified,
+            "webUrl": web_url or "",
+            "parentReference": parent_ref,
+        })
+    return items
+
+
+async def _drive_index_for_read(drive_id: str, token: str | None, wait: float) -> tuple[dict[str, Any] | None, int | None]:
+    """Complete delta index (refreshed in the background when stale), or
+    (None, retry_after) while the first pass is still running / cooling down."""
+    idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+    complete = idx is not None and bool(idx.get("complete"))
+    needs_sync = (not complete) or (time.time() - (idx or {}).get("ts", 0.0)) > _INDEX_REFRESH_AFTER
+    last_err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+    cooling = bool(last_err and last_err[1] and (time.time() - last_err[0]) < last_err[1])
+    task = _DRIVE_INDEX_TASKS.get(drive_id)
+    if needs_sync and not cooling:
+        task = _ensure_drive_index_task(drive_id, token)
+    if not complete and task is not None and not task.done() and wait > 0:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+        except Exception:  # noqa: BLE001 - timeout or sync error: answered below
+            pass
+    ready = _drive_index_ready(drive_id)
+    if ready is not None:
+        return ready, None
+    err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+    retry_after = max(1, int(err[1] - (time.time() - err[0]))) if err and err[1] else None
+    return None, retry_after
 
 
 _PATH_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
@@ -4520,6 +4711,50 @@ async def site_subfolder_counts(
     del site_id
     try:
         parent_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
+        # Answer from the drive delta index: zero Graph calls. The old path
+        # below walks the WHOLE subtree with one Graph /children call per
+        # folder — at a library root that is every folder in the library
+        # (thousands), which exhausted the app's Graph quota and made every
+        # other folder listing fail with 429 ("Couldn't load this folder").
+        if not _DELTA_UNSUPPORTED.get(drive_id):
+            idx, retry_after = await _drive_index_for_read(drive_id, x_graph_access_token, wait=1.5)
+            if idx is not None:
+                stats = _index_folder_stats(idx)
+                child_ids = stats["kids"].get(parent_id, [])
+                totals = stats["totals"]
+                counts_by_id: dict[str, dict[str, int]] = {}
+                for cid in child_ids:
+                    t = totals.get(cid)
+                    if t is not None:
+                        counts_by_id[cid] = {
+                            "direct_subfolders": t[0], "direct_files": t[1],
+                            "total_subfolders": t[2], "total_files": t[3],
+                        }
+                direct_folders = len(child_ids)
+                direct_files = stats["dfiles"].get(parent_id, 0)
+                return {
+                    "folder_id": parent_id,
+                    "counts": counts_by_id,
+                    "summary_counts": {
+                        "direct_folders": direct_folders,
+                        "direct_files": direct_files,
+                        "total_folders": direct_folders + sum(c["total_subfolders"] for c in counts_by_id.values()),
+                        "total_files": direct_files + sum(c["total_files"] for c in counts_by_id.values()),
+                    },
+                    "source": "delta",
+                }
+            if not _DELTA_UNSUPPORTED.get(drive_id) and not (
+                (_DRIVE_FOLDER_INDEX.get(drive_id) or {}).get("files_capped")
+            ):
+                # First index pass still running: the client polls. Never
+                # fall back to the per-folder walk here.
+                return {
+                    "folder_id": parent_id,
+                    "counts": {},
+                    "summary_counts": None,
+                    "building": True,
+                    "retry_after": retry_after,
+                }
         items = await gd.list_children(drive_id, parent_id, access_token=x_graph_access_token)
         folder_items = [i for i in items if i.get("folder") and i.get("id")]
         direct_files = len([i for i in items if not i.get("folder")])

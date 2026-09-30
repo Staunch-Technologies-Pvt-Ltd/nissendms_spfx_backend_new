@@ -11,6 +11,64 @@ import httpx
 import msal
 
 from ..config import settings
+import os
+import re
+
+
+# ── Throttling: keep bulk READS off the signed-in user's SharePoint quota ──
+# The SPFx web part forwards the user's delegated Graph token
+# (X-Graph-Access-Token). Every Graph call made with it is charged to that
+# USER's SharePoint throttling budget, so the backend's drive-wide delta
+# index, folder walks and per-file tag look-ups exhausted it and SharePoint
+# started redirecting the user's own pages to _layouts/15/Throttle.htm.
+# Read-only calls now use the app-only (client-credentials) token, which has
+# its own, separate per-app quota; writes keep the user's token so
+# "Modified By" stays the real user. If the app is not allowed to read a
+# site/drive (401/403) that call falls back to the user's token.
+# Set GRAPH_READS_AS_APP=false in backend/.env to restore the old behaviour.
+_READS_AS_APP = os.getenv("GRAPH_READS_AS_APP", "true").strip().lower() not in ("0", "false", "no", "off")
+# Microsoft's recommended traffic decoration (helps SharePoint prioritise
+# well-behaved app traffic when a tenant is under load).
+_USER_AGENT = os.getenv("GRAPH_USER_AGENT", "NONISV|NissenKaiun|StaunchDMS/1.0")
+_APP_DENIED_TTL = 600.0
+_app_denied: dict[str, float] = {}  # "/drives/<id>" or "/sites/<id>" -> denied until (monotonic)
+_SCOPE_RE = re.compile(r"/(drives|sites)/([^/?:]+)", re.IGNORECASE)
+
+
+def _graph_path(url: str) -> str:
+    u = url.split("?", 1)[0]
+    i = u.find("graph.microsoft.com/")
+    if i >= 0:
+        u = u[i + len("graph.microsoft.com/"):]
+        u = u.split("/", 1)[1] if "/" in u else ""  # drop "v1.0" / "beta"
+    return "/" + u.lstrip("/")
+
+
+def _is_user_scoped(path: str) -> bool:
+    p = path.lower()
+    return p == "/me" or p.startswith("/me/") or p.startswith("/me?")
+
+
+def _is_read_only(method: str, url: str, body: dict | None) -> bool:
+    path = _graph_path(url)
+    if _is_user_scoped(path):
+        return False
+    m = (method or "").upper()
+    if m == "GET":
+        return True
+    if m == "POST" and path.lower().endswith("/$batch") and isinstance(body, dict):
+        reqs = body.get("requests") or []
+        return bool(reqs) and all(
+            str(r.get("method", "GET")).upper() == "GET"
+            and not _is_user_scoped("/" + str(r.get("url", "")).lstrip("/"))
+            for r in reqs
+        )
+    return False
+
+
+def _scope_key(url: str) -> str | None:
+    m = _SCOPE_RE.search(_graph_path(url))
+    return f"/{m.group(1).lower()}/{m.group(2)}" if m else None
 
 
 class GraphError(RuntimeError):
@@ -89,12 +147,43 @@ class GraphClient:
 
     def _headers(self, extra: dict | None = None, access_token: str | None = None) -> dict:
         token = access_token if (isinstance(access_token, str) and "." in access_token) else self._token()
-        h = {"Authorization": f"Bearer {token}"}
+        h = {"Authorization": f"Bearer {token}", "User-Agent": _USER_AGENT}
         if extra:
             h.update(extra)
         return h
 
     async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        content: bytes | None = None,
+        headers: dict | None = None,
+        params: dict | None = None,
+        access_token: str | None = None,
+    ) -> httpx.Response:
+        delegated = isinstance(access_token, str) and "." in access_token
+        if delegated and _READS_AS_APP and _is_read_only(method, path, json):
+            key = _scope_key(path)
+            denied_until = _app_denied.get(key or "", 0.0)
+            if time.monotonic() >= denied_until:
+                try:
+                    return await self._request(
+                        method, path, json=json, content=content,
+                        headers=headers, params=params, access_token=None,
+                    )
+                except GraphError as exc:
+                    if exc.status not in (401, 403):
+                        raise  # incl. 429: never spill app throttling onto the user
+                    if key:
+                        _app_denied[key] = time.monotonic() + _APP_DENIED_TTL
+        return await self._request(
+            method, path, json=json, content=content,
+            headers=headers, params=params, access_token=access_token,
+        )
+
+    async def _request(
         self,
         method: str,
         path: str,
@@ -254,6 +343,7 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
             "Content-Type": "application/json;odata=nometadata",
+            "User-Agent": _USER_AGENT,
         }
         _NETWORK_ERRORS = (
             httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError,

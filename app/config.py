@@ -571,6 +571,68 @@ class Settings:
         return sites
 
     @staticmethod
+    def hidden_default_site_keys(sites: dict | None = None) -> set[str]:
+        """Site keys that must NOT be listed to users: the auto-generated
+        "bootstrap" site.
+
+        When the app is handed to another organisation, its .env only has the
+        default LOCAL/DEV/PROD block and no real site name, so discovery
+        synthesises a placeholder site labelled "Vessel DMS (<key>)". That
+        placeholder is not a real SharePoint site the customer chose, so it is
+        hidden from every site list / dashboard.
+
+        Controlled from .env:
+          HIDE_DEFAULT_SITE = auto (default) | true | false
+            auto  - hide sites whose name is still the generated placeholder
+                    ("Vessel DMS (<key>)"). Give the site a real name
+                    (<KEY>_SP_SITE_NAME or a site_configurations row) to show it.
+            true  - additionally hide the ACTIVE_SITE default site itself,
+                    even when it has a real name, so only sites added through
+                    Site Management (DB rows) are shown.
+            false - never hide (legacy behaviour).
+          HIDDEN_SITE_KEYS = comma,separated,keys  - always hidden.
+        Hiding only affects listings/dashboard; the backend still uses the
+        default site internally (provisioning, auth, etc.).
+        """
+        raw = _RawEnv()
+        mode = str(getattr(raw, "hide_default_site", None) or "auto").strip().lower()
+        explicit = {
+            k.strip().lower()
+            for k in str(getattr(raw, "hidden_site_keys", None) or "").split(",")
+            if k.strip()
+        }
+        if mode in ("false", "0", "no", "off"):
+            return explicit
+        if sites is None:
+            sites = Settings.discover_available_sites()
+        hidden = set(explicit)
+        db_named: set[str] = set()
+        try:
+            from .db.base import engine
+            if engine:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT site_key, display_name, site_name FROM site_configurations"
+                    )).mappings().all()
+                    for r in rows:
+                        nm = r["display_name"] or r["site_name"]
+                        if nm and not _is_generic_site_label(nm, r["site_key"]):
+                            db_named.add((r["site_key"] or "").strip().lower())
+        except Exception:
+            pass
+        for key, info in sites.items():
+            k = key.strip().lower()
+            if k in db_named:
+                continue  # admin registered this site with a real name
+            if _is_generic_site_label(info.get("sp_site_name"), k):
+                hidden.add(k)
+        if mode in ("true", "1", "yes", "on"):
+            hidden.add(str(getattr(raw, "active_site", None) or getattr(raw, "app_env", "") or "").strip().lower())
+            hidden.discard("")
+        return hidden
+
+    @staticmethod
     def discover_visible_sites() -> dict[str, dict]:
         """Like discover_available_sites(), minus any site an admin removed
         or hid from Site Management (site_configurations.is_removed /
@@ -602,6 +664,11 @@ class Settings:
                         for r in rows if r["is_hidden"] or r["is_removed"]
                     }
                     sites = {k: v for k, v in sites.items() if k not in excluded}
+        except Exception:
+            pass
+        try:
+            _hide = Settings.hidden_default_site_keys(sites)
+            sites = {k: v for k, v in sites.items() if k.strip().lower() not in _hide}
         except Exception:
             pass
         return sites

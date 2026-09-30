@@ -51,6 +51,12 @@ _DASHBOARD_CACHE_FILE = Path(__file__).resolve().parents[2] / ".dashboard_scan_c
 # finishes means "discard me, don't let me overwrite what invalidation
 # just fixed" (see _dashboard_site_scan_uncached).
 _DASHBOARD_CACHE_GENERATION = 0
+# Live running totals of scans that are in progress, keyed by site_key:
+# {"files": int, "folders": int}. Updated per item while a drive is being
+# walked so the Home page can show a growing count IMMEDIATELY (e.g.
+# "12,400+ files - counting") for a newly added 20k+ file site instead of a
+# blank "Counting..." until the whole library has been read.
+_DASHBOARD_LIVE_PROGRESS: dict[str, dict] = {}
 # time.time() of the last completed scan in which any site was throttled
 # (429/503). The scheduler's background refresh backs off for a few minutes
 # after this instead of re-scanning into a still-exhausted Graph quota.
@@ -3800,6 +3806,16 @@ class RealBackend:
                     "web_url": "",
                 }]
 
+        # Scan sites that have no real counts yet (just added / never scanned)
+        # BEFORE already-known sites: their numbers are what the user is
+        # waiting on, and the known sites already show cached counts.
+        _known_all = _DASHBOARD_SCAN_CACHE.get("all")
+        _known_keys = {
+            s.get("site_key") for s in ((_known_all or {}).get("data", {}).get("sites") or [])
+            if not s.get("stats_pending") and not s.get("error")
+        }
+        targets.sort(key=lambda tg: tg.get("site_key") in _known_keys)
+
         # Bounds concurrent Graph requests across ALL sites scanned in this
         # call, not just within one site's tree-walk. Scanning "All Sites"
         # fires up to 4 tree-walk workers PER site via asyncio.gather, so 3
@@ -3853,9 +3869,12 @@ class RealBackend:
                     return
                 if "folder" in f:
                     folders += 1
+                    _DASHBOARD_LIVE_PROGRESS[target["site_key"]] = {"files": len(docs), "folders": folders}
                     return
                 if "file" not in f:
                     return
+                if len(docs) % 50 == 0:
+                    _DASHBOARD_LIVE_PROGRESS[target["site_key"]] = {"files": len(docs), "folders": folders}
                 parts = _item_folder_parts(f)
                 group = parts[0] if parts else (target.get("site_name") or "Shared Documents")
 
@@ -4066,6 +4085,7 @@ class RealBackend:
 
             async def _scan_once() -> None:
                 nonlocal items_seen
+                _DASHBOARD_LIVE_PROGRESS[target["site_key"]] = {"files": 0, "folders": 0}
                 if not drive_id:
                     raise ValueError("no drive_id configured for this site")
                 items_seen = await _scan_via_search()
@@ -4163,6 +4183,7 @@ class RealBackend:
                         "dashboard scan: vessel term-store cross-match failed for site=%s: %s",
                         target.get("site_key"), e,
                     )
+            _DASHBOARD_LIVE_PROGRESS.pop(target["site_key"], None)
             return {
                 "site_key": target["site_key"],
                 "site_name": _dashboard_site_label(target["site_key"], target.get("site_name")),
@@ -4295,6 +4316,20 @@ class RealBackend:
 
         scan = await self._dashboard_site_scan(force_refresh=force_refresh, site_key=site_key)
         all_docs = scan["docs"]
+
+        # Overlay live running totals onto sites still being counted, so a
+        # big new site shows "N+ files" right away instead of 0/blank.
+        if any(s.get("stats_pending") for s in scan["sites"]):
+            live_sites = []
+            for s in scan["sites"]:
+                prog = _DASHBOARD_LIVE_PROGRESS.get(s.get("site_key")) if s.get("stats_pending") else None
+                live_sites.append({**s, "files": prog["files"], "folders": prog["folders"], "counting": True} if prog else s)
+            scan = {
+                **scan,
+                "sites": live_sites,
+                "total_files": sum(s.get("files", 0) for s in live_sites),
+                "total_folders": sum(s.get("folders", 0) for s in live_sites),
+            }
 
         # Vessel count scoped to the requested site: the number of the
         # site's ROOT-LEVEL folders whose name matches a Term Store vessel

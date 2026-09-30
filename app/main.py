@@ -33,12 +33,32 @@ async def _resolve_drive_folder_id(
     if not reference or reference.lower() == 'root':
         return root_id
 
-    try:
-        item = await gd.get_item(drive_id, reference, access_token=access_token)
-        if item.get('folder') is not None or item.get('id'):
-            return str(item.get('id') or reference)
-    except GraphError:
-        pass
+    # A drive-item ID (e.g. 01YT4WOQF5QIV...) must never fall through to the
+    # name/path lookup below: that lookup raises "SharePoint folder not found",
+    # which used to turn any *transient* Graph failure on get_item (429
+    # throttle, 5xx, timeout, token hiccup) into a bogus 404 for a folder that
+    # exists. Only a real 400/404 from Graph means "not an item ID".
+    looks_like_item_id = bool(re.fullmatch(r'01[A-Z0-9]{26,}', reference))
+    for attempt in range(2):
+        try:
+            item = await gd.get_item(drive_id, reference, access_token=access_token)
+            if item.get('folder') is not None or item.get('id'):
+                return str(item.get('id') or reference)
+            break
+        except GraphError as exc:
+            if exc.status in (400, 404):
+                if looks_like_item_id:
+                    raise HTTPException(status_code=404, detail=f'SharePoint folder not found: {reference}') from exc
+                break  # plain name/path reference — resolve by name below
+            if attempt == 0 and exc.status in (500, 502, 503, 504):
+                await asyncio.sleep(0.4)
+                continue
+            raise  # 401/403/429/5xx: surface the real status so the UI can retry
+        except (httpx.TimeoutException, httpx.TransportError):
+            if attempt == 0:
+                await asyncio.sleep(0.4)
+                continue
+            raise
 
     # If reference starts with synthetic sf_ prefix (e.g. sf_4_ghana_express), strip it
     if reference.lower().startswith('sf_'):
@@ -110,6 +130,7 @@ when configured (see backend/.env), otherwise the in-memory stub. See
 `app/services/__init__.py`.
 """
 import asyncio
+import httpx
 import base64
 import json
 import logging
@@ -164,18 +185,17 @@ async def get_folder_recursive_counts(
     folder_id: str,
     parent_id: str | None = None,
     access_token: str | None = None,
-    max_depth: int = 2,
+    max_depth: int = 12,
     current_depth: int = 0,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """
-    Recursively walks a folder and its subfolders to compute:
-    - direct_subfolders: count of immediate child folders
-    - direct_files: count of immediate child files
-    - total_subfolders: count of all subfolders in the subtree
-    - total_files: count of all files in the subtree
-    Guarantees max 6 concurrent Graph API requests globally via _GRAPH_RECURSIVE_SEMAPHORE.
-    Records child -> parent relationship in _FOLDER_PARENT_MAP for targeted ancestor invalidation.
-    Bounded by max_depth to prevent Graph API rate-limiting delays.
+    Walk a folder's full subtree and return:
+    - direct_subfolders / direct_files: immediate children only
+    - total_subfolders / total_files: EVERY nested folder / file in the subtree
+    - is_partial: True only if a branch failed (e.g. throttled) or max_depth was hit,
+      in which case the totals are a lower bound and are NOT cached.
+    Concurrency is bounded globally via _GRAPH_RECURSIVE_SEMAPHORE.
+    Records child -> parent in _FOLDER_PARENT_MAP for targeted ancestor invalidation.
     """
     cache_key = f"{drive_id}:{folder_id}"
     now = time.time()
@@ -188,62 +208,54 @@ async def get_folder_recursive_counts(
     if parent_id:
         _FOLDER_PARENT_MAP[folder_id] = parent_id
 
-    async with _GRAPH_RECURSIVE_SEMAPHORE:
-        children = await gd.list_children(drive_id, folder_id, access_token=access_token)
+    try:
+        async with _GRAPH_RECURSIVE_SEMAPHORE:
+            children = await gd.list_children(drive_id, folder_id, access_token=access_token)
+    except GraphError:
+        logger.exception("Folder count walk failed drive=%s folder=%s", drive_id, folder_id)
+        return {
+            "direct_subfolders": 0, "direct_files": 0,
+            "total_subfolders": 0, "total_files": 0, "is_partial": True,
+        }
 
     subfolders = [c for c in children if c.get("folder") and c.get("id")]
-    files = [c for c in children if not c.get("folder")]
-
+    direct_files = len([c for c in children if not c.get("folder")])
     direct_subfolders = len(subfolders)
-    direct_files = len(files)
 
     if direct_subfolders == 0:
         result = {
-            "direct_subfolders": 0,
-            "direct_files": direct_files,
-            "total_subfolders": 0,
-            "total_files": direct_files,
+            "direct_subfolders": 0, "direct_files": direct_files,
+            "total_subfolders": 0, "total_files": direct_files, "is_partial": False,
         }
         _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
         return result
 
     if current_depth >= max_depth:
-        total_sub_files = sum(
-            (sf.get("folder") or {}).get("childCount") or 0
-            for sf in subfolders
-            if isinstance((sf.get("folder") or {}).get("childCount"), int)
-        )
-        result = {
-            "direct_subfolders": direct_subfolders,
-            "direct_files": direct_files,
-            "total_subfolders": direct_subfolders,
-            "total_files": direct_files + total_sub_files,
+        # Safety valve only (12 levels deep). Lower bound; not cached.
+        return {
+            "direct_subfolders": direct_subfolders, "direct_files": direct_files,
+            "total_subfolders": direct_subfolders, "total_files": direct_files,
+            "is_partial": True,
         }
-        _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
-        return result
 
     sub_results = await asyncio.gather(*(
         get_folder_recursive_counts(
-            drive_id,
-            sf["id"],
-            parent_id=folder_id,
-            access_token=access_token,
-            max_depth=max_depth,
-            current_depth=current_depth + 1,
+            drive_id, sf["id"], parent_id=folder_id, access_token=access_token,
+            max_depth=max_depth, current_depth=current_depth + 1,
         )
         for sf in subfolders
     ))
 
-    total_subfolders = direct_subfolders + sum(r["total_subfolders"] for r in sub_results)
-    total_files = direct_files + sum(r["total_files"] for r in sub_results)
-
+    is_partial = any(r.get("is_partial") for r in sub_results)
     result = {
         "direct_subfolders": direct_subfolders,
         "direct_files": direct_files,
-        "total_subfolders": total_subfolders,
-        "total_files": total_files,
+        "total_subfolders": direct_subfolders + sum(r["total_subfolders"] for r in sub_results),
+        "total_files": direct_files + sum(r["total_files"] for r in sub_results),
+        "is_partial": is_partial,
     }
-    _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
+    if not is_partial:
+        _FOLDER_RECURSIVE_COUNTS_CACHE[cache_key] = (now, result)
     return result
 
 _DISCOVERED_SITES_CACHE: dict[str, tuple[float, list[dict[str, str]]]] = {}
@@ -2378,6 +2390,9 @@ def get_available_sites(
         finally:
             db.close()
 
+    _hide_default = Settings.hidden_default_site_keys()
+    configured_sites = [s for s in configured_sites if str(s.get("site_key") or s.get("name") or "").strip().lower() not in _hide_default]
+
     if not include_hidden:
         configured_sites = [s for s in configured_sites if not s.get("is_hidden")]
 
@@ -2590,7 +2605,9 @@ async def get_document_sites(
         except Exception:
             pass
 
-    # Exclude any sites marked as hidden
+    # Exclude any sites marked as hidden, plus the auto-generated
+    # "Vessel DMS (<key>)" default site (see Settings.hidden_default_site_keys)
+    hidden_keys = hidden_keys | Settings.hidden_default_site_keys()
     sites = [s for s in sites if str(s["site_key"]).strip().lower() not in hidden_keys]
 
     # Configured site URLs are not always present in environment settings.
@@ -2753,6 +2770,9 @@ async def get_admin_site_configuration(
                     configured_sites_map[k] = entry
         except Exception:
             pass
+
+    _hide_default = Settings.hidden_default_site_keys()
+    configured_sites_map = {k: v for k, v in configured_sites_map.items() if str(k).strip().lower() not in _hide_default}
 
     # Removed sites are permanently excluded from Site Management, regardless
     # of include_hidden — unlike hiding, there is no "show removed" view.
@@ -3440,6 +3460,9 @@ async def discover_sites(
                 )
             }
 
+        _hide_default = Settings.hidden_default_site_keys()
+        configured_map = {k: s for k, s in configured_map.items() if k.strip().lower() not in _hide_default}
+
         if not inc_hidden:
             sites = [s for s in configured_map.values() if not s.get("is_hidden")]
         else:
@@ -3718,7 +3741,7 @@ async def site_folder_children(
                         "direct_files": child_count if isinstance(child_count, int) else 0,
                         "total_subfolders": 0,
                         "total_files": child_count if isinstance(child_count, int) else 0,
-                        "is_estimated": True,
+                        "is_estimated": True,  # immediate items only; UI must show as "~"
                     } if isinstance(child_count, int) else None
 
         # Do not launch recursive count walks from this request. The folder
@@ -3833,6 +3856,22 @@ async def create_site_folder(
     return {**item, "web_url": item.get("webUrl") or "", "status": "completed"}
 
 
+def _json_maybe_gzip(request: Request, payload: Any) -> Response:
+    """JSON response, gzip-compressed when the browser accepts it.
+
+    The index-served file lists run to several MB of repetitive JSON; done per
+    endpoint (not app-wide) so streaming endpoints are left alone.
+    """
+    import gzip as _gzip
+
+    body = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+    headers: dict[str, str] = {}
+    if len(body) > 1024 and "gzip" in (request.headers.get("accept-encoding") or "").lower():
+        body = _gzip.compress(body, compresslevel=5)
+        headers["Content-Encoding"] = "gzip"
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
 _RECURSIVE_TREE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _RECURSIVE_TREE_INFLIGHT: dict[str, asyncio.Task] = {}
 CACHE_TTL_RECURSIVE_TREE = 600.0  # 10 minutes cache for instant tree loading
@@ -3847,6 +3886,8 @@ async def site_folder_recursive_tree(
     request: Request,
     include_tags: bool = True,
     max_items: int = 2000,
+    path_words: str = "",
+    use_index: bool = True,
     x_graph_access_token: str | None = Header(default=None),
     _session: object = Depends(require_session),
 ):
@@ -3860,6 +3901,16 @@ async def site_folder_recursive_tree(
     # Documents Group/Category folder search. max_items is clamped so a
     # caller can't request an unbounded walk.
     max_items = max(100, min(int(max_items or 2000), 10000))
+    # Names/paths only: answer from the drive delta index (one in-memory pass)
+    # instead of a folder-by-folder Graph walk that takes minutes on a big
+    # library and trips the 429 quota. Falls through to the walk if the index
+    # can't be used (delta unsupported, file index over its cap, use_index=false).
+    if not include_tags and use_index:
+        served = await _recursive_from_index(
+            drive_id, folder_id, max_items, path_words[:400], x_graph_access_token
+        )
+        if served is not None:
+            return _json_maybe_gzip(request, served)
     cache_key = f"{drive_id}:{folder_id}:{int(include_tags)}:{max_items}"
     active = _RECURSIVE_TREE_INFLIGHT.get(cache_key)
     if active is not None:
@@ -4006,6 +4057,457 @@ async def _build_site_folder_recursive_tree(
     return result
 
 
+_FOLDER_ONLY_TREE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_FOLDER_ONLY_TREE_INFLIGHT: dict[str, asyncio.Task] = {}
+CACHE_TTL_FOLDER_ONLY_TREE = 600.0  # fresh for 10 min, then served stale while refreshing; ?refresh=true forces a rebuild
+
+
+# ── Drive-wide folder index (Graph delta) ──────────────────────────────────
+# Walking a big library folder-by-folder costs one Graph call per folder
+# (thousands for ~24 vessels) and exhausts the app's request quota (429).
+# A single paged delta pass over the drive returns every item once; we keep
+# only the folders, then derive any sub-tree in memory and refresh it
+# incrementally with the delta token (a handful of tiny calls).
+_DRIVE_FOLDER_INDEX: dict[str, dict[str, Any]] = {}
+_DRIVE_INDEX_TASKS: dict[str, asyncio.Task] = {}
+_DRIVE_INDEX_LAST_ERROR: dict[str, tuple[float, float | None]] = {}
+_DELTA_UNSUPPORTED: dict[str, bool] = {}
+_INDEX_REFRESH_AFTER = 45.0  # seconds before a background delta refresh
+
+
+_FILE_INDEX_MAX = 300_000  # past this the file index is dropped and /recursive walks Graph as before
+
+
+async def _sync_drive_index(drive_id: str, token: str | None) -> None:
+    idx = _DRIVE_FOLDER_INDEX.setdefault(
+        drive_id,
+        {"folders": {}, "files": {}, "delta_link": None, "resume": None, "ts": 0.0, "complete": False},
+    )
+    base_url = (
+        f"/drives/{drive_id}/root/delta"
+        "?$select=id,name,folder,file,size,lastModifiedDateTime,webUrl,parentReference,deleted"
+    )
+    # A bigger page size means far fewer Graph round trips for the first pass
+    # (default pages hold ~200 items); if Graph rejects $top the pass is simply
+    # restarted without it.
+    url = idx.get("resume") or idx.get("delta_link") or f"{base_url}&$top=1000"
+    tried_top = "$top=" in (url or "")
+    folders: dict[str, dict[str, Any]] = idx["folders"]
+    # Files ride along on the same delta pass (it already returns every item),
+    # so the Group/Category walk can be answered from memory instead of one
+    # Graph call per folder. Tuple: (name, parent_id, size, modified, web_url).
+    files: dict[str, tuple] = idx.setdefault("files", {})
+    while url:
+        try:
+            data = await graph().get(url, access_token=token)
+        except GraphError as exc:
+            if tried_top and getattr(exc, "status", None) == 400 and "$top=" in url:
+                tried_top = False
+                url = base_url
+                continue
+            raise
+        tried_top = False
+        for it in data.get("value", []):
+            iid = it.get("id")
+            if not iid:
+                continue
+            if it.get("deleted"):
+                folders.pop(iid, None)
+                files.pop(iid, None)
+            elif it.get("folder") is not None:
+                folders[iid] = {
+                    "name": it.get("name") or "",
+                    "parent_id": (it.get("parentReference") or {}).get("id"),
+                }
+            elif it.get("file") is not None:
+                if len(files) >= _FILE_INDEX_MAX and iid not in files:
+                    idx["files_capped"] = True
+                    continue
+                files[iid] = (
+                    it.get("name") or "",
+                    (it.get("parentReference") or {}).get("id"),
+                    it.get("size"),
+                    it.get("lastModifiedDateTime"),
+                    it.get("webUrl") or "",
+                )
+        nxt = data.get("@odata.nextLink")
+        if nxt:
+            idx["resume"] = nxt  # a throttled/failed page resumes here, not from scratch
+            url = nxt
+            continue
+        delta_link = data.get("@odata.deltaLink")
+        if delta_link:
+            idx["delta_link"] = delta_link
+        idx["resume"] = None
+        url = None
+    idx["ts"] = time.time()
+    idx["complete"] = True
+
+
+def _ensure_drive_index_task(drive_id: str, token: str | None) -> asyncio.Task:
+    task = _DRIVE_INDEX_TASKS.get(drive_id)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(_sync_drive_index(drive_id, token))
+
+    def _done(t: asyncio.Task) -> None:
+        if _DRIVE_INDEX_TASKS.get(drive_id) is t:
+            _DRIVE_INDEX_TASKS.pop(drive_id, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None:
+            _DRIVE_INDEX_LAST_ERROR.pop(drive_id, None)
+            return
+        logging.getLogger(__name__).warning("drive folder index sync failed for %s: %s", drive_id, exc)
+        if isinstance(exc, GraphError):
+            if exc.status in (400, 404, 405, 501):
+                _DELTA_UNSUPPORTED[drive_id] = True  # delta not available here -> use the walk
+            _DRIVE_INDEX_LAST_ERROR[drive_id] = (time.time(), getattr(exc, "retry_after", None))
+        else:
+            _DRIVE_INDEX_LAST_ERROR[drive_id] = (time.time(), None)
+
+    task.add_done_callback(_done)
+    _DRIVE_INDEX_TASKS[drive_id] = task
+    return task
+
+
+def _subtree_from_index(
+    idx: dict[str, Any], root_id: str, max_depth: int, max_folders: int
+) -> tuple[list[dict[str, Any]], bool]:
+    children: dict[str | None, list[tuple[str, str]]] = {}
+    for fid, f in idx["folders"].items():
+        children.setdefault(f.get("parent_id"), []).append((fid, f.get("name") or ""))
+    folders: list[dict[str, Any]] = []
+    capped = False
+    level: list[tuple[str, str]] = [(root_id, "")]
+    depth = 0
+    for depth in range(1, max_depth + 1):
+        nxt: list[tuple[str, str]] = []
+        for pid, ppath in level:
+            for fid, name in sorted(children.get(pid, []), key=lambda x: x[1].lower()):
+                if len(folders) >= max_folders:
+                    capped = True
+                    break
+                path = f"{ppath}/{name}".strip("/")
+                folders.append({"id": fid, "name": name, "parent_id": pid, "path": path, "depth": depth})
+                nxt.append((fid, path))
+        level = nxt
+        if not level:
+            break
+    if level and depth >= max_depth:
+        capped = True
+    return folders, capped
+
+
+_PATH_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+async def _recursive_from_index(
+    drive_id: str,
+    folder_id: str,
+    max_items: int,
+    path_words: str,
+    token: str | None,
+) -> dict[str, Any] | None:
+    """Files below a folder, answered from the drive delta index (no Graph walk).
+
+    Same response shape as the walk (`folders` holds the items) but files only.
+    `path_words` (comma separated, lower case) keeps only files that sit under
+    a folder whose name contains one of those words, e.g. "drawing,drawings,
+    dwg,dwgs" for the Drawings group; the client still applies its own exact
+    rule afterwards, so this only has to be a superset. Returns None when the
+    index can't be used (caller falls back to the walk), or a `building`
+    answer while the first delta pass is still running (client polls).
+    """
+    if _DELTA_UNSUPPORTED.get(drive_id):
+        return None
+    # No Graph call up front: under throttling the Graph client sleeps out its
+    # Retry-After, which used to hold this request for ~20 s. The folder is
+    # resolved from the index below once that is ready.
+    idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+    complete = idx is not None and bool(idx.get("complete"))
+    needs_sync = (not complete) or (time.time() - (idx or {}).get("ts", 0.0)) > _INDEX_REFRESH_AFTER
+    last_err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+    cooling = bool(last_err and last_err[1] and (time.time() - last_err[0]) < last_err[1])
+    task = _DRIVE_INDEX_TASKS.get(drive_id)
+    if needs_sync and not cooling:
+        task = _ensure_drive_index_task(drive_id, token)
+    if task is not None and not task.done():
+        # First build: a short wait, then tell the client to poll (a long-held
+        # request pins one of the browser's ~6 connections). Stale index: an
+        # even shorter wait so a just-uploaded file usually shows up.
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.5 if not complete else 1.5)
+        except asyncio.TimeoutError:
+            if not complete:
+                return {"root_id": None, "folders": [], "truncated": True, "building": True}
+        except Exception:  # noqa: BLE001 - handled below via the error map
+            pass
+    idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+    if idx is None or not idx.get("complete"):
+        if _DELTA_UNSUPPORTED.get(drive_id):
+            return None
+        err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+        retry_after = None
+        if err and err[1]:
+            retry_after = max(1, int(err[1] - (time.time() - err[0])))
+        return {"root_id": None, "folders": [], "truncated": True, "building": True, "retry_after": retry_after}
+    if idx.get("files_capped") or "files" not in idx:
+        return None
+
+    ref = (folder_id or "").strip()
+    root_id: str | None = None
+    if not ref or ref.lower() == "root":
+        root_id = idx.get("root_id")
+        if not root_id:
+            tops = [fid for fid, f in idx["folders"].items() if not f.get("parent_id")]
+            if len(tops) == 1:
+                root_id = idx["root_id"] = tops[0]
+    elif ref in idx["folders"]:
+        root_id = ref
+    if root_id is None:
+        try:
+            root_id = await _resolve_drive_folder_id(drive_id, folder_id, token)
+        except GraphError:
+            return None  # the walk reports the real error the way it always did
+
+    folders_map: dict[str, dict[str, Any]] = idx["folders"]
+    files_map: dict[str, tuple] = idx["files"]
+    words = frozenset(w.strip().lower() for w in (path_words or "").split(",") if w.strip())
+    word_cache: dict[str, bool] = {}
+    rel_memo: dict[str, list[str] | None] = {}
+
+    def _has_word(name: str) -> bool:
+        hit = word_cache.get(name)
+        if hit is None:
+            hit = any(w in words for w in _PATH_WORD_SPLIT.split(name.lower()) if w)
+            word_cache[name] = hit
+        return hit
+
+    def _rel_of(fid: str | None) -> list[str] | None:
+        """Folder names from just below `root_id` down to `fid`; None if not under it."""
+        chain: list[str] = []
+        seen: set[str] = set()
+        cur = fid
+        base: list[str] | None
+        while True:
+            if cur is None:
+                base = None
+                break
+            if cur == root_id:
+                base = []
+                break
+            if cur in rel_memo:
+                base = rel_memo[cur]
+                break
+            f = folders_map.get(cur)
+            if f is None or cur in seen:
+                base = None
+                break
+            seen.add(cur)
+            chain.append(cur)
+            cur = f.get("parent_id")
+        for cid in reversed(chain):
+            base = None if base is None else base + [folders_map[cid].get("name") or ""]
+            rel_memo[cid] = base
+        return base
+
+    items: list[dict[str, Any]] = []
+    for fid, (name, parent_id, size, modified, web_url) in files_map.items():
+        rel = _rel_of(parent_id)
+        if rel is None:
+            continue
+        if words and not any(_has_word(n) for n in rel):
+            continue
+        items.append({
+            "id": fid,
+            "name": name,
+            "path": "/".join(rel + [name]),
+            "web_url": web_url,
+            "is_folder": False,
+            "size": size,
+            "last_modified_date_time": modified,
+        })
+    items.sort(key=lambda x: x["path"].lower())
+    return {
+        "root_id": root_id,
+        "folders": items[:max_items],
+        "truncated": len(items) > max_items,
+        "source": "delta",
+    }
+
+
+@app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/folder-tree")
+@protected_read_endpoint
+async def site_folder_only_tree(
+    site_id: str,
+    drive_id: str,
+    folder_id: str,
+    max_depth: int = 8,
+    max_folders: int = 6000,
+    refresh: bool = False,
+    x_graph_access_token: str | None = Header(default=None),
+    _session: object = Depends(require_session),
+):
+    """Every sub-FOLDER below a drive item, in one call (flat, parent-linked).
+
+    Built for the Documents "All sub-folders" dropdown. Unlike /recursive it
+    (a) counts only folders against the cap, so files can no longer eat the
+    budget and hide whole vessels, (b) does no per-file tag enrichment, and
+    (c) is cached + single-flighted per folder, so the client makes ONE
+    request instead of one per folder.
+    """
+    if settings.db_configured:
+        from .db.base import SessionLocal
+        from .services.authorization import require_site_permission, resolve_site_key
+        with SessionLocal() as db:
+            require_site_permission(db, _session, resolve_site_key(db, site_id), "can_view")
+    max_depth = max(1, min(int(max_depth or 8), 12))
+    max_folders = max(100, min(int(max_folders or 6000), 20000))
+    try:
+        root_id = await _resolve_drive_folder_id(drive_id, folder_id, x_graph_access_token)
+    except GraphError as exc:
+        raise HTTPException(status_code=exc.status if 400 <= (exc.status or 0) < 600 else 502, detail=str(exc))
+    # Preferred path: drive-wide delta index (few Graph calls, no per-folder walk).
+    if not _DELTA_UNSUPPORTED.get(drive_id):
+        idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+        needs_sync = (
+            idx is None or not idx.get("complete") or refresh
+            or (time.time() - idx.get("ts", 0.0)) > _INDEX_REFRESH_AFTER
+        )
+        last_err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+        cooling = bool(last_err and last_err[1] and (time.time() - last_err[0]) < last_err[1])
+        task = _DRIVE_INDEX_TASKS.get(drive_id)
+        if needs_sync and not cooling:
+            task = _ensure_drive_index_task(drive_id, x_graph_access_token)
+        if idx is None or not idx.get("complete"):
+            if task is not None and not task.done():
+                try:
+                    # Short wait only: a long-held request pins one of the
+                    # browser's ~6 connections per origin, and the folder
+                    # listings (/children) queue behind it until their own
+                    # timeout aborts them — "Couldn't load this folder" on
+                    # first load. The client polls while `building`.
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.5)
+                except asyncio.TimeoutError:
+                    # Still building: tell the client to poll (costs no Graph calls).
+                    return {"root_id": root_id, "folders": [], "truncated": True, "building": True}
+                except Exception:  # noqa: BLE001 - handled via the error map below
+                    pass
+            idx = _DRIVE_FOLDER_INDEX.get(drive_id)
+        if idx is not None and idx.get("complete"):
+            tree_folders, capped = _subtree_from_index(idx, root_id, max_depth, max_folders)
+            return {"root_id": root_id, "folders": tree_folders, "truncated": capped, "source": "delta"}
+        if not _DELTA_UNSUPPORTED.get(drive_id):
+            err = _DRIVE_INDEX_LAST_ERROR.get(drive_id)
+            retry_after = None
+            if err and err[1]:
+                retry_after = max(1, int(err[1] - (time.time() - err[0])))
+            return {"root_id": root_id, "folders": [], "truncated": True, "building": True, "retry_after": retry_after}
+
+    cache_key = f"{drive_id}:{root_id}:{max_depth}:{max_folders}"
+    now = time.time()
+    cached = _FOLDER_ONLY_TREE_CACHE.get(cache_key)
+
+    async def _build() -> dict[str, Any]:
+        folders: list[dict[str, Any]] = []
+        failed_parents = 0
+        capped = False
+        sem = asyncio.Semaphore(6)
+
+        async def _list(pid: str) -> list[dict] | None:
+            # A throttled/failed listing used to silently drop that whole
+            # branch (which is why only some vessels showed nested folders).
+            # Retry with back-off OUTSIDE the semaphore so waiting doesn't
+            # block other folders.
+            for attempt in range(4):
+                try:
+                    async with sem:
+                        return await gd.list_children(drive_id, pid, access_token=x_graph_access_token)
+                except GraphError as exc:
+                    quota_out = getattr(exc, "status", 0) == 429 and (getattr(exc, "retry_after", 0) or 0) > 30
+                    if attempt == 3 or quota_out:
+                        logging.getLogger(__name__).exception("folder-tree list failed drive=%s parent=%s", drive_id, pid)
+                        return None
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            return None
+
+        level: list[tuple[str, str]] = [(root_id, "")]
+        seen: set[str] = {root_id}
+        depth = 0
+        for depth in range(1, max_depth + 1):
+            if not level:
+                break
+            results = await asyncio.gather(*(_list(pid) for pid, _ in level))
+            nxt: list[tuple[str, str]] = []
+            for (pid, ppath), children in zip(level, results):
+                if children is None:
+                    failed_parents += 1
+                    continue
+                for it in children:
+                    if not it.get("folder") or not it.get("id") or it["id"] in seen:
+                        continue
+                    if len(folders) >= max_folders:
+                        capped = True
+                        break
+                    seen.add(it["id"])
+                    name = it.get("name") or ""
+                    path = f"{ppath}/{name}".strip("/")
+                    folders.append({"id": it["id"], "name": name, "parent_id": pid, "path": path, "depth": depth})
+                    nxt.append((it["id"], path))
+            level = nxt
+        if level and depth >= max_depth:
+            capped = True
+        return {
+            "root_id": root_id,
+            "folders": folders,
+            "truncated": bool(failed_parents or capped),
+            "failed_branches": failed_parents,
+        }
+
+    def _start_build() -> asyncio.Task:
+        active_task = _FOLDER_ONLY_TREE_INFLIGHT.get(cache_key)
+        if active_task is not None:
+            return active_task
+        task = asyncio.create_task(_build())
+
+        def _done(t: asyncio.Task) -> None:
+            if _FOLDER_ONLY_TREE_INFLIGHT.get(cache_key) is t:
+                _FOLDER_ONLY_TREE_INFLIGHT.pop(cache_key, None)
+            if t.cancelled() or t.exception() is not None:
+                return
+            res = t.result()
+            prev = _FOLDER_ONLY_TREE_CACHE.get(cache_key)
+            # Keep the better tree: never replace a complete one with a
+            # partial (throttled) one, and never with a smaller partial one.
+            if res["truncated"] and prev and (not prev[1]["truncated"] or len(prev[1]["folders"]) > len(res["folders"])):
+                return
+            _FOLDER_ONLY_TREE_CACHE[cache_key] = (time.time(), res)
+
+        task.add_done_callback(_done)
+        _FOLDER_ONLY_TREE_INFLIGHT[cache_key] = task
+        return task
+
+    if cached and not refresh:
+        age = now - cached[0]
+        if age < CACHE_TTL_FOLDER_ONLY_TREE and not cached[1]["truncated"]:
+            return cached[1]
+        if age < 3600.0:
+            # Stale-while-revalidate: answer instantly from the last tree
+            # and refresh it in the background.
+            _start_build()
+            return cached[1]
+    try:
+        result = await asyncio.shield(_start_build())
+    except Exception as exc:  # noqa: BLE001
+        if cached:
+            return cached[1]
+        raise HTTPException(status_code=502, detail=f"Folder tree could not be loaded: {exc}")
+    kept = _FOLDER_ONLY_TREE_CACHE.get(cache_key)
+    return kept[1] if kept and kept[1] is not result and len(kept[1]["folders"]) > len(result["folders"]) else result
+
+
 @app.get("/api/sites/{site_id}/drives/{drive_id}/folders/{folder_id}/subfolder-counts")
 @protected_read_endpoint
 async def site_subfolder_counts(
@@ -4023,7 +4525,7 @@ async def site_subfolder_counts(
         direct_files = len([i for i in items if not i.get("folder")])
         direct_folders = len(folder_items)
 
-        # Concurrently compute counts for all direct child folders with max_depth=2.
+        # Concurrently compute full-depth counts for all direct child folders.
         # Bounded to a handful in flight at once — an unbounded gather() here fires
         # one recursive (depth-2) Graph walk per direct subfolder simultaneously,
         # so a folder with 20+ subfolders launched 20+ walks at once, each making
@@ -4040,7 +4542,7 @@ async def site_subfolder_counts(
             async with _counts_sem:
                 return await get_folder_recursive_counts(
                     drive_id, fi["id"], parent_id=parent_id,
-                    access_token=x_graph_access_token, max_depth=2,
+                    access_token=x_graph_access_token,
                 )
 
         results = await asyncio.gather(*(_bounded_counts(fi) for fi in folder_items))

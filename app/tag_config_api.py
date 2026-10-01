@@ -218,6 +218,11 @@ def _sync_domains_later(scope: str, level: str | None) -> None:
             res = await tc.taxonomy_column_sync(tc.get_view(scope, fresh=True), lvl, apply=True)
             if res.get("error"):
                 log.warning("[tag-config] %s column sync: %s", lvl, res["error"])
+            ts = res.get("term_store") or {}
+            if ts.get("error"):
+                log.warning("[tag-config] %s Term Store sync: %s", lvl, ts["error"])
+            elif ts.get("added"):
+                log.info("[tag-config] %s Term Store sync added: %s", lvl, ts["added"])
     try:
         asyncio.get_running_loop().create_task(_run())
     except RuntimeError:
@@ -489,7 +494,20 @@ def build_router(require_session) -> APIRouter:
             tc.invalidate(key)
             await _audit("delete", c["email"], key, level=row["level"], target=row["name"])
             _sync_domains_later(key, row["level"])
-            return {"deleted": row}
+            out: dict = {"deleted": row}
+            if row["level"] == "domain" and key != tc.TEMPLATE_SCOPE:
+                # Domains are also term sets in the shared Term Store; remove
+                # this one if (and only if) it is safe — see remove_domain_term_set.
+                with _db() as db:
+                    users = tc._sites_still_using_domain(db, key, row["display_name"])
+                out["term_store"] = await tc.remove_domain_term_set(
+                    tc.get_view(key, fresh=True), row["display_name"], other_site_users=users)
+                ts = out["term_store"]
+                if ts.get("error"):
+                    log.warning("[tag-config] Term Store delete of '%s': %s", row["name"], ts["error"])
+                elif ts.get("reason"):
+                    log.info("[tag-config] '%s': %s", row["name"], ts["reason"])
+            return out
         except Exception as exc:  # noqa: BLE001
             _err(exc)
 

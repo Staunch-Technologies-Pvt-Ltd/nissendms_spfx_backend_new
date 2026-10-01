@@ -550,7 +550,14 @@ async def _get_term_store_info(site_id: str, access_token: str | None = None) ->
                         if is_vessel_set:
                             info["vessel_set_id"] = sid
                         elif "vessel dms" in gname or "dms" in sname or sid == "552ae441-6494-4c7e-97c7-825933bb1a80":
-                            info["dms_set_id"] = sid
+                            # Every Domain is its own term set in the "Vessel DMS"
+                            # group (see tag_config._ensure_domain_terms), so more
+                            # than one set can match here. Keep the first match
+                            # (or the known production set) instead of letting the
+                            # last-visited Domain set win, otherwise Category/Group
+                            # terms get created inside whichever Domain was added last.
+                            if info["dms_set_id"] is None or sid == "552ae441-6494-4c7e-97c7-825933bb1a80":
+                                info["dms_set_id"] = sid
 
                         # Load terms in set
                         try:

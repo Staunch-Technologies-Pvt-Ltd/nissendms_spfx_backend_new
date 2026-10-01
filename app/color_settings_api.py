@@ -2,7 +2,7 @@
 
 Mounted from main.py via build_router(require_session), same pattern as
 module_settings_api / filter_settings_api. Lets an admin recolor the app's
-"Ocean Clay" theme app-wide: background, text, design/accent color, and
+"Maritime" theme app-wide: background, text, design/accent color, and
 hover color, set independently for light mode and night mode. Reads are
 available to any signed-in user — every page needs the current colors to
 render (VesselEmail._loadColorSettings, called once in componentDidMount).
@@ -14,8 +14,8 @@ under key "color_theme" — the same table hidden_modules / filter_ui_mode /
 folder_structure_default_mode use — so this needs no schema change and no
 migration. The value is a small JSON blob:
 
-  {"light": {"bg": "#f8f1ea", "text": "#342417", "accent": "#DD9159", "hover": "#C77A3E"},
-   "night": {"bg": "#211812", "text": "#f8eee6", "accent": "#DD9159", "hover": "#C77A3E"}}
+  {"light": {"bg": "#dcefff", "text": "#08243a", "accent": "#0a7ea8", "hover": "#1463b8"},
+   "night": {"bg": "#031423", "text": "#eaf6fd", "accent": "#34d5ea", "hover": "#2a8fe0"}}
 
 Everything else the theme needs (surfaces, soft accent tints, shadows,
 Fluent UI's palette) is derived client-side from these four values per mode
@@ -45,14 +45,17 @@ HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # frontend/.../clayTheme.ts. Used both as the initial value (no row saved
 # yet) and as the "Reset to default" target the frontend offers.
 DEFAULT_COLORS: dict = {
-    "light": {"bg": "#f8f1ea", "text": "#342417", "accent": "#DD9159", "hover": "#C77A3E"},
-    "night": {"bg": "#211812", "text": "#f8eee6", "accent": "#DD9159", "hover": "#C77A3E"},
+    "light": {"bg": "#dcefff", "text": "#08243a", "accent": "#0a7ea8", "hover": "#1463b8"},
+    "night": {"bg": "#031423", "text": "#eaf6fd", "accent": "#34d5ea", "hover": "#2a8fe0"},
 }
 
 # A handful of ready-made palettes offered alongside custom pickers.
 # "Ocean Clay" is the shipped default; the rest are new options.
 PRESETS: list[dict] = [
-    {"id": "ocean-clay", "label": "Ocean Clay (Default)", "colors": DEFAULT_COLORS},
+    {"id": "maritime", "label": "Maritime (Default)", "colors": DEFAULT_COLORS},
+    {"id": "ocean-clay", "label": "Ocean Clay (Legacy)", "colors": {
+        "light": {"bg": "#f8f1ea", "text": "#342417", "accent": "#DD9159", "hover": "#C77A3E"},
+        "night": {"bg": "#211812", "text": "#f8eee6", "accent": "#DD9159", "hover": "#C77A3E"}}},
     {"id": "slate-blue", "label": "Slate Blue", "colors": {
         "light": {"bg": "#eef2f8", "text": "#1e293b", "accent": "#3b6fd6", "hover": "#2f59b0"},
         "night": {"bg": "#141b29", "text": "#e7edf7", "accent": "#4f83e6", "hover": "#3b6fd6"},

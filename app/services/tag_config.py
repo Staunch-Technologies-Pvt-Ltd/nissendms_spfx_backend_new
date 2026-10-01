@@ -1226,7 +1226,7 @@ async def _resolve_document_drive(site_key: str) -> tuple[str, str, str]:
     return drive_id, site_id, list_id
 
 
-async def taxonomy_column_sync(view: TagView, level: str, *, apply: bool) -> dict:
+async def _sync_taxonomy_column(view: TagView, level: str, *, apply: bool) -> dict:
     """Keep one of the library's tag columns (Domain, Group or Category) in
     step with `view`'s Active items at that level.
 
@@ -1339,6 +1339,153 @@ async def taxonomy_column_sync(view: TagView, level: str, *, apply: bool) -> dic
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)[:400]
     return out
+
+
+async def taxonomy_column_sync(view: TagView, level: str, *, apply: bool) -> dict:
+    """`_sync_taxonomy_column` plus, for Domains, the Term Store mirror.
+
+    The library's Domain column is usually a Choice column, so the column
+    sync never touches the Term Store. Each Domain is also its own term set in
+    the "Vessel DMS" Term Store group (e.g. "Technical and Crewing"); create
+    the ones that are missing. Independent of the column result (even when the
+    column is missing or the update was refused) and never raises. With
+    apply=False nothing is written and `term_store["add"]` lists what a sync
+    would create."""
+    out = await _sync_taxonomy_column(view, level, apply=apply)
+    if level == "domain":
+        try:
+            out["term_store"] = await _ensure_domain_terms(view, out["target"], apply=apply)
+        except Exception as exc:  # noqa: BLE001
+            out["term_store"] = {"error": str(exc)[:300], "add": [], "added": []}
+    return out
+
+
+def _term_label(name: str) -> str:
+    """Term Store labels cannot contain '&' (SharePoint rewrites it to a
+    full-width character); the existing domains use 'and' ("Technical and
+    Crewing"), so do the same."""
+    return re.sub(r"\s+", " ", (name or "").replace("&", " and ")).strip()
+
+
+_DMS_GROUP_NAME = "vessel dms"
+
+
+def _set_names(term_set: dict) -> list[str]:
+    return [n["name"] for n in (term_set.get("localizedNames") or []) if n.get("name")]
+
+
+async def _ensure_domain_terms(view: TagView, target: list[str], *, apply: bool = True) -> dict:
+    """Create every Active Domain that is missing as a term set of the
+    "Vessel DMS" Term Store group. In that Term Store each Domain is its own
+    term set ("Technical and Crewing", ...) whose terms are the Groups /
+    Categories under it — Domains are NOT terms inside one shared set. Nothing
+    is deleted or renamed, and names already present (loose match: '&' == 'and')
+    are left alone.
+
+    Returns {"group_id", "add", "added", "existing", "error"}: `add` is what is
+    missing, `added` what was actually created (empty when apply=False)."""
+    from ..graph import drive as gd
+    from ..graph.client import graph
+
+    res: dict = {"group_id": None, "add": [], "added": [], "existing": [], "error": None}
+    if not target:
+        return res
+    _drive_id, site_id, _list_id = await _resolve_document_drive(view.site_key)
+    if not site_id:
+        res["error"] = "Could not resolve the SharePoint site for the Term Store."
+        return res
+
+    groups = (await graph().get(f"/sites/{site_id}/termStore/groups")).get("value", [])
+    group = next((g for g in groups if (g.get("displayName") or "").strip().lower() == _DMS_GROUP_NAME), None)
+    if group is None:
+        res["error"] = ("No 'Vessel DMS' group was found in the Term Store. Create it in "
+                        "SharePoint admin center → Content services → Term store, then sync again.")
+        return res
+    res["group_id"] = group["id"]
+
+    sets = (await graph().get(f"/sites/{site_id}/termStore/groups/{group['id']}/sets")).get("value", [])
+    have = {match_norm(n) for s in sets for n in _set_names(s)}
+    for name in target:
+        key = match_norm(name)
+        if key in have:
+            res["existing"].append(name)
+            continue
+        label = _term_label(name)
+        res["add"].append(label)
+        have.add(key)
+        if not apply:
+            continue
+        try:
+            await graph().post(f"/sites/{site_id}/termStore/groups/{group['id']}/sets",
+                               json={"localizedNames": [{"name": label, "languageTag": "en-US"}]})
+        except Exception as exc:  # noqa: BLE001 - keep what was already created
+            res["error"] = f"Could not create the '{label}' term set: {str(exc)[:300]}"
+            break
+        res["added"].append(label)
+    if res["added"]:
+        gd._TERM_STORE_CACHE.pop(site_id, None)
+    return res
+
+
+def _sites_still_using_domain(db, deleted_scope: str, name: str) -> list[str]:
+    """Other configured sites whose Tag Configuration still lists a Domain
+    called `name` (any status, loose match). The Term Store is shared by the
+    whole tenant, so a Domain's term set is only ours to remove when no other
+    site still has that Domain — otherwise deleting it on one site would pull
+    the term set out from under another."""
+    from .site_provisioning import get_all_configured_sites
+    key = match_norm(name)
+    users: list[str] = []
+    for site in get_all_configured_sites(db, include_hidden=True):
+        sk = str(site["site_key"]).lower()
+        if sk == deleted_scope:
+            continue
+        if any(match_norm(r["display_name"]) == key for r in get_view(sk, fresh=True).items("domain")):
+            users.append(sk)
+    return users
+
+
+async def remove_domain_term_set(view: TagView, name: str, *, other_site_users: list[str]) -> dict:
+    """Mirror a hard-deleted Domain by deleting its term set from the "Vessel
+    DMS" Term Store group. Deliberately conservative — it only deletes when
+    ALL of these hold, otherwise it leaves the set alone and says why:
+      * no other configured site still has a Domain of that name (shared
+        tenant-wide Term Store);
+      * the set has no terms (its Groups/Categories) — a populated set may be
+        tagged on documents, and deleting it would orphan those tags.
+    Never raises. Returns {"deleted", "skipped", "reason", "error"}."""
+    from ..graph.client import graph
+
+    res: dict = {"deleted": None, "skipped": False, "reason": None, "error": None}
+    try:
+        if other_site_users:
+            res.update(skipped=True, reason=f"Term set kept: still used by {', '.join(other_site_users)}.")
+            return res
+        _drive_id, site_id, _list_id = await _resolve_document_drive(view.site_key)
+        if not site_id:
+            res["error"] = "Could not resolve the SharePoint site for the Term Store."
+            return res
+        groups = (await graph().get(f"/sites/{site_id}/termStore/groups")).get("value", [])
+        group = next((g for g in groups if (g.get("displayName") or "").strip().lower() == _DMS_GROUP_NAME), None)
+        if group is None:
+            return res
+        sets = (await graph().get(f"/sites/{site_id}/termStore/groups/{group['id']}/sets")).get("value", [])
+        key = match_norm(name)
+        term_set = next((x for x in sets if any(match_norm(n) == key for n in _set_names(x))), None)
+        if term_set is None:
+            return res   # nothing to remove
+        terms = (await graph().get(f"/sites/{site_id}/termStore/sets/{term_set['id']}/children")).get("value", [])
+        if terms:
+            res.update(skipped=True, reason=f"Term set kept: it still contains {len(terms)} term(s). "
+                                            "Delete it in the Term Store if it is really unused.")
+            return res
+        await graph().delete(f"/sites/{site_id}/termStore/sets/{term_set['id']}")
+        res["deleted"] = (_set_names(term_set) or [name])[0]
+        from ..graph import drive as gd
+        gd._TERM_STORE_CACHE.pop(site_id, None)
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)[:300]
+    return res
 
 
 async def domain_column_sync(view: TagView, *, apply: bool) -> dict:

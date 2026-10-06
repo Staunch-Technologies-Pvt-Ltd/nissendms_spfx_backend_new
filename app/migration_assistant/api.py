@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Callable
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import settings
@@ -57,6 +57,18 @@ class SiteToSiteScanIn(BaseModel):
     dest_folder_path: str
 
 
+class SiteToSiteConfirmIn(BaseModel):
+    # skip | replace | rename (keep both) | fail — for files that already
+    # exist at the destination.
+    conflict_policy: str = "skip"
+    copy_permissions: bool = False
+    copy_versions: bool = False
+
+
+class SiteUrlIn(BaseModel):
+    url: str
+
+
 class ExistingFilesScanIn(BaseModel):
     root_path: str
 
@@ -78,7 +90,19 @@ def _fail_orphaned_jobs() -> None:
             job.status = "failed"
             job.error = "Interrupted by a server restart — never completed. Re-scan this folder to retry."
             job.finished_at = now
-        if orphaned or orphaned_s2s:
+        # A copy that was running or paused when the server stopped can be
+        # resumed — every finished item is already recorded per item.
+        interrupted = (
+            db.query(models.SiteToSiteJob)
+            .filter(models.SiteToSiteJob.copy_status.in_(("running", "paused")))
+            .all()
+        )
+        for job in interrupted:
+            job.copy_status = "interrupted"
+        stuck_verify = db.query(models.SiteToSiteJob).filter_by(verify_status="running").all()
+        for job in stuck_verify:
+            job.verify_status = "failed"
+        if orphaned or orphaned_s2s or interrupted or stuck_verify:
             db.commit()
 
 
@@ -95,6 +119,15 @@ def startup() -> None:
 
 def build_router(require_session: Callable) -> APIRouter:
     router = APIRouter(prefix=PREFIX, tags=["migration-assistant"], dependencies=[Depends(require_session)])
+
+    def acting_user(
+        session=Depends(require_session),
+        x_user_email: str = Header(default="unknown", alias="X-User-Email"),
+    ) -> str:
+        """Who to record as having confirmed a copy: the signed-in session's
+        own email when there is one, the client-sent header only as a
+        fallback (stub/dev mode has no session)."""
+        return getattr(session, "email", None) or x_user_email
 
     @router.get("/health")
     def health():
@@ -238,6 +271,29 @@ def build_router(require_session: Callable) -> APIRouter:
         except (NotFound, BadRequest) as e:
             _raise(e)
 
+    @router.get("/site-to-site/sites/search")
+    async def search_s2s_sites(q: str):
+        try:
+            return await site_to_site_service.search_sites(q)
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+
+    @router.post("/site-to-site/sites/resolve")
+    async def resolve_s2s_site(payload: SiteUrlIn):
+        try:
+            return await site_to_site_service.resolve_site_url(payload.url)
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+
+    @router.get("/site-to-site/drives")
+    async def list_s2s_site_drives_by_key(site_key: str):
+        """Same as /sites/{site_key}/drives, but with the key as a query
+        parameter — URL-based site keys contain slashes."""
+        try:
+            return await site_to_site_service.list_site_drives(site_key)
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+
     @router.get("/site-to-site/sites/{site_key}/drives")
     async def list_s2s_site_drives(site_key: str):
         try:
@@ -284,14 +340,74 @@ def build_router(require_session: Callable) -> APIRouter:
         except (NotFound, BadRequest) as e:
             _raise(e)
 
-    @router.post("/site-to-site/jobs/{job_id}/confirm")
-    async def confirm_s2s_job(job_id: str, user: str = Header(default="unknown", alias="X-User-Email")):
-        """Copies files (and migrates metadata) into the destination site.
-        The source site is only ever read."""
+    @router.post("/site-to-site/jobs/{job_id}/confirm", status_code=202)
+    async def confirm_s2s_job(job_id: str, payload: SiteToSiteConfirmIn | None = None, user: str = Depends(acting_user)):
+        """Starts copying files (and metadata) into the destination site in
+        the background and returns the job immediately — follow it with
+        /stream. The source site is only ever read. Also retries a finished
+        job's failed/remaining items."""
+        options = payload or SiteToSiteConfirmIn()
         try:
-            return await site_to_site_service.confirm_job(job_id, user)
+            return await site_to_site_service.confirm_job(
+                job_id, user,
+                site_to_site_service.CopyOptions(options.conflict_policy, options.copy_permissions, options.copy_versions),
+            )
         except (NotFound, BadRequest, Conflict) as e:
             _raise(e)
+
+    @router.post("/site-to-site/jobs/{job_id}/pause")
+    async def pause_s2s_job(job_id: str):
+        try:
+            return await site_to_site_service.pause_job(job_id)
+        except (NotFound, BadRequest, Conflict) as e:
+            _raise(e)
+
+    @router.post("/site-to-site/jobs/{job_id}/resume")
+    async def resume_s2s_job(job_id: str, user: str = Depends(acting_user)):
+        try:
+            return await site_to_site_service.resume_job(job_id, user)
+        except (NotFound, BadRequest, Conflict) as e:
+            _raise(e)
+
+    @router.post("/site-to-site/jobs/{job_id}/cancel")
+    async def cancel_s2s_job(job_id: str):
+        try:
+            return await site_to_site_service.cancel_job(job_id)
+        except (NotFound, BadRequest, Conflict) as e:
+            _raise(e)
+
+    @router.get("/site-to-site/jobs/{job_id}/stream")
+    async def stream_s2s_job(job_id: str):
+        """Live copy progress as NDJSON (one JSON object per line)."""
+        try:
+            await site_to_site_service.get_scan_job(job_id)  # 404 before the stream opens
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+        return StreamingResponse(
+            site_to_site_service.stream_progress(job_id),
+            media_type="application/x-ndjson",
+            # Stop proxies (nginx etc.) from buffering the stream.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @router.post("/site-to-site/jobs/{job_id}/verify")
+    async def verify_s2s_job(job_id: str):
+        try:
+            return await site_to_site_service.verify_job(job_id)
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+
+    @router.get("/site-to-site/jobs/{job_id}/report")
+    async def s2s_job_report(job_id: str):
+        try:
+            content, filename = site_to_site_service.build_report(job_id)
+        except (NotFound, BadRequest) as e:
+            _raise(e)
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     return router
 

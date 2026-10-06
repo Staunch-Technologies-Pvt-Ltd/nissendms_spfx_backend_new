@@ -7,6 +7,7 @@ multi-site, multi-drive equivalent used only by Site-to-Site migration).
 from __future__ import annotations
 
 import json
+from urllib.parse import unquote, urlparse
 
 from ..config import settings
 from ..graph import drive as gd
@@ -15,10 +16,14 @@ from ..graph import site as gsite
 from .errors import BadRequest, NotFound
 
 
+URL_KEY_PREFIX = "url:"
+
+
 def allowed_sites() -> list[dict]:
-    """The configured site allow-list — see `config/settings.py`'s
-    `allowed_sites` docstring for why this isn't a free-text field or a
-    tenant-wide site search."""
+    """The configured site allow-list (`ALLOWED_SITES`) — shown in the
+    pickers as quick picks. Not the only way to pick a site any more: any
+    site the app can reach can also be found by search or pasted URL (see
+    `site_key_for_url`)."""
     try:
         sites = json.loads(settings.allowed_sites or "[]")
     except json.JSONDecodeError:
@@ -26,16 +31,43 @@ def allowed_sites() -> list[dict]:
     return sites if isinstance(sites, list) else []
 
 
+def parse_site_url(url: str) -> tuple[str, str]:
+    """("contoso.sharepoint.com", "sites/Docs") from any URL inside a site —
+    a library or folder URL pasted from the browser works too, since only
+    the /sites/<name> or /teams/<name> part is kept. A URL with neither is
+    the tenant root site (site_path "")."""
+    parsed = urlparse(url.strip() if "://" in url else f"https://{url.strip()}")
+    if not parsed.hostname or not parsed.hostname.endswith(".sharepoint.com"):
+        raise BadRequest("Enter a SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/Docs")
+    segments = [unquote(p) for p in parsed.path.split("/") if p]
+    if len(segments) >= 2 and segments[0].lower() in ("sites", "teams"):
+        return parsed.hostname.lower(), f"{segments[0].lower()}/{segments[1]}"
+    return parsed.hostname.lower(), ""
+
+
+def site_key_for_url(url: str) -> str:
+    hostname, site_path = parse_site_url(url)
+    return f"{URL_KEY_PREFIX}https://{hostname}/{site_path}".rstrip("/")
+
+
 def find_site(site_key: str) -> dict:
-    """{"key", "label", "hostname", "site_path"} for a configured site, from
-    `ALLOWED_SITES` — used directly (no Graph call) by anything that only
-    needs the hostname/site_path, e.g. resolving a drive id via
-    `graph.site.get_site_drive_id`. `resolve_site` below additionally
-    resolves the Graph site id, for callers that also need Term Store /
-    site-column lookups."""
+    """{"key", "label", "hostname", "site_path"} for a site key — either an
+    `ALLOWED_SITES` entry's key, or a "url:https://host/sites/x" key minted
+    by site search / URL lookup. Used directly (no Graph call) by anything
+    that only needs the hostname/site_path. `resolve_site` below
+    additionally resolves the Graph site id."""
+    if site_key.startswith(URL_KEY_PREFIX):
+        url = site_key[len(URL_KEY_PREFIX):]
+        hostname, site_path = parse_site_url(url)
+        configured = next(
+            (s for s in allowed_sites() if s.get("hostname", "").lower() == hostname and s.get("site_path", "").strip("/") == site_path),
+            None,
+        )
+        label = configured.get("label", site_path or hostname) if configured else (site_path.split("/")[-1] if site_path else hostname)
+        return {"key": site_key, "label": label, "hostname": hostname, "site_path": site_path}
     site = next((s for s in allowed_sites() if s.get("key") == site_key), None)
     if site is None:
-        raise BadRequest(f"'{site_key}' is not a configured site — add it to ALLOWED_SITES first")
+        raise BadRequest(f"'{site_key}' is not a known site — pick it from the list or search for it")
     return site
 
 

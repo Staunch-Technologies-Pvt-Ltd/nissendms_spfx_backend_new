@@ -20,3 +20,34 @@ stops with it — **no second process**.
   `document_parser/`, `models/`. Internal imports are relative.
 - Tests: `backend/tests/migration_assistant/` (`pytest tests/migration_assistant`).
 - No new dependencies — everything it needs is already in `requirements.txt`.
+
+## Site-to-Site copy jobs
+
+- **Confirm runs in the background.** `POST site-to-site/jobs/{id}/confirm`
+  (body: `conflict_policy` skip|replace|rename|fail, `copy_permissions`,
+  `copy_versions`) returns `202` straight away; the copy engine is
+  `services/site_to_site_mover.py`.
+- **Live progress:** `GET site-to-site/jobs/{id}/stream` is an NDJSON feed
+  (files/bytes done, speed, time left, per-item events) ending with a
+  `{"type": "done", "job": ...}` line. Live counters are kept in memory by
+  `services/site_to_site_progress.py`; with several worker processes, a worker
+  that doesn't own the run falls back to counts from the database.
+- **Control:** `pause`, `resume`, `cancel`. Every item's result is saved as it
+  finishes, so a cancelled job — or one interrupted by a server restart
+  (marked `interrupted` on startup) — resumes without copying anything twice.
+- **Verification** runs automatically after each copy (`verify` re-runs it):
+  every copied item is re-read on both sides and compared by quickXorHash or
+  size. Office files whose bytes SharePoint rewrote while setting metadata are
+  reported as `changed_by_sharepoint`, not as failures.
+  `GET site-to-site/jobs/{id}/report` downloads an Excel report.
+- **Site picking:** `ALLOWED_SITES` entries are quick picks;
+  `GET site-to-site/sites/search?q=` and `POST site-to-site/sites/resolve`
+  find any other site. Those sites get `url:https://host/sites/x` keys, so
+  use `GET site-to-site/drives?site_key=` for their libraries.
+- **Version history** uses Graph's `includeAllVersionHistory` copy option; if
+  the tenant rejects it, the current version is copied and the item is
+  flagged. **Permissions** re-grants unique (non-inherited) user/group access
+  without sending invitations; sharing links and SharePoint groups are listed
+  in the report as skipped.
+- New columns are added to existing tables automatically on startup
+  (`db._upgrade_existing_schema`, SQLite and Postgres).

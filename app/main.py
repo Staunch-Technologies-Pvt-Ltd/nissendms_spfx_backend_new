@@ -1053,13 +1053,15 @@ async def _startup():
             _logger.warning("Alembic automatic migration failed: %s", exc)
 
         # 3. Safety net: make sure ALL tables and columns are present.
-        #    create_all with checkfirst=True will add any missing tables but
-        #    cannot add missing columns — those are handled by migrations above.
+        #    create_all adds any missing tables; sync_missing_columns adds any
+        #    model column an existing table lacks (e.g. a teammate's older DB),
+        #    so starting the backend is always enough to catch a DB up.
         try:
             from .db.base import Base, engine
+            from .db.schema_sync import ensure_schema
             from sqlalchemy import inspect, text
             if engine is not None:
-                Base.metadata.create_all(bind=engine, checkfirst=True)
+                ensure_schema(engine, Base.metadata)
 
                 # Critical legacy drift guard: some older DBs were stamped to
                 # Alembic head without actually applying every incremental

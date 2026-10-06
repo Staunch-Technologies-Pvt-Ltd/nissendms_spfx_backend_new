@@ -158,21 +158,39 @@ async def get_preview_url(drive_id: str, item_id: str) -> str:
 
 
 async def copy_item(
-    drive_id: str, item_id: str, dest_drive_id: str, dest_parent_id: str, new_name: str
+    drive_id: str,
+    item_id: str,
+    dest_drive_id: str,
+    dest_parent_id: str,
+    new_name: str,
+    *,
+    conflict_behavior: str = "fail",
+    include_versions: bool = False,
 ) -> str:
     """Start a server-side copy of a file/folder into a *different* drive
     (used for Site-to-Site migration — same-site moves use `move_item`
     instead, since those never need to leave the source untouched). Graph's
     copy action is always asynchronous: this returns the monitor URL (from
     the `Location` response header) to poll with `poll_copy_status`, not the
-    copied item itself."""
+    copied item itself.
+
+    `conflict_behavior` is Graph's own name-collision handling: "fail",
+    "replace" (overwrite the existing file) or "rename" (keep both — Graph
+    appends " 1", " 2", ... to the new copy). `include_versions` asks Graph
+    to bring the source file's whole version history along
+    (`includeAllVersionHistory`); without it only the current version is
+    copied."""
+    body: dict = {
+        "parentReference": {"driveId": dest_drive_id, "id": dest_parent_id},
+        "name": new_name,
+    }
+    if include_versions:
+        body["includeAllVersionHistory"] = True
     resp = await graph().request(
         "POST",
         f"/drives/{drive_id}/items/{item_id}/copy",
-        json={
-            "parentReference": {"driveId": dest_drive_id, "id": dest_parent_id},
-            "name": new_name,
-        },
+        json=body,
+        params={"@microsoft.graph.conflictBehavior": conflict_behavior},
     )
     monitor_url = resp.headers.get("Location")
     if not monitor_url:
@@ -185,11 +203,13 @@ async def poll_copy_status(monitor_url: str, *, timeout_seconds: float = 120) ->
     monitor endpoint's final JSON body (`status` "completed" with a
     `resourceId`, or "failed"/other with an error) — raises only if the
     operation doesn't finish within `timeout_seconds`, never for the copy
-    itself failing (the caller inspects `status`)."""
+    itself failing (the caller inspects `status`). Polls quickly at first
+    (most single-file copies finish in a second or two) then backs off."""
     import asyncio
     import time
 
     start = time.monotonic()
+    delay = 0.5
     while True:
         resp = await graph().request("GET", monitor_url)
         data = resp.json()
@@ -197,5 +217,54 @@ async def poll_copy_status(monitor_url: str, *, timeout_seconds: float = 120) ->
         if status in ("completed", "failed"):
             return data
         if time.monotonic() - start > timeout_seconds:
-            return {"status": "failed", "error": f"Copy did not complete within {timeout_seconds}s"}
-        await asyncio.sleep(2)
+            return {"status": "failed", "error": f"Copy did not complete within {int(timeout_seconds)}s"}
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 5)
+
+
+async def batch_get_items(drive_id: str, item_ids: list[str], select: str = "id,name,size,file,folder") -> dict[str, dict | None]:
+    """Fetch many driveItems in as few round-trips as possible via `$batch`.
+    Returns {item_id: item | None} — None means Graph answered 404 for it
+    (the item doesn't exist). Any other per-item failure is returned as
+    {"_error": status, "_message": ...} so the caller can tell "missing"
+    apart from "couldn't check"."""
+    out: dict[str, dict | None] = {}
+    for start in range(0, len(item_ids), 20):
+        chunk = item_ids[start : start + 20]
+        requests = [
+            {"id": str(i), "method": "GET", "url": f"/drives/{drive_id}/items/{iid}?$select={select}"}
+            for i, iid in enumerate(chunk)
+        ]
+        responses = await graph().batch(requests)
+        by_id = {r.get("id"): r for r in responses}
+        for i, iid in enumerate(chunk):
+            r = by_id.get(str(i)) or {}
+            status = r.get("status", 0)
+            if 200 <= status < 300:
+                out[iid] = r.get("body") or {}
+            elif status == 404:
+                out[iid] = None
+            else:
+                body = r.get("body") or {}
+                out[iid] = {"_error": status, "_message": (body.get("error") or {}).get("message") or str(body)}
+    return out
+
+
+async def list_permissions(drive_id: str, item_id: str) -> list[dict]:
+    data = await graph().get(f"/drives/{drive_id}/items/{item_id}/permissions")
+    return data.get("value", [])
+
+
+async def invite(drive_id: str, item_id: str, emails: list[str], roles: list[str]) -> dict:
+    """Grant `roles` ("read"/"write") on an item to the given users/groups
+    without emailing them (`sendInvitation: false`) — this is a silent
+    permission copy, not a share notification."""
+    return await graph().post(
+        f"/drives/{drive_id}/items/{item_id}/invite",
+        json={
+            "recipients": [{"email": e} for e in emails],
+            "roles": roles,
+            "requireSignIn": True,
+            "sendInvitation": False,
+        },
+    )

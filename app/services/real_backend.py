@@ -1386,14 +1386,45 @@ class RealBackend:
         # vessels" for a given SharePoint site reflects what's actually
         # there, not only what was provisioned through the app.
         known_names = {_normalize_term_label(v["name"]) for v in vessels}
-        # A folder named after a vessel that's already registered in ANY
-        # site (e.g. a copy of it in a migration source site) is not a new
-        # vessel — suggesting it only invites a duplicate.
-        try:
-            with SessionLocal() as _db:
-                known_names |= {_normalize_term_label(n) for (n,) in _db.query(models.Vessel.name).all()}
-        except Exception:
-            log.debug("list_vessels: could not read registered vessel names", exc_info=True)
+        from . import vessel_roots as _vessel_roots
+
+        def _sharepoint_row(site_key_for_row, name: str, norm: str, path: str) -> dict:
+            # View-only card for a vessel folder that isn't registered for
+            # this site (the Vessels page only views its documents).
+            return {
+                "id": f"sp:{site_key_for_row}:{norm}",
+                "name": name,
+                "imo": None, "shipyard": None, "hull_number": None, "vessel_type": None,
+                "is_provisioned": False,
+                "provisioned_site_ids": [],
+                "provisioned_site_key": site_key_for_row,
+                "vessel_folder_path": path,
+                "restored_at": None,
+                "status": "Found in SharePoint",
+                "source": "sharepoint",
+            }
+
+        # A single site with admin-chosen vessel folders: list them live
+        # (a few Graph calls), so a new choice shows straight away instead of
+        # after the next full site scan.
+        if site_key and site_key != "all":
+            try:
+                _drive = Settings.load_site_config(site_key).drive_id
+                _roots = _vessel_roots.get_for_drive(_drive)
+            except Exception:
+                _roots = None
+            if _roots is not None:
+                added = 0
+                if _roots["mode"] == "folders":
+                    for item, parent in await _vessel_roots.child_folders_of_roots(graph(), _drive, _roots["paths"]):
+                        norm = _normalize_term_label(item["name"])
+                        if norm in known_names:
+                            continue
+                        known_names.add(norm)
+                        added += 1
+                        vessels.append(_sharepoint_row(site_key, item["name"], norm, f"{parent}/{item['name']}"))
+                log.info("list_vessels: site_key=%r -> %d vessel folder(s) from the chosen folders", site_key, added)
+                return vessels
         try:
             dash = await self.get_dashboard_stats(site_key=site_key)
         except Exception as e:
@@ -1407,7 +1438,6 @@ class RealBackend:
                 site_key, len(vessels), len(sites_in_dash),
                 [(s.get("site_key"), s.get("vessels"), len(s.get("vessel_names") or []), s.get("error")) for s in sites_in_dash],
             )
-            from . import vessel_roots as _vessel_roots
             for site in sites_in_dash:
                 site_key_for_row = site.get("site_key")
                 site_drive = site.get("drive_id")
@@ -1417,24 +1447,12 @@ class RealBackend:
                         continue
                     known_names.add(norm)
                     added += 1
-                    vessels.append({
-                        "id": f"sp:{site_key_for_row}:{norm}",
-                        "name": name,
-                        "imo": None,
-                        "shipyard": None,
-                        "hull_number": None,
-                        "vessel_type": None,
-                        "is_provisioned": False,
-                        "provisioned_site_ids": [],
-                        "provisioned_site_key": site_key_for_row,
-                        # The real folder path when it came from the site's
-                        # chosen vessel folders; else just the name (the
-                        # frontend then finds it at the root or one level down).
-                        "vessel_folder_path": _vessel_roots.discovered_path(site_drive, norm) or name,
-                        "restored_at": None,
-                        "status": "Found in SharePoint",
-                        "source": "sharepoint",
-                    })
+                    # The real folder path when it came from the site's chosen
+                    # vessel folders; else just the name (the frontend then
+                    # finds it at the root or one level down).
+                    vessels.append(_sharepoint_row(
+                        site_key_for_row, name, norm, _vessel_roots.discovered_path(site_drive, norm) or name,
+                    ))
             log.info("list_vessels: site_key=%r -> added %d SharePoint-only vessel(s), %d total returned", site_key, added, len(vessels))
         else:
             log.info("list_vessels: site_key=%r -> dashboard scan unavailable, returning %d DB vessel(s) only", site_key, len(vessels))

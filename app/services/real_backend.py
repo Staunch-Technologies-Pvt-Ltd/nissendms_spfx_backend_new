@@ -153,6 +153,27 @@ async def _term_store_vessel_folder_count(target: dict) -> tuple[int, list[str]]
     if not drive_id or not site_id:
         return 0, []
 
+    # Admin-chosen vessel folders for this library (Site Management): every
+    # sub-folder of them is a vessel; nothing else in the library is
+    # considered. "none" = this site holds no vessels. Not configured = the
+    # automatic Term Store match below.
+    from . import vessel_roots
+    roots_cfg = vessel_roots.get_for_drive(drive_id)
+    if roots_cfg is not None:
+        if roots_cfg["mode"] == "none":
+            return 0, []
+        try:
+            terms = await gd.get_vessel_terms(site_id)
+        except Exception:
+            terms = []
+        by_norm = {_normalize_term_label(t): t for t in terms}
+        names: dict[str, str] = {}
+        for item, _parent in await vessel_roots.child_folders_of_roots(graph(), drive_id, roots_cfg["paths"]):
+            norm = _normalize_term_label(item["name"])
+            names.setdefault(norm, by_norm.get(norm) or item["name"].strip())
+        matched = sorted(names.values(), key=str.casefold)
+        return len(matched), matched
+
     try:
         vessel_terms = await gd.get_vessel_terms(site_id)
     except Exception as e:
@@ -1362,6 +1383,14 @@ class RealBackend:
         # vessels" for a given SharePoint site reflects what's actually
         # there, not only what was provisioned through the app.
         known_names = {_normalize_term_label(v["name"]) for v in vessels}
+        # A folder named after a vessel that's already registered in ANY
+        # site (e.g. a copy of it in a migration source site) is not a new
+        # vessel — suggesting it only invites a duplicate.
+        try:
+            with SessionLocal() as _db:
+                known_names |= {_normalize_term_label(n) for (n,) in _db.query(models.Vessel.name).all()}
+        except Exception:
+            log.debug("list_vessels: could not read registered vessel names", exc_info=True)
         try:
             dash = await self.get_dashboard_stats(site_key=site_key)
         except Exception as e:

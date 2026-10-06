@@ -78,6 +78,21 @@ async def list_root_vessel_candidates(drive_id: str, pool_slugs: set[str]) -> li
             url = page.get("@odata.nextLink") if isinstance(page, dict) else None
         return found
 
+    # Admin-chosen vessel folders (Site Management) replace the guesswork
+    # below: only their sub-folders are vessel candidates.
+    from . import vessel_roots
+    roots_cfg = vessel_roots.get_for_drive(drive_id)
+    if roots_cfg is not None:
+        if roots_cfg["mode"] == "none":
+            return []
+        out: list[RootCandidate] = []
+        for item, parent in await vessel_roots.child_folders_of_roots(graph(), drive_id, roots_cfg["paths"]):
+            low = item["name"].strip().lower()
+            if low in pool_slugs or low.startswith("pool-") or low in _NON_VESSEL_ROOT_NAMES:
+                continue
+            out.append(RootCandidate(name=item["name"], drive_item_id=item["id"], path=f"{parent}/{item['name']}"))
+        return out
+
     try:
         root_folders = await _list_folders("root")
     except Exception as e:

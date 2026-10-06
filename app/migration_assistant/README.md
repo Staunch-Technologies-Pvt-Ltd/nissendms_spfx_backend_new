@@ -40,10 +40,15 @@ stops with it — **no second process**.
   size. Office files whose bytes SharePoint rewrote while setting metadata are
   reported as `changed_by_sharepoint`, not as failures.
   `GET site-to-site/jobs/{id}/report` downloads an Excel report.
-- **Site picking:** `ALLOWED_SITES` entries are quick picks;
+- **Site picking:** the pickers list every site in the DMS's
+  **Sites → Site Management** (`services/dms_sites.py`, keys `dms:<site_key>`,
+  hidden/removed sites skipped) — add a site there and it appears here with
+  the same name. `ALLOWED_SITES` entries that aren't in Site Management are
+  listed after them (and keep resolving for old jobs / DESTINATION_SITE_KEY).
   `GET site-to-site/sites/search?q=` and `POST site-to-site/sites/resolve`
-  find any other site. Those sites get `url:https://host/sites/x` keys, so
-  use `GET site-to-site/drives?site_key=` for their libraries.
+  find any other site (`url:https://host/sites/x` keys); use
+  `GET site-to-site/drives?site_key=` for libraries, since keys can contain
+  slashes.
 - **Version history** uses Graph's `includeAllVersionHistory` copy option; if
   the tenant rejects it, the current version is copied and the item is
   flagged. **Permissions** re-grants unique (non-inherited) user/group access

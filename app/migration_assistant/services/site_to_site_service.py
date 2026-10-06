@@ -32,16 +32,19 @@ def _require_configured() -> None:
 
 
 async def list_sites() -> list[dict]:
-    """The `ALLOWED_SITES` quick picks. Any other site can be found with
-    `search_sites` or `resolve_site_url`."""
+    """Sites for the pickers: every site in the DMS's Site Management (so a
+    site added there appears here automatically), then any `ALLOWED_SITES`
+    entry not already listed. Read fresh on every call. Any other site can
+    be found with `search_sites` or `resolve_site_url`."""
     _require_configured()
     return [
         {
             "key": s["key"],
             "label": s.get("label", s["key"]),
-            "url": f"https://{s.get('hostname', '')}/{s.get('site_path', '').strip('/')}".rstrip("/"),
+            "url": s.get("url") or f"https://{s.get('hostname', '')}/{s.get('site_path', '').strip('/')}".rstrip("/"),
+            "origin": s.get("origin", "allowed_sites"),
         }
-        for s in s2s_common.allowed_sites()
+        for s in s2s_common.picker_sites()
     ]
 
 

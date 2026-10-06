@@ -21,6 +21,7 @@ from app.migration_assistant.db import SessionLocal, init_db  # noqa: E402
 from app.migration_assistant.graph import drive as gd  # noqa: E402
 from app.migration_assistant.models import db_models as models  # noqa: E402
 from app.migration_assistant.services import (  # noqa: E402
+    dms_sites,
     site_to_site_common as s2s_common,
     site_to_site_mover as mover,
     site_to_site_progress as progress,
@@ -141,6 +142,7 @@ class SiteToSiteCopyTests(unittest.TestCase):
                          "batch_get_items", "list_permissions", "invite")
         ]
         patches.append(mock.patch.object(s2s_common, "resolve_site", self._resolve_site))
+        patches.append(mock.patch.object(dms_sites, "site_management_sites", lambda: []))
         patches.append(mock.patch.object(term_mapping, "migrate_item_fields", self._no_metadata))
         patches.append(mock.patch.object(service, "_require_configured", lambda: None))
         for p in patches:
@@ -432,6 +434,11 @@ class SiteToSiteRouteTests(SiteToSiteCopyTests):
 
 
 class SiteUrlParsingTests(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(dms_sites, "site_management_sites", lambda: [])
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_parse_site_url(self):
         cases = {
             "https://contoso.sharepoint.com/sites/Docs": ("contoso.sharepoint.com", "sites/Docs"),
@@ -455,3 +462,54 @@ class SiteUrlParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SiteManagementSitesTests(unittest.TestCase):
+    """Sites added in the DMS's Site Management appear in the pickers, ahead
+    of ALLOWED_SITES, without duplicates; their keys resolve through Graph."""
+
+    SM = [
+        {"key": "dms:nksdocman", "label": "NKSDocMan", "hostname": "contoso.sharepoint.com", "site_path": "sites/NKSDocMan",
+         "url": "https://contoso.sharepoint.com/sites/NKSDocMan", "site_id": "sid-1", "drive_id": "d1", "origin": "site_management"},
+        {"key": "dms:newsite", "label": "New Site", "hostname": "contoso.sharepoint.com", "site_path": "sites/NewSite",
+         "url": "https://contoso.sharepoint.com/sites/NewSite", "site_id": "", "drive_id": "d2", "origin": "site_management"},
+    ]
+    ENV = [
+        {"key": "nks-docman", "label": "NKS DocMan (Destination)", "hostname": "contoso.sharepoint.com", "site_path": "sites/NKSDocMan"},
+        {"key": "old-only", "label": "Old only", "hostname": "contoso.sharepoint.com", "site_path": "sites/OldOnly"},
+    ]
+
+    def setUp(self):
+        for target, value in ((dms_sites, ("site_management_sites", lambda: [dict(s) for s in self.SM])),
+                              (s2s_common, ("allowed_sites", lambda: [dict(s) for s in self.ENV]))):
+            p = mock.patch.object(target, value[0], value[1])
+            p.start()
+            self.addCleanup(p.stop)
+        dms_sites._resolved.clear()
+
+    def test_picker_lists_site_management_first_without_duplicates(self):
+        keys = [s["key"] for s in s2s_common.picker_sites()]
+        self.assertEqual(keys, ["dms:nksdocman", "dms:newsite", "old-only"])
+
+    def test_old_keys_still_resolve(self):
+        self.assertEqual(s2s_common.find_site("nks-docman")["site_path"], "sites/NKSDocMan")
+        with self.assertRaises(s2s_common.BadRequest):
+            s2s_common.find_site("dms:deleted-site")
+
+    def test_dms_site_resolves_via_drive_when_no_site_id(self):
+        calls = []
+
+        class FakeGraph:
+            async def get(self, path):
+                calls.append(path)
+                if path.startswith("/drives/d2/root"):
+                    return {"sharepointIds": {"siteUrl": "https://contoso.sharepoint.com/sites/NewSite"}}
+                return {"id": "sid-2", "webUrl": "https://contoso.sharepoint.com/sites/NewSite"}
+
+        with mock.patch.object(dms_sites, "graph", lambda: FakeGraph()):
+            site = asyncio.run(s2s_common.resolve_site("dms:newsite"))
+            again = asyncio.run(s2s_common.resolve_site("dms:newsite"))
+        self.assertEqual((site["site_id"], site["hostname"], site["site_path"]), ("sid-2", "contoso.sharepoint.com", "sites/NewSite"))
+        self.assertEqual(s2s_common.site_url(site), "https://contoso.sharepoint.com/sites/NewSite")
+        self.assertEqual(again["site_id"], "sid-2")
+        self.assertEqual(len(calls), 2)  # cached after the first resolve

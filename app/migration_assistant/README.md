@@ -13,9 +13,12 @@ stops with it — **no second process**.
 - Own database: `backend/migration_assistant.db` (SQLite) by default, separate
   from the DMS Postgres. To keep your old job history, copy the old
   `migration_assistant.db` over it while the backend is stopped.
-- Own Entra app registration (`Sites.Selected`, app-only) — kept separate from
-  the DMS's SharePoint Embedded credentials. Configure in `backend/.env.migration`
-  (see `migration.env.example`; the old standalone `.env` can be copied as-is).
+- **One `.env`.** It uses the DMS's own Entra app credentials (same app
+  registration) and keeps its few options in `backend/.env` with a
+  `MIGRATION_` prefix: `MIGRATION_SITE_HOSTNAME`, `MIGRATION_SITE_PATH`,
+  `MIGRATION_DESTINATION_ROOT`, `MIGRATION_ALLOWED_SITES`, term-set ids, ...
+  (see `.env.example`). An old `backend/.env.migration` with un-prefixed
+  names is still read if present, but is no longer needed.
 - Layout: `config.py`, `db.py`, `api.py`, `graph/`, `services/`, `classifier/`,
   `document_parser/`, `models/`. Internal imports are relative.
 - Tests: `backend/tests/migration_assistant/` (`pytest tests/migration_assistant`).

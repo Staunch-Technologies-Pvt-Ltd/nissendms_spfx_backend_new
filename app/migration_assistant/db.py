@@ -9,7 +9,7 @@ Fallbacks:
 - `MIGRATION_DATABASE_URL` set in the process environment overrides it (tests
   point it at a throwaway SQLite file).
 - With no DMS database configured (stub mode) it uses its own SQLite file
-  (`DATABASE_URL` from `.env.migration`, default backend/migration_assistant.db).
+  (`MIGRATION_DATABASE_URL`, default backend/migration_assistant.db).
 
 Tables and any missing columns are created on startup (`init_db`). When the
 module first starts on PostgreSQL and its tables are still empty, job history
@@ -49,7 +49,7 @@ def _build_engine():
 
 
 def _legacy_sqlite_url() -> str | None:
-    """The module's own SQLite file (from `.env.migration`'s DATABASE_URL),
+    """The module's own SQLite file (`MIGRATION_DATABASE_URL` / legacy `.env.migration` DATABASE_URL),
     with a relative path resolved against the backend folder rather than
     whatever directory the server happened to be started from."""
     url = settings.database_url

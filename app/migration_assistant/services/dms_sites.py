@@ -1,7 +1,7 @@
 """Sites from the DMS's own Site Management, offered in the Site-to-Site
 pickers — so a site added there (Sites → Site Management) is available for
 migration straight away, with the same name, and nothing has to be repeated
-in `.env.migration`.
+in `MIGRATION_ALLOWED_SITES`.
 
 Uses the DMS's own site discovery (`app.config.Settings.discover_available_sites`:
 the `.env` site blocks plus `site_configurations` rows) and honours the same

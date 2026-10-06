@@ -23,8 +23,7 @@ from .migration_common import get_migration_drive_id
 def _require_configured() -> None:
     if not settings.graph_configured:
         raise BadRequest(
-            "Not configured — set AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, "
-            "SITE_HOSTNAME and SITE_PATH (see README.md)."
+            "Not configured — set MIGRATION_SITE_HOSTNAME and MIGRATION_SITE_PATH in backend/.env (the Graph credentials come from the DMS settings)."
         )
 
 

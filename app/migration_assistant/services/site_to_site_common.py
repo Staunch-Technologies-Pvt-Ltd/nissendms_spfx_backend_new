@@ -21,7 +21,7 @@ URL_KEY_PREFIX = "url:"
 
 
 def allowed_sites() -> list[dict]:
-    """`ALLOWED_SITES` from `.env.migration` (the original fixed list)."""
+    """`MIGRATION_ALLOWED_SITES` from `.env` (the original fixed list)."""
     try:
         sites = json.loads(settings.allowed_sites or "[]")
     except json.JSONDecodeError:

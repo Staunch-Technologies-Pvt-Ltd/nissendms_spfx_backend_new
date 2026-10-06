@@ -18,8 +18,7 @@ from .errors import BadRequest, NotFound
 async def get_migration_drive_id() -> str:
     if not settings.graph_configured:
         raise BadRequest(
-            "Not configured — set AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, "
-            "SITE_HOSTNAME and SITE_PATH (see README.md)."
+            "Not configured — set MIGRATION_SITE_HOSTNAME and MIGRATION_SITE_PATH in backend/.env (the Graph credentials come from the DMS settings)."
         )
     return await get_site_drive_id(settings.site_hostname, settings.site_path)
 
@@ -36,8 +35,7 @@ def get_destination_site() -> dict:
 async def get_destination_drive_id() -> str:
     if not settings.graph_configured:
         raise BadRequest(
-            "Not configured — set AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, "
-            "SITE_HOSTNAME and SITE_PATH (see README.md)."
+            "Not configured — set MIGRATION_SITE_HOSTNAME and MIGRATION_SITE_PATH in backend/.env (the Graph credentials come from the DMS settings)."
         )
     site = get_destination_site()
     return await get_site_drive_id(site["hostname"], site["site_path"])

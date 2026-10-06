@@ -39,8 +39,8 @@ Based on the official SharePoint Term Store taxonomy:
 
 3. 24 Production Vessel Names:
    Belle Lune, Bow Fighter, Bow Fraternity, Cameroun Express, Cecilie F, Cote D Ivoire Express,
-   Dutches Emerald, Ghana Express, Lignum Grid, Lignum Mesh, Lignum Web, Maersk EI Banco,
-   Maersk EI Palomar, Maersk Ferrato, Maersk Finisterre, Maersk Frio, Norse Evolution,
+   Duchess Emerald, Ghana Express, Lignum Grid, Lignum Mesh, Lignum Web, Maersk El Banco,
+   Maersk El Palomar, Maersk Ferrato, Maersk Finisterre, Maersk Frio, Norse Evolution,
    Norse Ijmuiden, Norse New Haven, Peissy, Potiniere, Senegal Express, Snow Flake, Snow Flower
 """
 from __future__ import annotations
@@ -71,13 +71,13 @@ VESSEL_MASTER_LIST: list[str] = [
     "Cameroun Express",
     "Cecilie F",
     "Cote D Ivoire Express",
-    "Dutches Emerald",
+    "Duchess Emerald",
     "Ghana Express",
     "Lignum Grid",
     "Lignum Mesh",
     "Lignum Web",
-    "Maersk EI Banco",
-    "Maersk EI Palomar",
+    "Maersk El Banco",
+    "Maersk El Palomar",
     "Maersk Ferrato",
     "Maersk Finisterre",
     "Maersk Frio",
@@ -111,7 +111,7 @@ VESSEL_ALIASES: dict[str, tuple[str, ...]] = {
         "cote d’ivoire express", "côte d'ivoire express", "côte d’ivoire express",
         "cote divoire express", "cotedivoire express", "cote-d-ivoire-express"
     ),
-    "Dutches Emerald": (
+    "Duchess Emerald": (
         "dutches emerald", "duchess emerald", "dutchess emerald",
         "dutches-emerald", "duchess-emerald"
     ),
@@ -123,12 +123,12 @@ VESSEL_ALIASES: dict[str, tuple[str, ...]] = {
     "Lignum Grid": ("lignum grid", "lignum-grid", "lignum_grid"),
     "Lignum Mesh": ("lignum mesh", "lignum-mesh", "lignum_mesh"),
     "Lignum Web": ("lignum web", "lignum-web", "lignum_web"),
-    "Maersk EI Banco": (
+    "Maersk El Banco": (
         "maersk ei banco", "maersk el banco", "maersk-ei-banco", "maersk-el-banco",
         "maersk_ei_banco", "maersk_el_banco", "ei banco", "el banco",
         "9964493", "imo 9964493", "imo: 9964493", "imo:9964493", "imo no. 9964493", "imo number : 9964493"
     ),
-    "Maersk EI Palomar": (
+    "Maersk El Palomar": (
         "maersk ei palomar", "maersk el palomar", "maersk-ei-palomar", "maersk-el-palomar",
         "maersk_ei_palomar", "maersk_el_palomar", "ei palomar", "el palomar",
         "9964481", "imo 9964481", "imo: 9964481", "imo:9964481", "imo no. 9964481", "imo number : 9964481",

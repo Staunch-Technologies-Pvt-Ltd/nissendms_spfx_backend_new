@@ -298,7 +298,8 @@ async def ensure_for_vessel(vessel_id: int, *, dry_run: bool = False) -> dict:
     if not targets:
         found = await _find_vessel_folder_by_name(name, vessel_sites)
         if found:
-            targets.append(found)
+            targets.append(found[:4])
+            _record_location(vessel_id, found[4], found[5])
     if not targets:
         return {"vessel_id": vessel_id, "name": name, "ok": False,
                 "error": "No SharePoint folder with this vessel's name was found in any site"}
@@ -359,8 +360,8 @@ async def _find_vessel_folder_by_name(name: str, preferred_sites: list[str]):
         hit = index.get(wanted)
         if hit:
             item, parent_path = hit
-            where = f"{key}: {parent_path + '/' if parent_path else ''}{item['name']}"
-            return (client, drive_id, item["id"], where)
+            rel = f"{parent_path}/{item['name']}" if parent_path else item["name"]
+            return (client, drive_id, item["id"], f"{key}: {rel}", key, rel)
         try:
             data = await client.get(
                 f"/drives/{drive_id}/root/search(q='{escaped}')?$select=id,name,folder,parentReference&$top=100"
@@ -378,8 +379,8 @@ async def _find_vessel_folder_by_name(name: str, preferred_sites: list[str]):
                 best = (depth, item, parent_path)
         if best:
             _, item, parent_path = best
-            where = f"{key}: {parent_path + '/' if parent_path else ''}{item['name']}"
-            return (client, drive_id, item["id"], where)
+            rel = f"{parent_path}/{item['name']}" if parent_path else item["name"]
+            return (client, drive_id, item["id"], f"{key}: {rel}", key, rel)
     return None
 
 
@@ -423,3 +424,65 @@ async def _top_level_index(client, drive_id: str) -> dict[str, tuple[dict, str]]
                 index.setdefault(match_key(item["name"]), (item, top["name"]))
         _index_cache[drive_id] = (time.monotonic(), index)
         return index
+
+
+# --- recording where a vessel's folder is ----------------------------------
+
+def _record_location(vessel_id: int, site_key: str, folder_path: str) -> None:
+    """Save a vessel's folder path (and its site, if it had none) once it has
+    been found, so "View Documents" and the cards can use it directly."""
+    from ..db import models
+    from ..db.base import SessionLocal
+
+    with SessionLocal() as db:
+        v = db.get(models.Vessel, vessel_id)
+        if v is None or v.vessel_folder_path:
+            return
+        v.vessel_folder_path = folder_path
+        if not v.provisioned_site_key:
+            v.provisioned_site_key = site_key
+        db.commit()
+    log.info("[vessel location] vessel %s folder recorded: %s: %s", vessel_id, site_key, folder_path)
+
+
+async def locate_vessel_folder(vessel_id: int) -> dict:
+    """Return {"site_key", "folder_path"} for a vessel, finding (and saving)
+    it by name in the vessel's own site when it isn't recorded yet."""
+    from ..db import models
+    from ..db.base import SessionLocal
+
+    with SessionLocal() as db:
+        v = db.get(models.Vessel, vessel_id)
+        if v is None:
+            return {"found": False, "error": "Vessel not found"}
+        if v.vessel_folder_path:
+            return {"found": True, "site_key": v.provisioned_site_key, "folder_path": v.vessel_folder_path}
+        name = v.name
+        sites = [k for k in [v.provisioned_site_key, *(v.provisioned_site_ids or [])] if k]
+    found = await _find_vessel_folder_by_name(name, sites)
+    if not found:
+        return {"found": False, "error": "No folder with this vessel's name was found in its site"}
+    _record_location(vessel_id, found[4], found[5])
+    return {"found": True, "site_key": found[4], "folder_path": found[5]}
+
+
+async def backfill_vessel_locations() -> int:
+    """Find and save the folder path of every vessel that has none (run in
+    the background at startup). Returns how many were recorded."""
+    from ..db import models
+    from ..db.base import SessionLocal
+
+    if SessionLocal is None:
+        return 0
+    with SessionLocal() as db:
+        ids = [v.id for v in db.query(models.Vessel).filter(models.Vessel.vessel_folder_path.is_(None)).all()]
+    recorded = 0
+    for vid in ids:
+        try:
+            if (await locate_vessel_folder(vid)).get("found"):
+                recorded += 1
+        except Exception:
+            log.debug("[vessel location] lookup failed for vessel %s", vid, exc_info=True)
+    if ids:
+        log.info("[vessel location] backfill: %d of %d vessel(s) without a folder path found", recorded, len(ids))
+    return recorded

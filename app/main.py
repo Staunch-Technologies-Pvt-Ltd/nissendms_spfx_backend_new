@@ -1189,6 +1189,12 @@ async def _startup():
             _logger.warning("Database safety net table creation failed: %s", exc)
 
     app.state.scheduler = start_scheduler() if database_ready else None
+    if database_ready and settings.graph_configured:
+        # Record the folder path of vessels that don't have one yet (e.g.
+        # discovered from SharePoint), so "View Documents" opens the right
+        # folder. Background; never delays startup.
+        from .services.vessel_folder_template import backfill_vessel_locations
+        asyncio.create_task(backfill_vessel_locations(), name="backfill_vessel_locations")
 
 
 @app.on_event("shutdown")

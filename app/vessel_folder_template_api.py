@@ -69,6 +69,11 @@ def build_router(require_session) -> APIRouter:
         saved = vft.reset_template(admin_email(session, x_user_email))
         return {**saved, "folder_count": vft.count_folders(saved["folders"])}
 
+    @router.get("/locate/{vessel_id}")
+    async def locate(vessel_id: int, session=Depends(require_session)):
+        """Where a vessel's folder is; finds and saves it by name if unknown."""
+        return await vft.locate_vessel_folder(vessel_id)
+
     @router.get("/vessels")
     async def list_vessels(session=Depends(require_session)):
         from .db import models

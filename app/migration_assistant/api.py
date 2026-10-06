@@ -12,6 +12,9 @@ from datetime import datetime
 from typing import Callable
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -25,6 +28,31 @@ from .services.errors import BadRequest, Conflict, NotFound
 logger = logging.getLogger("migration_assistant")
 
 PREFIX = "/api/migration-assistant"
+
+
+class _JsonErrorRoute(APIRoute):
+    """Turn an unexpected exception in a Migration Assistant route into a
+    JSON 500 with the reason. Without this the error escapes to Starlette's
+    outermost error handler, whose plain 500 carries no CORS headers — the
+    browser then reports a network failure and the UI can only show a
+    generic "Could not load …" with no clue what went wrong."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            try:
+                return await original(request)
+            except (StarletteHTTPException, RequestValidationError, GraphError):
+                raise  # already turned into proper JSON responses
+            except Exception as exc:
+                logger.exception("Migration Assistant %s %s failed", request.method, request.url.path)
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"Migration Assistant server error ({type(exc).__name__}): {exc}"},
+                )
+
+        return handler
 
 
 def _raise(e: Exception):
@@ -118,7 +146,10 @@ def startup() -> None:
 
 
 def build_router(require_session: Callable) -> APIRouter:
-    router = APIRouter(prefix=PREFIX, tags=["migration-assistant"], dependencies=[Depends(require_session)])
+    router = APIRouter(
+        prefix=PREFIX, tags=["migration-assistant"], dependencies=[Depends(require_session)],
+        route_class=_JsonErrorRoute,
+    )
 
     def acting_user(
         session=Depends(require_session),

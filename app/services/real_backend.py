@@ -168,9 +168,12 @@ async def _term_store_vessel_folder_count(target: dict) -> tuple[int, list[str]]
             terms = []
         by_norm = {_normalize_term_label(t): t for t in terms}
         names: dict[str, str] = {}
-        for item, _parent in await vessel_roots.child_folders_of_roots(graph(), drive_id, roots_cfg["paths"]):
+        paths: dict[str, str] = {}
+        for item, parent in await vessel_roots.child_folders_of_roots(graph(), drive_id, roots_cfg["paths"]):
             norm = _normalize_term_label(item["name"])
             names.setdefault(norm, by_norm.get(norm) or item["name"].strip())
+            paths.setdefault(norm, f"{parent}/{item['name']}")
+        vessel_roots.remember_paths(drive_id, paths)
         matched = sorted(names.values(), key=str.casefold)
         return len(matched), matched
 
@@ -1404,8 +1407,10 @@ class RealBackend:
                 site_key, len(vessels), len(sites_in_dash),
                 [(s.get("site_key"), s.get("vessels"), len(s.get("vessel_names") or []), s.get("error")) for s in sites_in_dash],
             )
+            from . import vessel_roots as _vessel_roots
             for site in sites_in_dash:
                 site_key_for_row = site.get("site_key")
+                site_drive = site.get("drive_id")
                 for name in site.get("vessel_names") or []:
                     norm = _normalize_term_label(name)
                     if norm in known_names:
@@ -1422,7 +1427,10 @@ class RealBackend:
                         "is_provisioned": False,
                         "provisioned_site_ids": [],
                         "provisioned_site_key": site_key_for_row,
-                        "vessel_folder_path": name,
+                        # The real folder path when it came from the site's
+                        # chosen vessel folders; else just the name (the
+                        # frontend then finds it at the root or one level down).
+                        "vessel_folder_path": _vessel_roots.discovered_path(site_drive, norm) or name,
                         "restored_at": None,
                         "status": "Found in SharePoint",
                         "source": "sharepoint",

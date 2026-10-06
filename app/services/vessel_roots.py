@@ -93,6 +93,20 @@ def save(drive_id: str, site_key: str, mode: str | None, paths: list[str], email
     return entry
 
 
+# Last discovered location of each vessel folder, per library:
+# {drive_id: {normalized name: "root/child" path}} — lets the Vessels page
+# open a discovered (not registered) vessel's real folder.
+_discovered_paths: dict[str, dict[str, str]] = {}
+
+
+def remember_paths(drive_id: str, paths: dict[str, str]) -> None:
+    _discovered_paths[drive_id] = paths
+
+
+def discovered_path(drive_id: str | None, norm_name: str) -> str | None:
+    return _discovered_paths.get(drive_id or "", {}).get(norm_name)
+
+
 async def child_folders_of_roots(client, drive_id: str, paths: list[str]) -> list[tuple[dict, str]]:
     """[(folder item, its parent path)] for every sub-folder of the chosen
     folders. A chosen folder that no longer exists is skipped (and logged)."""

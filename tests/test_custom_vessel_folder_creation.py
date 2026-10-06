@@ -171,6 +171,34 @@ class TestCustomVesselFolderCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["subfolders"], ["Certificates"])
         self.assertEqual(client.post.await_count, 4)
 
+    async def test_create_vessel_at_path_reuses_parent_with_double_space_name(self):
+        # Real library folder is "Technical and Crewing  New" (two spaces). The
+        # parent must be reused, never duplicated as a one-space sibling.
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[
+            {"id": "root-id"},
+            {"value": [{"id": "tc-real", "name": "Technical and Crewing  New", "folder": {}}]},
+            {"value": []},
+        ])
+        client.post = AsyncMock(side_effect=[
+            {"id": "vessel-1", "name": "MV Test"},
+        ])
+
+        with (
+            patch(
+                "app.services.site_provisioning._site_config_for_reference",
+                return_value=("demo", SimpleNamespace(drive_id="drive-123")),
+            ),
+            patch("app.services.site_provisioning.graph", return_value=client),
+        ):
+            result = await site_provisioning.create_vessel_at_path(
+                "demo", "Technical and Crewing  New", "MV Test", []
+            )
+
+        self.assertEqual(client.post.await_count, 1)
+        self.assertIn("/items/tc-real/children", client.post.await_args_list[0].args[0])
+        self.assertEqual(result["vessel_folder_id"], "vessel-1")
+
     async def test_create_vessel_does_not_create_dms_folder_structure_without_explicit_target(self):
         backend = RealBackend()
         name = f"MV No DMS {uuid.uuid4().hex[:6]}"

@@ -140,7 +140,17 @@ async def create_vessel_at_path(
         if not safe_name or any(ch in safe_name for ch in '~"#%&*:<>?/\\{|}'):
             raise ValueError(f"Invalid SharePoint folder name: {name!r}")
         listing = await client.get(f"/drives/{drive_id}/items/{current_id}/children?$top=200&$select=id,name,folder")
-        existing = next((x for x in listing.get("value", []) if x.get("folder") is not None and x.get("name", "").casefold() == safe_name.casefold()), None)
+        # Compare with repeated spaces collapsed on both sides: SharePoint folders
+        # such as "Technical and Crewing  New" (two spaces) must be reused, not
+        # duplicated as "Technical and Crewing New".
+        existing = next(
+            (
+                x for x in listing.get("value", [])
+                if x.get("folder") is not None
+                and " ".join((x.get("name") or "").split()).casefold() == safe_name.casefold()
+            ),
+            None,
+        )
         if existing:
             return existing
         return await client.post(

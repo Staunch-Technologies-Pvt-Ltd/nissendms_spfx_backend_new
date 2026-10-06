@@ -8153,6 +8153,64 @@ def _dashboard_doc_matches_text(
     return all(clause in hay for clause in clauses)
 
 
+@app.get("/api/dashboard/vessel-summary")
+async def dashboard_vessel_summary(
+    site_key: str | None = Query(default=None, description="Only this site's documents (the Vessels page site filter)"),
+    _session: object = Depends(require_session),
+):
+    """Per-vessel document figures for the Vessels page cards: how many
+    documents, total size, when and by whom last updated, and how many sit
+    in Drawings / Manuals / To Be Classified. Computed from the same cached
+    scan as /api/dashboard/documents, so it never queries SharePoint itself.
+
+    Returns {"scan_pending": bool, "vessels": {lower-case name: {...}}}.
+    """
+    be = get_backend()
+    docs: list[dict] = []
+    scan_pending = False
+    if hasattr(be, "get_dashboard_documents"):
+        result = await be.get_dashboard_documents(force_refresh=False, site_key=site_key if site_key and site_key != "all" else None)
+        if isinstance(result, dict):
+            docs = list(result.get("docs") or [])
+            scan_pending = bool(result.get("pending"))
+        else:
+            docs = list(result or [])
+
+    def group_of(d: dict) -> str:
+        vessel_key = (d.get("vessel") or "").strip().casefold()
+        parts = [" ".join(p.split()).casefold() for p in (d.get("subFolderPath") or "").split(">") if p.strip()]
+        # Only look below the vessel's own folder, so a "Drawings" folder
+        # higher up the path doesn't decide it.
+        if vessel_key in parts:
+            parts = parts[parts.index(vessel_key) + 1:]
+        for part in parts:
+            if part in ("to be classified", "to be classifed"):
+                return "to_be_classified"
+            if part in ("drawings", "drawing"):
+                return "drawings"
+            if part in ("manuals", "manual"):
+                return "manuals"
+        return "other"
+
+    summary: dict[str, dict] = {}
+    for d in docs:
+        name = (d.get("vessel") or "").strip()
+        if not name:
+            continue
+        row = summary.setdefault(name.casefold(), {
+            "name": name, "total": 0, "size_bytes": 0, "last_modified_epoch": 0, "last_modified_by": None,
+            "drawings": 0, "manuals": 0, "to_be_classified": 0, "other": 0,
+        })
+        row["total"] += 1
+        row["size_bytes"] += int(d.get("sizeBytes") or 0)
+        row[group_of(d)] += 1
+        ep = d.get("modifiedEpoch") or 0
+        if ep > row["last_modified_epoch"]:
+            row["last_modified_epoch"] = ep
+            row["last_modified_by"] = d.get("modifiedBy")
+    return {"scan_pending": scan_pending, "vessels": summary}
+
+
 @app.get("/api/dashboard/documents")
 async def dashboard_documents(
     site_key: str | None = Query(default=None),

@@ -8189,12 +8189,17 @@ async def dashboard_vessel_summary(
         # higher up the path doesn't decide it.
         if vessel_key in parts:
             parts = parts[parts.index(vessel_key) + 1:]
+        # Folder names that merely contain the word count too — e.g. "Final
+        # Drawings (Maker)" or "Machinery Manuals" in sites not yet organised
+        # as Drawings and Manuals. A name with both words ("Drawings and
+        # Manuals") is a container, so look further down.
         for part in parts:
-            if part in ("to be classified", "to be classifed"):
+            if "to be classif" in part:
                 return "to_be_classified"
-            if part in ("drawings", "drawing"):
+            has_drawing, has_manual = "drawing" in part, "manual" in part
+            if has_drawing and not has_manual:
                 return "drawings"
-            if part in ("manuals", "manual"):
+            if has_manual and not has_drawing:
                 return "manuals"
         return "other"
 

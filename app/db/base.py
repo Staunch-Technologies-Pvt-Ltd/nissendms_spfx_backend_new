@@ -18,6 +18,10 @@ def _active_site_id() -> str:
 @event.listens_for(Session, "do_orm_execute")
 def _scope_folder_queries(execute_state):
     """Keep logical folder paths isolated when multiple sites share a DB."""
+    # Opt-out for cross-site maintenance jobs (services/folder_sync.py):
+    # query.execution_options(all_sites=True).
+    if execute_state.execution_options.get("all_sites"):
+        return
     if execute_state.is_select and not execute_state.is_column_load:
         from .models import Folder
         site_id = _active_site_id()

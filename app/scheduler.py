@@ -10,6 +10,7 @@ All jobs are only active when Graph + DB are configured (real mode).
 """
 from datetime import date, datetime, timedelta, timezone
 import asyncio
+import os
 import logging
 import time
 
@@ -23,7 +24,10 @@ from .db.base import SessionLocal
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- vessel pool
-POOL_TARGET_SIZE = 5
+# Number of empty "Pool-xxxx" vessel folders kept ready in SharePoint. 0 (the
+# default) turns the pool off: a new vessel is then created directly, with no
+# pre-built folder to claim. Set POOL_TARGET_SIZE in .env to bring it back.
+POOL_TARGET_SIZE = int(os.getenv("POOL_TARGET_SIZE", "0") or 0)
 # How long before reconcile_pool declares a 'building' PoolSlot / 'pending'
 # ReplenishJob as stuck and marks it 'failed' so it can be retried.
 # Must be comfortably larger than SLOT_BUILD_TIMEOUT_SECONDS (in minutes).
@@ -249,6 +253,25 @@ async def reconcile_vessel_folders() -> dict:
         return {"error": str(exc)}
 
 
+async def sync_folder_table() -> dict:
+    """Apply SharePoint-side renames/moves/deletes of folders to the folders
+    table (incremental Graph delta, every couple of minutes)."""
+    from .services import get_backend
+    from .services.real_backend import RealBackend
+
+    backend = get_backend()
+    if not isinstance(backend, RealBackend):
+        return {"skipped": "not_real_backend"}
+    try:
+        return await backend.sync_folder_table()
+    except asyncio.CancelledError:
+        log.info("[sync_folder_table] cancelled (server shutting down/restarting)")
+        raise
+    except Exception as exc:
+        log.warning("[sync_folder_table] Unhandled error: %s", exc)
+        return {"error": str(exc)}
+
+
 async def ensure_template_month_folders() -> dict:
     """See services/folder_structure.ensure_current_month_folders."""
     from .services import get_backend
@@ -460,6 +483,19 @@ def start_scheduler() -> AsyncIOScheduler | None:
         replace_existing=True,
     )
 
+    # Folders table: apply folders renamed / moved / deleted directly in
+    # SharePoint (incremental Graph delta per drive, every 2 minutes).
+    sched.add_job(
+        sync_folder_table,
+        "interval",
+        minutes=2,
+        id="sync_folder_table",
+        next_run_time=datetime.now() + timedelta(seconds=30),
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     # Home dashboard stats: keep the "all sites" cache warm (every 100s,
     # just under CACHE_TTL_DASHBOARD_STATS's 120s) so page loads read from
     # cache instead of triggering a live multi-site scan. Also runs once on
@@ -494,6 +530,7 @@ def start_scheduler() -> AsyncIOScheduler | None:
     log.info(
         "Scheduler started: session_sweep (15 min) "
         "+ reconcile_pool (5 min) + reconcile_vessel_folders (10 min) "
+        "+ sync_folder_table (2 min) "
         "+ refresh_dashboard_stats_cache (100 sec) "
         "+ reconcile_native_deletions (45 sec) "
         "+ ensure_template_month_folders (daily 00:20)"

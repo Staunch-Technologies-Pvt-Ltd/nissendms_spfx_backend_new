@@ -2585,6 +2585,7 @@ class RealBackend:
     @protected_delete_operation
     async def _execute_delete_vessel(
         self, vessel_id: str, requesting_email=None, requesting_name=None, reason=None,
+        source: str = "app",
     ) -> dict:
         """Delete a vessel: delete its root ship folders via Graph API (moving them to
         SharePoint Recycle Bin) and delete the vessel + folder rows from SQLite DB.
@@ -2862,7 +2863,7 @@ class RealBackend:
             requesting_email=requesting_email,
             requesting_name=requesting_name,
             reason=reason,
-            source="app",
+            source=source,
         )
 
         # Delete vessel & associated folder rows from DB, and cancel any pending approvals
@@ -2899,6 +2900,17 @@ class RealBackend:
         invalidate_folder_caches()
 
         return {"deleted": True, "vessel_name": vname, "message": f"Moved vessel '{vname}' to Recycle Bin."}
+
+    async def reconcile_vessel_folders(self, force: bool = True) -> dict:
+        """Remove vessels whose SharePoint ship folder was deleted directly in
+        SharePoint (soft delete into the app's Recycle Bin). See services/folder_sync.py."""
+        from . import folder_sync
+        return await folder_sync.reconcile_vessel_folders(self, force=force)
+
+    async def sync_folder_table(self) -> dict:
+        """Apply SharePoint renames/moves/deletes to the folders table (Graph delta)."""
+        from . import folder_sync
+        return await folder_sync.sync_folder_table(self)
 
     async def repair_vessel_links(self) -> dict:
         """Scan all ship-kind folders with vessel_id=None and try to link them

@@ -10294,6 +10294,8 @@ app.include_router(_build_tag_config_router(require_session))
 # ── Module Management (Settings → Module Management) ─────────────────────────
 from .module_settings_api import build_router as _build_module_settings_router
 app.include_router(_build_module_settings_router(require_session))
+from .vessel_folder_template_api import build_router as _build_vessel_folder_template_router
+app.include_router(_build_vessel_folder_template_router(require_session))
 
 # ── Filter Search Management (Settings → Filter Search Management) ───────────
 from .filter_settings_api import build_router as _build_filter_settings_router

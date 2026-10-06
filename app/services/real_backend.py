@@ -1623,6 +1623,7 @@ class RealBackend:
                         "is_provisioned": True,
                         "provisioned_site_key": selected_site or None,
                         "vessel_folder_path": vessel_folder_path,
+                        "folder_template": folder_result.get("template"),
                         "provisioned_site_ids": list(dict.fromkeys(final_target_sites + ([selected_site] if selected_site else []))),
                     })
                     # The vessel folder now exists in SharePoint, but the
@@ -1652,6 +1653,15 @@ class RealBackend:
         # nothing else, so creation behaves exactly as before. Modes 2-4 run
         # in the background on the active site's drive and never delay this
         # response. Vessels created at a custom site/path are left alone.
+        if creation_method == "pool" and vessel.get("id"):
+            # A claimed pool slot is just a renamed empty folder — add the
+            # vessel folder template's sub-folders in the background.
+            from . import vessel_folder_template
+            asyncio.create_task(
+                vessel_folder_template.ensure_for_vessel(int(vessel["id"])),
+                name=f"vessel_folder_template_{clean_name}",
+            )
+
         if not custom_location and vessel.get("id"):
             from . import folder_structure
             asyncio.create_task(

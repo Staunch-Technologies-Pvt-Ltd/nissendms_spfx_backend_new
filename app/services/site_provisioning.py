@@ -120,8 +120,11 @@ async def create_vessel_at_path(
     parent_path: str,
     vessel_name: str,
     subfolders: list[str] | None = None,
+    apply_template: bool = True,
 ) -> dict[str, Any]:
-    """Create or reuse a vessel folder and custom child folders in one site."""
+    """Create or reuse a vessel folder, the vessel folder template's
+    sub-folders (Settings → Vessel Settings → Vessel Folder Template), and
+    any extra custom child folders, in one site."""
     try:
         key, config = _site_config_for_reference(site_key)
         client = graph(site_name=key, site_config=config)
@@ -172,6 +175,16 @@ async def create_vessel_at_path(
     parent = _clean_folder_path(parent_path)
     parent_id = await ensure_path(parent)
     vessel_folder = await ensure_child(parent_id, vessel_name)
+    template_result: dict[str, Any] = {"created": [], "existing": 0, "failed": []}
+    if apply_template:
+        from . import vessel_folder_template
+        try:
+            template_result = await vessel_folder_template.ensure_tree(
+                client, drive_id, vessel_folder["id"], vessel_folder_template.get_template()["folders"],
+            )
+        except Exception as exc:  # the vessel itself is still created
+            logger.exception("Vessel folder template failed for '%s' on site '%s'", vessel_name, key)
+            template_result["failed"].append({"path": "", "error": str(exc)[:300]})
     created_subfolders: list[str] = []
     for raw_name in subfolders or []:
         path_parts = [
@@ -196,6 +209,7 @@ async def create_vessel_at_path(
         "vessel_folder_id": vessel_folder["id"],
         "vessel_folder_path": full_path,
         "subfolders": created_subfolders,
+        "template": template_result,
     }
 
 
@@ -440,6 +454,17 @@ async def provision_vessel_to_drive(
 
         vessel_folder = await gd.ensure_folder(drive_id, root_id, vessel_name)
         vessel_folder_id = vessel_folder["id"]
+
+        # The vessel folder template's sub-folders (Settings → Vessel
+        # Settings). A failure here is logged; the vessel folder still counts
+        # as provisioned and "Apply to existing vessels" can fill it in later.
+        from . import vessel_folder_template
+        try:
+            await vessel_folder_template.ensure_tree(
+                graph(), drive_id, vessel_folder_id, vessel_folder_template.get_template()["folders"],
+            )
+        except Exception:
+            logger.exception("Vessel folder template failed for '%s' on site '%s'", vessel_name, site_key)
 
         if is_active_site:
             with SessionLocal() as db:

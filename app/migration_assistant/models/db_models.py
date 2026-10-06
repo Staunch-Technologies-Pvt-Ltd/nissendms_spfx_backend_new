@@ -26,6 +26,11 @@ class MigrationScanJob(Base):
     status: Mapped[str] = mapped_column(String(20), default="running")  # running/done/failed
 
     source_folder: Mapped[str] = mapped_column(String(1024), default="")  # e.g. "SS378-PEISSY-Drawings, Plans, Manuals"
+    # The site/library this scan reads from, picked in the UI (a Site
+    # Management site). NULL = the configured default source
+    # (MIGRATION_SITE_HOSTNAME/PATH) — also what every older job used.
+    source_site_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    source_drive_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     subfolders: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of checked subfolder names
     # JSON list of individual loose files (siblings of the checked subfolders,
     # sitting directly in source_folder) the user checked one-by-one.

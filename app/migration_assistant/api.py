@@ -68,6 +68,10 @@ class ScanIn(BaseModel):
     subfolders: list[str]
     vessel_path: str
     files: list[str] = []
+    # Picked source site (a Site Management / site-picker key) and library;
+    # omitted = the configured default source.
+    source_site_key: str | None = None
+    source_drive_id: str | None = None
 
 
 class OverrideIn(BaseModel):
@@ -166,9 +170,9 @@ def build_router(require_session: Callable) -> APIRouter:
 
     # ── Same-site migration ────────────────────────────────────────────────
     @router.get("/migration/source-folders")
-    async def list_source_folders(path: str | None = None):
+    async def list_source_folders(path: str | None = None, site_key: str | None = None, drive_id: str | None = None):
         try:
-            return await migration_service.list_source_folders(path)
+            return await migration_service.list_source_folders(path, site_key, drive_id)
         except (NotFound, BadRequest) as e:
             _raise(e)
 
@@ -231,7 +235,8 @@ def build_router(require_session: Callable) -> APIRouter:
     async def start_migration_scan(payload: ScanIn):
         try:
             return await migration_service.start_scan(
-                payload.source_folder, payload.subfolders, payload.vessel_path, payload.files
+                payload.source_folder, payload.subfolders, payload.vessel_path, payload.files,
+                payload.source_site_key, payload.source_drive_id,
             )
         except (NotFound, BadRequest, Conflict) as e:
             _raise(e)

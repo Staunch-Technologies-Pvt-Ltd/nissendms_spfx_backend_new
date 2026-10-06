@@ -54,6 +54,8 @@ def create_job(
     vessel_folder_id: str,
     files: list[str] | None = None,
     auto_detect_vessel: bool = False,
+    source_site_key: str | None = None,
+    source_drive_id: str | None = None,
 ) -> int:
     with SessionLocal() as db:
         job = models.MigrationScanJob(
@@ -65,6 +67,8 @@ def create_job(
             vessel_path=vessel_path,
             vessel_folder_id=vessel_folder_id,
             auto_detect_vessel=auto_detect_vessel,
+            source_site_key=source_site_key,
+            source_drive_id=source_drive_id,
         )
         db.add(job)
         db.commit()
@@ -190,6 +194,7 @@ async def run_scan(
     subfolder_paths: list[str],
     source_folder: str | None = None,
     files: list[str] | None = None,
+    source_drive_id: str | None = None,
 ) -> None:
     """Scan exactly the given list of absolute subfolder paths (each fully,
     i.e. including every nested folder beneath it), plus any individually
@@ -201,7 +206,7 @@ async def run_scan(
     from ..classifier import migration_classifier
 
     try:
-        drive_id = await migration_common.get_migration_drive_id()
+        drive_id = await migration_common.get_migration_drive_id(source_drive_id)
         sem = asyncio.Semaphore(SCAN_CONCURRENCY)
         per_folder_results = await asyncio.gather(
             *(_scan_one(drive_id, path, job_id, sem) for path in subfolder_paths)

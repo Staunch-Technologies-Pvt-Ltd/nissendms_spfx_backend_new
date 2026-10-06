@@ -15,16 +15,14 @@ from ..models import db_models as models
 from ..db import SessionLocal
 from ..config import settings
 
-from . import migration_common, migration_mover, migration_scanner
+from . import migration_common, migration_mover, migration_scanner, site_to_site_common
 from .errors import BadRequest, NotFound
 from .migration_common import get_migration_drive_id
 
 
 def _require_configured() -> None:
     if not settings.graph_configured:
-        raise BadRequest(
-            "Not configured — set MIGRATION_SITE_HOSTNAME and MIGRATION_SITE_PATH in backend/.env (the Graph credentials come from the DMS settings)."
-        )
+        raise BadRequest(migration_common.GRAPH_NOT_CONFIGURED)
 
 
 def _item_public(row: models.MigrationItem) -> dict:
@@ -65,6 +63,9 @@ def _job_public(job: models.MigrationScanJob) -> dict:
         "id": str(job.id),
         "status": job.status,
         "source_folder": job.source_folder,
+        "source_site_key": job.source_site_key,
+        "source_site_label": _source_label(job.source_site_key),
+        "source_drive_id": job.source_drive_id,
         "subfolders": json.loads(job.subfolders) if job.subfolders else [],
         "files": json.loads(job.files) if job.files else [],
         "vessel_name": job.vessel_name,
@@ -102,13 +103,25 @@ def _get_item_in_job(job_id: str, item_id: str) -> models.MigrationItem:
         return row
 
 
-async def list_source_folders(path: str | None = None) -> dict:
-    """Immediate children under `path`, or the Documents library's top level
-    if empty — powers the source-folder/subfolder browser. Includes files
+def _source_label(site_key: str | None) -> str:
+    if not site_key:
+        return "Default source"
+    try:
+        return site_to_site_common.find_site(site_key).get("label", site_key)
+    except Exception:
+        return site_key
+
+
+async def list_source_folders(path: str | None = None, site_key: str | None = None, drive_id: str | None = None) -> dict:
+    """Immediate children under `path`, or the library's top level if empty —
+    powers the source-folder/subfolder browser. The library is the picked
+    site's (`drive_id`), else the configured default. Includes files
     (read-only, for visibility into exactly what's there) alongside the
     navigable/selectable folders."""
     _require_configured()
-    drive_id = await get_migration_drive_id()
+    if site_key:
+        site_to_site_common.find_site(site_key)  # 400s on an unknown site
+    drive_id = await get_migration_drive_id(drive_id)
     children = await migration_common.list_child_folders(drive_id, path)
     return {"path": (path or "").strip("/"), "folders": children["folders"], "files": children["files"]}
 
@@ -123,7 +136,8 @@ async def list_vessels() -> dict:
 
 
 async def start_scan(
-    source_folder: str, subfolders: list[str], vessel_path: str, files: list[str] | None = None
+    source_folder: str, subfolders: list[str], vessel_path: str, files: list[str] | None = None,
+    source_site_key: str | None = None, source_drive_id: str | None = None,
 ) -> dict:
     """Kick off a scan of exactly the checked subfolders under `source_folder`
     (each fully, including everything nested beneath it), plus any
@@ -142,7 +156,9 @@ async def start_scan(
         raise BadRequest("A destination vessel must be selected")
     files = [f.strip("/") for f in (files or []) if f.strip("/")]
 
-    source_drive_id = await get_migration_drive_id()
+    if source_site_key:
+        site_to_site_common.find_site(source_site_key)  # 400s on an unknown site
+    source_drive_id = await get_migration_drive_id(source_drive_id)
     dest_drive_id = await migration_common.get_destination_drive_id()
     # 404s early if any of these are invalid, rather than failing deep inside
     # the background scan task.
@@ -173,8 +189,12 @@ async def start_scan(
         vessel_path=vessel_path,
         vessel_folder_id=vessel["id"],
         auto_detect_vessel=auto_detect_vessel,
+        # The resolved library is stored even for the default source, so the
+        # job keeps working if MIGRATION_SITE_HOSTNAME/PATH change later.
+        source_site_key=source_site_key,
+        source_drive_id=source_drive_id,
     )
-    asyncio.create_task(migration_scanner.run_scan(job_id, subfolder_paths, source_folder, files))
+    asyncio.create_task(migration_scanner.run_scan(job_id, subfolder_paths, source_folder, files, source_drive_id))
     return _job_public(_get_job_row(str(job_id)))
 
 
@@ -252,7 +272,7 @@ async def reclassify_item(job_id: str, item_id: str) -> dict:
 async def get_item_preview(job_id: str, item_id: str):
     _require_configured()
     row = _get_item_in_job(job_id, item_id)
-    drive_id = await get_migration_drive_id()
+    drive_id = await get_migration_drive_id(_get_job_row(job_id).source_drive_id)
     content, content_type, name = await gd.download_file(drive_id, row.source_drive_item_id)
     return content, content_type, name
 

@@ -150,13 +150,14 @@ class Settings(BaseSettings):
 
     @property
     def graph_configured(self) -> bool:
-        return bool(
-            self.azure_tenant_id
-            and self.graph_client_id
-            and self.graph_client_secret
-            and self.site_hostname
-            and self.site_path
-        )
+        """Graph credentials are present. The source site is picked per scan
+        (from Site Management); MIGRATION_SITE_HOSTNAME/PATH are only the
+        default used when no site is picked."""
+        return bool(self.azure_tenant_id and self.graph_client_id and self.graph_client_secret)
+
+    @property
+    def default_source_configured(self) -> bool:
+        return bool(self.site_hostname and self.site_path)
 
     @property
     def authority_url(self) -> str:

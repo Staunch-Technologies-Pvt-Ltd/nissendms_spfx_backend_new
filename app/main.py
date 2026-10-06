@@ -1189,6 +1189,40 @@ async def _startup():
             _logger.warning("Database safety net table creation failed: %s", exc)
 
     app.state.scheduler = start_scheduler() if database_ready else None
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """Stop background jobs so Ctrl+C and --reload exit promptly. Without
+    this, scheduler jobs still waiting on Graph keep the old process alive
+    and the server hangs half-shut-down (port held, no requests answered)."""
+    import asyncio as _asyncio
+
+    sched = getattr(app.state, "scheduler", None)
+    if sched is not None:
+        try:
+            sched.shutdown(wait=False)
+        except Exception:
+            pass
+    # Cancel only our own background work still awaiting Graph/DB calls:
+    # scheduler job runners and tasks whose coroutine lives in this app's
+    # code. Server (uvicorn/starlette) tasks are left alone.
+    import pathlib as _pathlib
+
+    app_dir = str(_pathlib.Path(__file__).resolve().parent)
+    current = _asyncio.current_task()
+
+    def _ours(task) -> bool:
+        coro = task.get_coro()
+        code = getattr(coro, "cr_code", None)
+        name = getattr(code, "co_name", "")
+        return name == "run_coroutine_job" or str(getattr(code, "co_filename", "")).startswith(app_dir)
+
+    pending = [t for t in _asyncio.all_tasks() if t is not current and not t.done() and _ours(t)]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await _asyncio.wait(pending, timeout=5)
     # NOTE: the deferred startup precreate_next_month() call was removed —
     # the app no longer auto-creates month/category folder structures.
 # ---------------------------------------------------------------------------

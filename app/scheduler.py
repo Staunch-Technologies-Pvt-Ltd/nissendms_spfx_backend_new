@@ -203,10 +203,11 @@ async def refresh_dashboard_stats_cache() -> dict:
         # just this scan being torn down mid-flight because the app itself
         # is shutting down or restarting (e.g. uvicorn --reload picking up a
         # code change while this job happened to be running) — normal during
-        # development, not a real failure. Log it briefly and re-raise so
-        # the event loop's own cancellation still completes correctly.
+        # development, not a real failure. Log it briefly and return: the
+        # process is stopping anyway, and re-raising made APScheduler print
+        # the same multi-frame ERROR traceback this handler exists to avoid.
         log.info("[refresh_dashboard_stats_cache] cancelled (server shutting down/restarting)")
-        raise
+        return {"cancelled": True}
     except Exception as exc:
         # Best-effort — a failed background refresh just leaves the previous
         # cached figures in place (or falls through to a live scan on the

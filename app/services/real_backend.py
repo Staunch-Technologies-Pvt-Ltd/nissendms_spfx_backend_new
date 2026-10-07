@@ -3939,6 +3939,26 @@ class RealBackend:
             last_epoch = 0
             scan_error: str | None = None
 
+            # Admin-chosen vessel folders for this library: a file below
+            # "<chosen folder>/<vessel>/…" belongs to that vessel even when
+            # the vessel has no DB row yet (vessels found in SharePoint).
+            def _norm_seg(s: str) -> str:
+                return " ".join(s.split()).casefold()
+
+            from . import vessel_roots as _vr
+            _roots_cfg = _vr.get_for_drive(drive_id)
+            root_prefixes = [
+                [_norm_seg(p) for p in path.split("/") if p.strip()]
+                for path in ((_roots_cfg or {}).get("paths") or [])
+            ] if (_roots_cfg or {}).get("mode") == "folders" else []
+
+            def _vessel_from_roots(parts: list[str]) -> str:
+                normed = [_norm_seg(p) for p in parts]
+                for prefix in root_prefixes:
+                    if prefix and len(normed) > len(prefix) and normed[:len(prefix)] == prefix:
+                        return parts[len(prefix)]
+                return ""
+
             def _process_item(f: dict) -> None:
                 nonlocal folders, last_epoch
                 name = f.get("name")
@@ -3960,6 +3980,8 @@ class RealBackend:
                     if part.lower() in known_vessels:
                         vessel = known_vessels[part.lower()]
                         break
+                if not vessel and root_prefixes:
+                    vessel = _vessel_from_roots(parts)
 
                 doc_type = parts[-1] if parts else "Document"
                 sub_folder_path = " > ".join(parts) if parts else group
@@ -4416,6 +4438,18 @@ class RealBackend:
         # SharePoint right now and updates on site switch/refresh.
         total_vessels = scan.get("total_vessels", 0)
 
+        # Active vessels = vessel folders (in the scanned site(s)) that hold at
+        # least one document; the rest are vessels with no documents yet.
+        docs_per_vessel: dict[str, int] = {}
+        for d in all_docs:
+            v = _normalize_term_label(d.get("vessel") or "")
+            if v and v != "notlisted":
+                docs_per_vessel[v] = docs_per_vessel.get(v, 0) + 1
+        vessel_names_in_scope = {
+            _normalize_term_label(str(n)) for s in scan["sites"] for n in (s.get("vessel_names") or []) if str(n).strip()
+        }
+        active_vessels = sum(1 for n in vessel_names_in_scope if docs_per_vessel.get(n))
+
         result = {
             # total_documents kept for older clients; same value as total_files.
             "total_documents": scan["total_files"],
@@ -4423,6 +4457,8 @@ class RealBackend:
             "total_folders": scan["total_folders"],
             "total_sites": len(scan["sites"]),
             "total_vessels": total_vessels,
+            "active_vessels": active_vessels,
+            "vessels_without_documents": max(len(vessel_names_in_scope) - active_vessels, 0),
             "sites": scan["sites"],
             "truncated": scan["truncated"],
             "recent_documents": all_docs[:10],

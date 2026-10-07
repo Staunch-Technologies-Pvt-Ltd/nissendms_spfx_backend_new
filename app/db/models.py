@@ -542,6 +542,10 @@ class EmailLog(Base):
 
     status: Mapped[str] = mapped_column(String(20), default="pending")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Compose email (app/mail_compose): the mailbox it was sent from, and
+    # the documents it carried as JSON [{"name", "kind": "file|link|folder"}].
+    sender: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    documents: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

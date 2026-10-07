@@ -8182,26 +8182,7 @@ async def dashboard_vessel_summary(
         else:
             docs = list(result or [])
 
-    def group_of(d: dict) -> str:
-        vessel_key = (d.get("vessel") or "").strip().casefold()
-        parts = [" ".join(p.split()).casefold() for p in (d.get("subFolderPath") or "").split(">") if p.strip()]
-        # Only look below the vessel's own folder, so a "Drawings" folder
-        # higher up the path doesn't decide it.
-        if vessel_key in parts:
-            parts = parts[parts.index(vessel_key) + 1:]
-        # Folder names that merely contain the word count too — e.g. "Final
-        # Drawings (Maker)" or "Machinery Manuals" in sites not yet organised
-        # as Drawings and Manuals. A name with both words ("Drawings and
-        # Manuals") is a container, so look further down.
-        for part in parts:
-            if "to be classif" in part:
-                return "to_be_classified"
-            has_drawing, has_manual = "drawing" in part, "manual" in part
-            if has_drawing and not has_manual:
-                return "drawings"
-            if has_manual and not has_drawing:
-                return "manuals"
-        return "other"
+    from .services.doc_groups import group_of
 
     summary: dict[str, dict] = {}
     for d in docs:
@@ -10383,6 +10364,10 @@ app.include_router(_build_settings_tab_router(require_session))
 # ── Documents Copilot (self-contained: backend/app/copilot/) ─────────────────
 from .copilot.api import build_router as _build_copilot_router
 app.include_router(_build_copilot_router(require_session))
+
+# ── Compose email with SharePoint documents (backend/app/mail_compose/) ─────
+from .mail_compose.api import build_router as _build_mail_router
+app.include_router(_build_mail_router(require_session))
 
 # ── Migration Assistant (self-contained: backend/app/migration_assistant/) ───
 # Merged from the former standalone app: starts/stops with this backend, routes

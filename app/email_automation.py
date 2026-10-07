@@ -270,6 +270,17 @@ def suggest_tag(filename: str = ""):
     }
 
 
+def _documents(raw: str | None) -> list[dict]:
+    if not raw:
+        return []
+    try:
+        import json as _json
+        value = _json.loads(raw)
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
 @router.get("/email-logs")
 @router.get("/api/email-logs")
 def list_email_logs(status: Optional[str] = None):
@@ -303,6 +314,8 @@ def list_email_logs(status: Optional[str] = None):
                     "sent_at": entry.sent_at.isoformat() if entry.sent_at else None,
                     "attachments_count": len(entry.attachments),
                     "attachment_names": [a.filename for a in entry.attachments],
+                    "sender": getattr(entry, "sender", None),
+                    "documents": _documents(getattr(entry, "documents", None)),
                 })
             return logs
         except Exception as e:

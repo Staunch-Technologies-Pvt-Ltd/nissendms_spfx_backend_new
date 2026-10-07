@@ -1053,13 +1053,15 @@ async def _startup():
             _logger.warning("Alembic automatic migration failed: %s", exc)
 
         # 3. Safety net: make sure ALL tables and columns are present.
-        #    create_all with checkfirst=True will add any missing tables but
-        #    cannot add missing columns — those are handled by migrations above.
+        #    create_all adds any missing tables; sync_missing_columns adds any
+        #    model column an existing table lacks (e.g. a teammate's older DB),
+        #    so starting the backend is always enough to catch a DB up.
         try:
             from .db.base import Base, engine
+            from .db.schema_sync import ensure_schema
             from sqlalchemy import inspect, text
             if engine is not None:
-                Base.metadata.create_all(bind=engine, checkfirst=True)
+                ensure_schema(engine, Base.metadata)
 
                 # Critical legacy drift guard: some older DBs were stamped to
                 # Alembic head without actually applying every incremental
@@ -1187,6 +1189,46 @@ async def _startup():
             _logger.warning("Database safety net table creation failed: %s", exc)
 
     app.state.scheduler = start_scheduler() if database_ready else None
+    if database_ready and settings.graph_configured:
+        # Record the folder path of vessels that don't have one yet (e.g.
+        # discovered from SharePoint), so "View Documents" opens the right
+        # folder. Background; never delays startup.
+        from .services.vessel_folder_template import backfill_vessel_locations
+        asyncio.create_task(backfill_vessel_locations(), name="backfill_vessel_locations")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """Stop background jobs so Ctrl+C and --reload exit promptly. Without
+    this, scheduler jobs still waiting on Graph keep the old process alive
+    and the server hangs half-shut-down (port held, no requests answered)."""
+    import asyncio as _asyncio
+
+    sched = getattr(app.state, "scheduler", None)
+    if sched is not None:
+        try:
+            sched.shutdown(wait=False)
+        except Exception:
+            pass
+    # Cancel only our own background work still awaiting Graph/DB calls:
+    # scheduler job runners and tasks whose coroutine lives in this app's
+    # code. Server (uvicorn/starlette) tasks are left alone.
+    import pathlib as _pathlib
+
+    app_dir = str(_pathlib.Path(__file__).resolve().parent)
+    current = _asyncio.current_task()
+
+    def _ours(task) -> bool:
+        coro = task.get_coro()
+        code = getattr(coro, "cr_code", None)
+        name = getattr(code, "co_name", "")
+        return name == "run_coroutine_job" or str(getattr(code, "co_filename", "")).startswith(app_dir)
+
+    pending = [t for t in _asyncio.all_tasks() if t is not current and not t.done() and _ours(t)]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await _asyncio.wait(pending, timeout=5)
     # NOTE: the deferred startup precreate_next_month() call was removed —
     # the app no longer auto-creates month/category folder structures.
 # ---------------------------------------------------------------------------
@@ -8117,6 +8159,69 @@ def _dashboard_doc_matches_text(
     return all(clause in hay for clause in clauses)
 
 
+@app.get("/api/dashboard/vessel-summary")
+async def dashboard_vessel_summary(
+    site_key: str | None = Query(default=None, description="Only this site's documents (the Vessels page site filter)"),
+    _session: object = Depends(require_session),
+):
+    """Per-vessel document figures for the Vessels page cards: how many
+    documents, total size, when and by whom last updated, and how many sit
+    in Drawings / Manuals / To Be Classified. Computed from the same cached
+    scan as /api/dashboard/documents, so it never queries SharePoint itself.
+
+    Returns {"scan_pending": bool, "vessels": {lower-case name: {...}}}.
+    """
+    be = get_backend()
+    docs: list[dict] = []
+    scan_pending = False
+    if hasattr(be, "get_dashboard_documents"):
+        result = await be.get_dashboard_documents(force_refresh=False, site_key=site_key if site_key and site_key != "all" else None)
+        if isinstance(result, dict):
+            docs = list(result.get("docs") or [])
+            scan_pending = bool(result.get("pending"))
+        else:
+            docs = list(result or [])
+
+    def group_of(d: dict) -> str:
+        vessel_key = (d.get("vessel") or "").strip().casefold()
+        parts = [" ".join(p.split()).casefold() for p in (d.get("subFolderPath") or "").split(">") if p.strip()]
+        # Only look below the vessel's own folder, so a "Drawings" folder
+        # higher up the path doesn't decide it.
+        if vessel_key in parts:
+            parts = parts[parts.index(vessel_key) + 1:]
+        # Folder names that merely contain the word count too — e.g. "Final
+        # Drawings (Maker)" or "Machinery Manuals" in sites not yet organised
+        # as Drawings and Manuals. A name with both words ("Drawings and
+        # Manuals") is a container, so look further down.
+        for part in parts:
+            if "to be classif" in part:
+                return "to_be_classified"
+            has_drawing, has_manual = "drawing" in part, "manual" in part
+            if has_drawing and not has_manual:
+                return "drawings"
+            if has_manual and not has_drawing:
+                return "manuals"
+        return "other"
+
+    summary: dict[str, dict] = {}
+    for d in docs:
+        name = (d.get("vessel") or "").strip()
+        if not name:
+            continue
+        row = summary.setdefault(name.casefold(), {
+            "name": name, "total": 0, "size_bytes": 0, "last_modified_epoch": 0, "last_modified_by": None,
+            "drawings": 0, "manuals": 0, "to_be_classified": 0, "other": 0,
+        })
+        row["total"] += 1
+        row["size_bytes"] += int(d.get("sizeBytes") or 0)
+        row[group_of(d)] += 1
+        ep = d.get("modifiedEpoch") or 0
+        if ep > row["last_modified_epoch"]:
+            row["last_modified_epoch"] = ep
+            row["last_modified_by"] = d.get("modifiedBy")
+    return {"scan_pending": scan_pending, "vessels": summary}
+
+
 @app.get("/api/dashboard/documents")
 async def dashboard_documents(
     site_key: str | None = Query(default=None),
@@ -10258,6 +10363,10 @@ app.include_router(_build_tag_config_router(require_session))
 # ── Module Management (Settings → Module Management) ─────────────────────────
 from .module_settings_api import build_router as _build_module_settings_router
 app.include_router(_build_module_settings_router(require_session))
+from .vessel_folder_template_api import build_router as _build_vessel_folder_template_router
+app.include_router(_build_vessel_folder_template_router(require_session))
+from .vessel_roots_api import build_router as _build_vessel_roots_router
+app.include_router(_build_vessel_roots_router(require_session))
 
 # ── Filter Search Management (Settings → Filter Search Management) ───────────
 from .filter_settings_api import build_router as _build_filter_settings_router

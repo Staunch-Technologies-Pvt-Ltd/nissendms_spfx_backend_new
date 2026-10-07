@@ -14,12 +14,23 @@ from ..graph.site import get_site_drive_id
 from . import site_to_site_common
 from .errors import BadRequest, NotFound
 
+GRAPH_NOT_CONFIGURED = (
+    "Not configured — the Graph credentials (AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET) "
+    "are missing from backend/.env."
+)
 
-async def get_migration_drive_id() -> str:
+
+async def get_migration_drive_id(drive_id: str | None = None) -> str:
+    """The source library: the one picked for this scan, or the configured
+    default (MIGRATION_SITE_HOSTNAME/PATH) when none was picked."""
     if not settings.graph_configured:
+        raise BadRequest(GRAPH_NOT_CONFIGURED)
+    if drive_id:
+        return drive_id
+    if not settings.default_source_configured:
         raise BadRequest(
-            "Not configured — set AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, "
-            "SITE_HOSTNAME and SITE_PATH (see README.md)."
+            "Pick a source site and library first (or set MIGRATION_SITE_HOSTNAME and "
+            "MIGRATION_SITE_PATH in backend/.env for a default source)."
         )
     return await get_site_drive_id(settings.site_hostname, settings.site_path)
 
@@ -35,10 +46,7 @@ def get_destination_site() -> dict:
 
 async def get_destination_drive_id() -> str:
     if not settings.graph_configured:
-        raise BadRequest(
-            "Not configured — set AZURE_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, "
-            "SITE_HOSTNAME and SITE_PATH (see README.md)."
-        )
+        raise BadRequest(GRAPH_NOT_CONFIGURED)
     site = get_destination_site()
     return await get_site_drive_id(site["hostname"], site["site_path"])
 

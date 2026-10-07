@@ -11,7 +11,7 @@ application's schema.
 """
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -26,6 +26,11 @@ class MigrationScanJob(Base):
     status: Mapped[str] = mapped_column(String(20), default="running")  # running/done/failed
 
     source_folder: Mapped[str] = mapped_column(String(1024), default="")  # e.g. "SS378-PEISSY-Drawings, Plans, Manuals"
+    # The site/library this scan reads from, picked in the UI (a Site
+    # Management site). NULL = the configured default source
+    # (MIGRATION_SITE_HOSTNAME/PATH) — also what every older job used.
+    source_site_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    source_drive_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     subfolders: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of checked subfolder names
     # JSON list of individual loose files (siblings of the checked subfolders,
     # sitting directly in source_folder) the user checked one-by-one.
@@ -81,7 +86,7 @@ class MigrationItem(Base):
     # earlier rename used a wrong heading or never happened at all.
     original_filename: Mapped[str | None] = mapped_column(String(400), nullable=True)
     content_type: Mapped[str] = mapped_column(String(200), default="application/octet-stream")
-    size: Mapped[int] = mapped_column(default=0)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)  # bytes; files can exceed 2 GB
 
     status: Mapped[str] = mapped_column(String(20), default="discovered", index=True)
 
@@ -223,6 +228,27 @@ class SiteToSiteJob(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     confirmed_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
+    # --- Copy phase (Confirm & Copy runs as a background task) ---
+    # None until first confirmed, then: running | paused | cancelled |
+    # interrupted (server restarted mid-copy) | failed | completed |
+    # completed_with_warnings | completed_with_errors. Everything except
+    # running/paused can be resumed — items already copied are skipped.
+    copy_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # What to do when a file with the same name already exists at the
+    # destination: skip | replace | rename (keep both) | fail.
+    conflict_policy: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    copy_permissions: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    copy_versions: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    copy_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    copy_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # JSON counters of the most recent copy run (see site_to_site_progress).
+    copy_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Post-copy verification (source vs destination count/size/hash) ---
+    verify_status: Mapped[str | None] = mapped_column(String(20), nullable=True)  # running/done/failed
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verify_summary: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+
     items: Mapped[list["SiteToSiteItem"]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )
@@ -248,13 +274,18 @@ class SiteToSiteItem(Base):
     # Path relative to the job's chosen source folder, e.g. "Engine/Drawing.pdf"
     relative_path: Mapped[str] = mapped_column(String(1024))
     name: Mapped[str] = mapped_column(String(400))
-    size: Mapped[int] = mapped_column(default=0)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)  # bytes; files can exceed 2 GB
 
     status: Mapped[str] = mapped_column(String(20), default="discovered", index=True)
 
     dest_item_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # JSON: [{"field": ..., "status": "applied"|"label_matched"|"unmapped"|"error", "detail": ...}]
     metadata_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON: [{"principal": ..., "roles": [...], "status": "applied"|"skipped"|"error", "detail": ...}]
+    permissions_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ok | changed_by_sharepoint | size_mismatch | hash_mismatch | missing | error
+    verify_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    verify_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

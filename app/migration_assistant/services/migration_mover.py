@@ -419,6 +419,7 @@ async def confirm_job(job_id: str, decided_by_email: str) -> dict:
         vessel_path = job.vessel_path
         vessel_name = job.vessel_name
         source_folder = job.source_folder
+        job_source_drive_id = job.source_drive_id
         total_items = db.query(models.MigrationItem).filter_by(job_id=job.id).count()
         categorized_count = sum(
             1 for r in pending_rows
@@ -433,7 +434,7 @@ async def confirm_job(job_id: str, decided_by_email: str) -> dict:
             row["detected_vessel_name"] or "" if auto_detect_vessel else vessel_name,
         )
 
-    source_drive_id = await get_migration_drive_id()
+    source_drive_id = await get_migration_drive_id(job_source_drive_id)
     drive_id = await migration_common.get_destination_drive_id()
     dest_site = migration_common.get_destination_site()
     dest_site_url = site_to_site_common.site_url(dest_site)

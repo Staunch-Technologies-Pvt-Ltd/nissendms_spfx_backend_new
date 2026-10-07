@@ -153,6 +153,30 @@ async def _term_store_vessel_folder_count(target: dict) -> tuple[int, list[str]]
     if not drive_id or not site_id:
         return 0, []
 
+    # Admin-chosen vessel folders for this library (Site Management): every
+    # sub-folder of them is a vessel; nothing else in the library is
+    # considered. "none" = this site holds no vessels. Not configured = the
+    # automatic Term Store match below.
+    from . import vessel_roots
+    roots_cfg = vessel_roots.get_for_drive(drive_id)
+    if roots_cfg is not None:
+        if roots_cfg["mode"] == "none":
+            return 0, []
+        try:
+            terms = await gd.get_vessel_terms(site_id)
+        except Exception:
+            terms = []
+        by_norm = {_normalize_term_label(t): t for t in terms}
+        names: dict[str, str] = {}
+        paths: dict[str, str] = {}
+        for item, parent in await vessel_roots.child_folders_of_roots(graph(), drive_id, roots_cfg["paths"]):
+            norm = _normalize_term_label(item["name"])
+            names.setdefault(norm, by_norm.get(norm) or item["name"].strip())
+            paths.setdefault(norm, f"{parent}/{item['name']}")
+        vessel_roots.remember_paths(drive_id, paths)
+        matched = sorted(names.values(), key=str.casefold)
+        return len(matched), matched
+
     try:
         vessel_terms = await gd.get_vessel_terms(site_id)
     except Exception as e:
@@ -1362,6 +1386,45 @@ class RealBackend:
         # vessels" for a given SharePoint site reflects what's actually
         # there, not only what was provisioned through the app.
         known_names = {_normalize_term_label(v["name"]) for v in vessels}
+        from . import vessel_roots as _vessel_roots
+
+        def _sharepoint_row(site_key_for_row, name: str, norm: str, path: str) -> dict:
+            # View-only card for a vessel folder that isn't registered for
+            # this site (the Vessels page only views its documents).
+            return {
+                "id": f"sp:{site_key_for_row}:{norm}",
+                "name": name,
+                "imo": None, "shipyard": None, "hull_number": None, "vessel_type": None,
+                "is_provisioned": False,
+                "provisioned_site_ids": [],
+                "provisioned_site_key": site_key_for_row,
+                "vessel_folder_path": path,
+                "restored_at": None,
+                "status": "Found in SharePoint",
+                "source": "sharepoint",
+            }
+
+        # A single site with admin-chosen vessel folders: list them live
+        # (a few Graph calls), so a new choice shows straight away instead of
+        # after the next full site scan.
+        if site_key and site_key != "all":
+            try:
+                _drive = Settings.load_site_config(site_key).drive_id
+                _roots = _vessel_roots.get_for_drive(_drive)
+            except Exception:
+                _roots = None
+            if _roots is not None:
+                added = 0
+                if _roots["mode"] == "folders":
+                    for item, parent in await _vessel_roots.child_folders_of_roots(graph(), _drive, _roots["paths"]):
+                        norm = _normalize_term_label(item["name"])
+                        if norm in known_names:
+                            continue
+                        known_names.add(norm)
+                        added += 1
+                        vessels.append(_sharepoint_row(site_key, item["name"], norm, f"{parent}/{item['name']}"))
+                log.info("list_vessels: site_key=%r -> %d vessel folder(s) from the chosen folders", site_key, added)
+                return vessels
         try:
             dash = await self.get_dashboard_stats(site_key=site_key)
         except Exception as e:
@@ -1377,27 +1440,19 @@ class RealBackend:
             )
             for site in sites_in_dash:
                 site_key_for_row = site.get("site_key")
+                site_drive = site.get("drive_id")
                 for name in site.get("vessel_names") or []:
                     norm = _normalize_term_label(name)
                     if norm in known_names:
                         continue
                     known_names.add(norm)
                     added += 1
-                    vessels.append({
-                        "id": f"sp:{site_key_for_row}:{norm}",
-                        "name": name,
-                        "imo": None,
-                        "shipyard": None,
-                        "hull_number": None,
-                        "vessel_type": None,
-                        "is_provisioned": False,
-                        "provisioned_site_ids": [],
-                        "provisioned_site_key": site_key_for_row,
-                        "vessel_folder_path": name,
-                        "restored_at": None,
-                        "status": "Found in SharePoint",
-                        "source": "sharepoint",
-                    })
+                    # The real folder path when it came from the site's chosen
+                    # vessel folders; else just the name (the frontend then
+                    # finds it at the root or one level down).
+                    vessels.append(_sharepoint_row(
+                        site_key_for_row, name, norm, _vessel_roots.discovered_path(site_drive, norm) or name,
+                    ))
             log.info("list_vessels: site_key=%r -> added %d SharePoint-only vessel(s), %d total returned", site_key, added, len(vessels))
         else:
             log.info("list_vessels: site_key=%r -> dashboard scan unavailable, returning %d DB vessel(s) only", site_key, len(vessels))
@@ -1623,6 +1678,7 @@ class RealBackend:
                         "is_provisioned": True,
                         "provisioned_site_key": selected_site or None,
                         "vessel_folder_path": vessel_folder_path,
+                        "folder_template": folder_result.get("template"),
                         "provisioned_site_ids": list(dict.fromkeys(final_target_sites + ([selected_site] if selected_site else []))),
                     })
                     # The vessel folder now exists in SharePoint, but the
@@ -1652,6 +1708,15 @@ class RealBackend:
         # nothing else, so creation behaves exactly as before. Modes 2-4 run
         # in the background on the active site's drive and never delay this
         # response. Vessels created at a custom site/path are left alone.
+        if creation_method == "pool" and vessel.get("id"):
+            # A claimed pool slot is just a renamed empty folder — add the
+            # vessel folder template's sub-folders in the background.
+            from . import vessel_folder_template
+            asyncio.create_task(
+                vessel_folder_template.ensure_for_vessel(int(vessel["id"])),
+                name=f"vessel_folder_template_{clean_name}",
+            )
+
         if not custom_location and vessel.get("id"):
             from . import folder_structure
             asyncio.create_task(

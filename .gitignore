@@ -10,3 +10,8 @@ __pycache__/
 # Migration Assistant (merged module): secrets + local job database
 .env.migration
 migration_assistant.db
+
+# Local environment secrets
+.env
+.env.*
+!.env.example

@@ -1,18 +1,21 @@
 """Migration Assistant configuration (merged into the Vessel DMS backend).
 
-The Migration Assistant talks to SharePoint Online through its OWN Microsoft
-Entra app registration (Sites.Selected, app-only) — deliberately NOT the DMS's
-SharePoint Embedded credentials — so its settings are kept separate from
-`app/config.py` and never collide with the DMS's env vars
-(AZURE_TENANT_ID, DATABASE_URL, ALLOWED_ORIGINS, ...).
+Everything lives in the DMS's single ``backend/.env``:
+
+- **Credentials** (tenant, client id/secret) are the DMS's own — the Migration
+  Assistant uses the same Entra app, so nothing is repeated. Set
+  ``MIGRATION_AZURE_TENANT_ID`` / ``MIGRATION_GRAPH_CLIENT_ID`` /
+  ``MIGRATION_GRAPH_CLIENT_SECRET`` only to use a different app.
+- **Migration-only options** use a ``MIGRATION_`` prefix in ``.env``
+  (``MIGRATION_SITE_HOSTNAME``, ``MIGRATION_DESTINATION_ROOT``, ...), so they
+  can never collide with DMS names like DATABASE_URL or ALLOWED_ORIGINS.
 
 Where values come from (highest priority first):
-  1. Real process env vars, PREFIXED with ``MIGRATION_``
-     (e.g. ``MIGRATION_GRAPH_CLIENT_SECRET``) — for servers / CI.
-  2. ``backend/.env.migration`` — the standalone project's old ``.env`` file,
-     copied as-is with its ORIGINAL un-prefixed names (``GRAPH_CLIENT_ID=...``).
-     Only this file is read un-prefixed; the DMS ``.env`` is never consulted,
-     so DATABASE_URL etc. cannot leak in from it.
+  1. Process env vars prefixed ``MIGRATION_`` — for servers / CI.
+  2. ``backend/.env``, ``MIGRATION_``-prefixed keys only.
+  3. ``backend/.env.migration`` (legacy, un-prefixed names from the old
+     standalone project) — still read if present, so older setups keep working.
+  4. Credentials not set by any of the above: the DMS's own settings.
 """
 from functools import lru_cache
 from pathlib import Path
@@ -20,7 +23,8 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, DotEnvSettingsSource, SettingsConfigDict
 
 _BACKEND_DIR = Path(__file__).resolve().parents[2]  # .../backend
-ENV_FILE = _BACKEND_DIR / ".env.migration"
+ENV_FILE = _BACKEND_DIR / ".env.migration"  # legacy; optional
+DMS_ENV_FILE = _BACKEND_DIR / ".env"
 _DEFAULT_DB = "sqlite:///" + (_BACKEND_DIR / "migration_assistant.db").as_posix()
 
 
@@ -34,10 +38,25 @@ class Settings(BaseSettings):
         return (
             init_settings,
             env_settings,  # MIGRATION_* process env vars
-            DotEnvSettingsSource(
+            DotEnvSettingsSource(  # MIGRATION_* keys in the single DMS .env
+                settings_cls, env_file=DMS_ENV_FILE, env_file_encoding="utf-8", env_prefix="MIGRATION_"
+            ),
+            DotEnvSettingsSource(  # legacy .env.migration, un-prefixed
                 settings_cls, env_file=ENV_FILE, env_file_encoding="utf-8", env_prefix=""
             ),
         )
+
+    def model_post_init(self, __context) -> None:
+        """Fill missing credentials from the DMS's own settings (same Entra app)."""
+        if self.azure_tenant_id and self.graph_client_id and self.graph_client_secret:
+            return
+        try:
+            from ..config import settings as dms
+        except Exception:  # pragma: no cover - DMS config unavailable
+            return
+        self.azure_tenant_id = self.azure_tenant_id or (dms.azure_tenant_id or "")
+        self.graph_client_id = self.graph_client_id or (dms.graph_client_id or "")
+        self.graph_client_secret = self.graph_client_secret or (dms.graph_client_secret or "")
 
     # --- Microsoft Entra / Graph (app-only, client-credentials) ---
     azure_tenant_id: str = ""
@@ -131,13 +150,14 @@ class Settings(BaseSettings):
 
     @property
     def graph_configured(self) -> bool:
-        return bool(
-            self.azure_tenant_id
-            and self.graph_client_id
-            and self.graph_client_secret
-            and self.site_hostname
-            and self.site_path
-        )
+        """Graph credentials are present. The source site is picked per scan
+        (from Site Management); MIGRATION_SITE_HOSTNAME/PATH are only the
+        default used when no site is picked."""
+        return bool(self.azure_tenant_id and self.graph_client_id and self.graph_client_secret)
+
+    @property
+    def default_source_configured(self) -> bool:
+        return bool(self.site_hostname and self.site_path)
 
     @property
     def authority_url(self) -> str:
